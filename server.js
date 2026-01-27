@@ -1,8 +1,9 @@
-// ========== MONGODB MIDDLEWARE ==========
+// ========== MONGODB MIDDLEWARE COMPLETO CON AUTENTICACIÓN ==========
 
 import express from 'express';
 import { MongoClient, ObjectId } from 'mongodb';
 import cors from 'cors';
+import crypto from 'crypto';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -11,7 +12,8 @@ const PORT = process.env.PORT || 3000;
 // CONFIGURACIÓN
 // ============================================================
 
-const MONGODB_URI = process.env.MONGODB_URI;
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://iqu_api:UV1qiXyzk6Yducaz@cluster0.kb6nsgi.mongodb.net/?appName=Cluster0';
+const JWT_SECRET = process.env.JWT_SECRET || 'AKfycbwJ6NPiIrwGMXOfZYLjoo-TXI07O3pz94QA-M7yOOb-fiBmsXb3bmFljw_FnVsebTK4hw';
 const DB_NAME = 'iqu_telecom';
 
 const COLLECTIONS = {
@@ -29,11 +31,85 @@ const COLLECTIONS = {
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-// Logger
 app.use((req, res, next) => {
   console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
   next();
 });
+
+// ============================================================
+// JWT UTILS
+// ============================================================
+
+function base64UrlEncode(str) {
+  return Buffer.from(str)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=/g, '');
+}
+
+function base64UrlDecode(str) {
+  str = str.replace(/-/g, '+').replace(/_/g, '/');
+  while (str.length % 4) str += '=';
+  return Buffer.from(str, 'base64').toString('utf8');
+}
+
+function createJWT(payload) {
+  const header = { alg: 'HS256', typ: 'JWT' };
+  const encodedHeader = base64UrlEncode(JSON.stringify(header));
+  const encodedPayload = base64UrlEncode(JSON.stringify(payload));
+  const message = `${encodedHeader}.${encodedPayload}`;
+  
+  const signature = crypto
+    .createHmac('sha256', JWT_SECRET)
+    .update(message)
+    .digest('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=/g, '');
+  
+  return `${message}.${signature}`;
+}
+
+function verifyJWT(token) {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) throw new Error('Invalid token');
+    
+    const [encodedHeader, encodedPayload, signature] = parts;
+    const message = `${encodedHeader}.${encodedPayload}`;
+    
+    const expectedSignature = crypto
+      .createHmac('sha256', JWT_SECRET)
+      .update(message)
+      .digest('base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=/g, '');
+    
+    if (signature !== expectedSignature) {
+      throw new Error('Invalid signature');
+    }
+    
+    const payload = JSON.parse(base64UrlDecode(encodedPayload));
+    
+    if (payload.exp && Date.now() > payload.exp) {
+      throw new Error('Token expired');
+    }
+    
+    return payload;
+  } catch (error) {
+    throw new Error(`JWT verification failed: ${error.message}`);
+  }
+}
+
+// ============================================================
+// PASSWORD HASHING
+// ============================================================
+
+function hashPassword(password) {
+  return crypto.createHash('sha256').update(password).digest('hex');
+}
 
 // ============================================================
 // MONGODB CONNECTION
@@ -67,6 +143,97 @@ async function getCollection(collectionName) {
   const { db } = await connectDB();
   return db.collection(collectionName);
 }
+
+// ============================================================
+// INICIALIZACIÓN
+// ============================================================
+
+async function initializeDB() {
+  try {
+    const users = await getCollection(COLLECTIONS.USERS);
+    const admin = await users.findOne({ username: 'admin' });
+
+    if (!admin) {
+      const passwordHash = hashPassword('myg2025');
+      await users.insertOne({
+        username: 'admin',
+        password: passwordHash,
+        nombre: 'Administrador',
+        email: 'admin@mygtelecom.mx',
+        rol: 'ADMIN',
+        activo: true,
+        permisos: ['*'],
+        creadoEn: new Date().toISOString(),
+        actualizadoEn: new Date().toISOString(),
+        ultimoAcceso: null
+      });
+      console.log('✅ Usuario admin creado');
+    }
+  } catch (error) {
+    console.error('Error inicializando DB:', error);
+  }
+}
+
+// ============================================================
+// ENDPOINTS - AUTENTICACIÓN
+// ============================================================
+
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+
+    if (!username || !password) {
+      return res.status(400).json({ error: 'Usuario y contraseña requeridos' });
+    }
+
+    const users = await getCollection(COLLECTIONS.USERS);
+    const user = await users.findOne({ username });
+
+    if (!user) {
+      return res.status(401).json({ error: 'Credenciales inválidas' });
+    }
+
+    if (!user.activo) {
+      return res.status(403).json({ error: 'Usuario inactivo' });
+    }
+
+    const passwordHash = hashPassword(password);
+    
+    if (passwordHash !== user.password) {
+      return res.status(401).json({ error: 'Credenciales inválidas' });
+    }
+
+    // Actualizar último acceso
+    await users.updateOne(
+      { username },
+      { $set: { ultimoAcceso: new Date().toISOString() } }
+    );
+
+    // Crear JWT
+    const payload = {
+      username: user.username,
+      nombre: user.nombre,
+      rol: user.rol,
+      exp: Date.now() + (24 * 60 * 60 * 1000) // 24 horas
+    };
+
+    const token = createJWT(payload);
+
+    res.json({
+      success: true,
+      token,
+      user: {
+        username: user.username,
+        nombre: user.nombre,
+        rol: user.rol,
+        permisos: user.permisos
+      }
+    });
+  } catch (error) {
+    console.error('Error en login:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
 
 // ============================================================
 // ENDPOINTS - USUARIOS
@@ -103,6 +270,12 @@ app.get('/api/users/:username', async (req, res) => {
 app.post('/api/users', async (req, res) => {
   try {
     const users = await getCollection(COLLECTIONS.USERS);
+    
+    // Hash password si se proporciona
+    if (req.body.password) {
+      req.body.password = hashPassword(req.body.password);
+    }
+    
     const result = await users.insertOne(req.body);
     
     res.json({ success: true, insertedId: result.insertedId });
@@ -115,6 +288,12 @@ app.post('/api/users', async (req, res) => {
 app.put('/api/users/:username', async (req, res) => {
   try {
     const users = await getCollection(COLLECTIONS.USERS);
+    
+    // Hash password si se está actualizando
+    if (req.body.password) {
+      req.body.password = hashPassword(req.body.password);
+    }
+    
     const result = await users.updateOne(
       { username: req.params.username },
       { $set: req.body }
@@ -148,7 +327,7 @@ app.delete('/api/users/:username', async (req, res) => {
 });
 
 // ============================================================
-// ENDPOINTS - DISPOSITIVOS (AGENTES)
+// ENDPOINTS - DISPOSITIVOS
 // ============================================================
 
 app.get('/api/devices', async (req, res) => {
@@ -168,7 +347,6 @@ app.get('/api/devices', async (req, res) => {
       ];
     }
     
-    // Marcar como offline dispositivos sin reporte reciente (20 min)
     const twentyMinAgo = new Date(Date.now() - 20 * 60 * 1000);
     await devices.updateMany(
       { 
@@ -255,7 +433,6 @@ app.post('/api/history/:agentId', async (req, res) => {
     
     await history.insertOne(historyData);
     
-    // Limpiar historial antiguo (mantener 30 días)
     const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
     await history.deleteMany({
       agent_id: req.params.agentId,
@@ -303,7 +480,6 @@ app.get('/api/commands/pending/:agentId', async (req, res) => {
       .limit(10)
       .toArray();
     
-    // Marcar como "executing"
     if (pendingCommands.length > 0) {
       const commandIds = pendingCommands.map(cmd => cmd._id);
       
@@ -494,13 +670,14 @@ app.use((err, req, res, next) => {
 // ============================================================
 
 app.listen(PORT, async () => {
-  console.log(`MongoDB Middleware running on port ${PORT}`);
+  console.log(`🚀 MongoDB Middleware running on port ${PORT}`);
   
   try {
     await connectDB();
-    console.log('Connected to MongoDB successfully');
+    console.log('✅ Connected to MongoDB successfully');
+    await initializeDB();
   } catch (error) {
-    console.error('Failed to connect to MongoDB:', error);
+    console.error('❌ Failed to connect to MongoDB:', error);
     process.exit(1);
   }
 });
