@@ -1,11 +1,22 @@
 {
-  "name": "mongodb-middleware",
+  "name": "mongodb-middleware-iqu",
   "version": "1.0.0",
-  "description": "Middleware API para conectar Cloudflare Workers con MongoDB",
+  "description": "MongoDB Middleware para sistema IQU Agents",
+  "type": "module",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "node --watch server.js"
   },
+  "keywords": [
+    "mongodb",
+    "middleware",
+    "api",
+    "iqu",
+    "agents"
+  ],
+  "author": "MYG Telecom",
+  "license": "MIT",
   "dependencies": {
     "express": "^4.18.2",
     "mongodb": "^6.3.0",
@@ -15,3 +26,4 @@
     "node": ">=18.0.0"
   }
 }
+
