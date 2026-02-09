@@ -1,4 +1,4 @@
-// ========== MONGODB MIDDLEWARE COMPLETO CON AUTENTICACIÓN + RH ==========
+// ========== MONGODB MIDDLEWARE COMPLETO - VERSION CORREGIDA ==========
 
 import express from 'express';
 import { MongoClient, ObjectId } from 'mongodb';
@@ -10,7 +10,7 @@ import winston from 'winston';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Configurar logger (para depuración y monitoreo)
+// Configurar logger
 const logger = winston.createLogger({
     level: 'info',
     format: winston.format.combine(
@@ -19,7 +19,7 @@ const logger = winston.createLogger({
     ),
     transports: [
         new winston.transports.Console(),
-        new winston.transports.File({ filename: 'error.log', level: 'error' })  // Log errores a file
+        new winston.transports.File({ filename: 'error.log', level: 'error' })
     ]
 });
 
@@ -37,28 +37,39 @@ const COLLECTIONS = {
   INVENTORY_HISTORY: 'inventory_history',
   COMMANDS: 'commands',
   AGENTS_LOG: 'agents_log',
-  // === NUEVAS COLECCIONES RH ===
   RH_MOVIMIENTOS: 'rh_movimientos',
   NOTIFICACIONES: 'notificaciones'
 };
 
 // ============================================================
-// SCHEMA DE VALIDACIÓN UNIFICADO (para create y update)
+// SCHEMAS DE VALIDACIÓN CORREGIDOS
 // ============================================================
-const userSchema = Joi.object({
+
+const userCreateSchema = Joi.object({
     username: Joi.string().min(3).max(50).required().messages({
         'string.min': 'Username debe tener al menos 3 caracteres',
         'any.required': 'Username es requerido'
     }),
-    password: Joi.string().min(6).optional().messages({  // Opcional en update
-        'string.min': 'Contraseña debe tener al menos 6 caracteres'
+    password: Joi.string().min(6).required().messages({
+        'string.min': 'Contraseña debe tener al menos 6 caracteres',
+        'any.required': 'Contraseña es requerida'
     }),
     nombre: Joi.string().min(3).max(100).required(),
     email: Joi.string().email().required(),
-    rol: Joi.string().valid('ADMIN', 'RH', 'SISTEMAS', 'GERENTE', 'USUARIO').required().messages({  // Solo roles permitidos
+    rol: Joi.string().valid('ADMIN', 'RH', 'SISTEMAS', 'GERENTE', 'USUARIO').required().messages({
         'any.only': 'Rol inválido. Opciones: ADMIN, RH, SISTEMAS, GERENTE, USUARIO'
     }),
     activo: Joi.boolean().default(true)
+});
+
+const userUpdateSchema = Joi.object({
+    password: Joi.string().min(6).optional().messages({
+        'string.min': 'Contraseña debe tener al menos 6 caracteres'
+    }),
+    nombre: Joi.string().min(3).max(100).optional(),
+    email: Joi.string().email().optional(),
+    rol: Joi.string().valid('ADMIN', 'RH', 'SISTEMAS', 'GERENTE', 'USUARIO').optional(),
+    activo: Joi.boolean().optional()
 });
 
 // ============================================================
@@ -69,9 +80,11 @@ app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
 app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
+  logger.info(`${req.method} ${req.path}`);
   next();
 });
+
+// Middleware de autenticación (NO verifica admin aquí)
 const authMiddleware = async (req, res, next) => {
     try {
         const token = req.headers.authorization?.split(' ')[1];
@@ -80,17 +93,20 @@ const authMiddleware = async (req, res, next) => {
         const payload = verifyJWT(token);
         req.usuario = payload;
 
-        // Verificar si es admin para create/update/delete
-        if (!SistemaPermisos.esAdmin(payload)) {
-            logger.warn(`Intento no autorizado: ${payload.username} intentó operación admin`);
-            return res.status(403).json({ error: 'Requiere rol ADMIN' });
-        }
-
         next();
     } catch (error) {
         logger.error(`Error en auth: ${error.message}`);
         res.status(401).json({ error: 'Autenticación fallida' });
     }
+};
+
+// Middleware para verificar rol ADMIN
+const requireAdmin = (req, res, next) => {
+    if (!req.usuario || req.usuario.rol !== 'ADMIN') {
+        logger.warn(`Acceso denegado: ${req.usuario?.username || 'unknown'} intentó operación admin`);
+        return res.status(403).json({ error: 'Requiere rol ADMIN' });
+    }
+    next();
 };
 
 // ============================================================
@@ -161,29 +177,7 @@ function verifyJWT(token) {
 }
 
 // ============================================================
-// MIDDLEWARE DE AUTENTICACIÓN
-// ============================================================
-
-function requireAuth(req, res, next) {
-  try {
-    const authHeader = req.headers.authorization;
-    
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ error: 'Token no proporcionado' });
-    }
-
-    const token = authHeader.substring(7);
-    const payload = verifyJWT(token);
-    
-    req.usuario = payload;
-    next();
-  } catch (error) {
-    return res.status(401).json({ error: 'Token inválido o expirado' });
-  }
-}
-
-// ============================================================
-// PASSWORD HASHING
+// PASSWORD HASHING (SIN BCRYPT - USANDO CRYPTO NATIVO)
 // ============================================================
 
 function hashPassword(password) {
@@ -246,7 +240,7 @@ async function initializeDB() {
         actualizadoEn: new Date().toISOString(),
         ultimoAcceso: null
       });
-      console.log('✅ Usuario admin creado');
+      logger.info('✅ Usuario admin creado');
     }
     
     // Crear índices para RH
@@ -259,9 +253,9 @@ async function initializeDB() {
     await notificaciones.createIndex({ usuario_destino: 1, leida: 1 });
     await notificaciones.createIndex({ fecha_creacion: -1 });
     
-    console.log('✅ Índices RH creados');
+    logger.info('✅ Índices creados');
   } catch (error) {
-    console.error('Error inicializando DB:', error);
+    logger.error('Error inicializando DB:', error);
   }
 }
 
@@ -323,50 +317,68 @@ app.post('/api/auth/login', async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Error en login:', error);
+    logger.error('Error en login:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
 // ============================================================
-// ENDPOINT CREAR USUARIO (POST /api/users) - Refactorizado
+// ENDPOINTS - USUARIOS (CORREGIDOS)
 // ============================================================
-app.post('/api/users', authMiddleware, async (req, res) => {
-    const client = await connectDB();
-    const db = client.db(DB_NAME);
-    const collection = db.collection(COLLECTIONS.USERS);
 
+// GET /api/users - Requiere auth pero NO admin (cualquier usuario autenticado puede listar)
+app.get('/api/users', authMiddleware, async (req, res) => {
     try {
-        // Validar con Joi
-        const { error, value } = userSchema.validate(req.body, { abortEarly: false });
+        const collection = await getCollection(COLLECTIONS.USERS);
+        
+        const users = await collection
+            .find({ activo: true })
+            .project({ password: 0 })  // NO devolver passwords
+            .toArray();
+
+        res.json(users);
+    } catch (error) {
+        logger.error(`Error obteniendo usuarios: ${error.message}`);
+        res.status(500).json({ error: 'Error interno al obtener usuarios' });
+    }
+});
+
+// POST /api/users - Requiere auth Y admin
+app.post('/api/users', authMiddleware, requireAdmin, async (req, res) => {
+    try {
+        // Validar con schema de creación
+        const { error, value } = userCreateSchema.validate(req.body, { abortEarly: false });
         if (error) {
             const errors = error.details.map(d => d.message).join('; ');
-            logger.warn(`Validación fallida al crear usuario: ${errors}`);
+            logger.warn(`Validación fallida: ${errors}`);
             return res.status(400).json({ error: errors });
         }
 
-        // Requerir password en creación
-        if (!value.password) {
-            return res.status(400).json({ error: 'Contraseña requerida para creación' });
-        }
+        const collection = await getCollection(COLLECTIONS.USERS);
 
         // Verificar duplicado
         const existing = await collection.findOne({ username: value.username });
         if (existing) {
-            logger.warn(`Intento de duplicado: ${value.username}`);
+            logger.warn(`Username duplicado: ${value.username}`);
             return res.status(409).json({ error: 'Username ya existe' });
         }
 
         // Hashear password
-        const hashedPassword = await bcrypt.hash(value.password, 12);
-        value.password = hashedPassword;  // Reemplazar plain con hash
+        value.password = hashPassword(value.password);
 
-        // Insertar con timestamp
-        value.createdAt = new Date();
+        // Insertar con timestamps
+        value.creadoEn = new Date().toISOString();
+        value.actualizadoEn = new Date().toISOString();
+        value.ultimoAcceso = null;
+        value.permisos = ['*'];  // Por defecto, luego se puede ajustar
+
         const result = await collection.insertOne(value);
 
         logger.info(`Usuario creado: ${value.username} por ${req.usuario.username}`);
-        res.status(201).json({ success: true, user: { ...value, _id: result.insertedId }, password: undefined });  // No retornar password
+        
+        // Devolver sin password
+        delete value.password;
+        res.status(201).json({ success: true, user: { ...value, _id: result.insertedId } });
 
     } catch (error) {
         logger.error(`Error creando usuario: ${error.message}`);
@@ -374,32 +386,33 @@ app.post('/api/users', authMiddleware, async (req, res) => {
     }
 });
 
-// ============================================================
-// ENDPOINT ACTUALIZAR USUARIO (PUT /api/users/:username) - Refactorizado
-// ============================================================
-app.put('/api/users/:username', authMiddleware, async (req, res) => {
-    const client = await connectDB();
-    const db = client.db(DB_NAME);
-    const collection = db.collection(COLLECTIONS.USERS);
-
+// PUT /api/users/:username - Requiere auth Y admin
+app.put('/api/users/:username', authMiddleware, requireAdmin, async (req, res) => {
     try {
         const username = req.params.username;
 
-        // Validar updates (password opcional)
-        const { error, value } = userSchema.validate(req.body, { abortEarly: false, stripUnknown: true });  // Ignorar campos extra
+        // Validar con schema de actualización
+        const { error, value } = userUpdateSchema.validate(req.body, { 
+            abortEarly: false, 
+            stripUnknown: true 
+        });
+        
         if (error) {
             const errors = error.details.map(d => d.message).join('; ');
-            logger.warn(`Validación fallida al actualizar: ${errors}`);
+            logger.warn(`Validación fallida: ${errors}`);
             return res.status(400).json({ error: errors });
         }
 
-        // Hashear si hay nueva password
+        const collection = await getCollection(COLLECTIONS.USERS);
+
+        // Hashear password si existe
         if (value.password) {
-            value.password = await bcrypt.hash(value.password, 12);
+            value.password = hashPassword(value.password);
         }
 
-        // Actualizar con timestamp
-        value.updatedAt = new Date();
+        // Actualizar timestamp
+        value.actualizadoEn = new Date().toISOString();
+
         const result = await collection.updateOne(
             { username },
             { $set: value }
@@ -418,21 +431,25 @@ app.put('/api/users/:username', authMiddleware, async (req, res) => {
     }
 });
 
-// ============================================================
-// ENDPOINT ELIMINAR (DELETE /api/users/:username) - Mejora: Soft delete
-// ============================================================
-app.delete('/api/users/:username', authMiddleware, async (req, res) => {
-    const client = await connectDB();
-    const db = client.db(DB_NAME);
-    const collection = db.collection(COLLECTIONS.USERS);
-
+// DELETE /api/users/:username - Soft delete
+app.delete('/api/users/:username', authMiddleware, requireAdmin, async (req, res) => {
     try {
         const username = req.params.username;
 
-        // Soft delete: Set activo=false en vez de borrar
+        if (username === 'admin') {
+            return res.status(403).json({ error: 'No se puede eliminar el usuario admin' });
+        }
+
+        const collection = await getCollection(COLLECTIONS.USERS);
+
         const result = await collection.updateOne(
             { username },
-            { $set: { activo: false, deletedAt: new Date() } }
+            { 
+                $set: { 
+                    activo: false, 
+                    eliminadoEn: new Date().toISOString() 
+                } 
+            }
         );
 
         if (result.matchedCount === 0) {
@@ -449,7 +466,7 @@ app.delete('/api/users/:username', authMiddleware, async (req, res) => {
 });
 
 // ============================================================
-// ENDPOINTS - DISPOSITIVOS (EXISTENTES - SIN CAMBIOS)
+// ENDPOINTS - DISPOSITIVOS (SIN CAMBIOS)
 // ============================================================
 
 app.get('/api/devices', async (req, res) => {
@@ -486,7 +503,7 @@ app.get('/api/devices', async (req, res) => {
     
     res.json(deviceList);
   } catch (error) {
-    console.error('Error getting devices:', error);
+    logger.error('Error getting devices:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -502,7 +519,7 @@ app.get('/api/devices/:agentId', async (req, res) => {
     
     res.json(device);
   } catch (error) {
-    console.error('Error getting device:', error);
+    logger.error('Error getting device:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -534,13 +551,13 @@ app.post('/api/devices/:agentId', async (req, res) => {
       modifiedCount: result.modifiedCount
     });
   } catch (error) {
-    console.error('Error upserting device:', error);
+    logger.error('Error upserting device:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
 // ============================================================
-// ENDPOINTS - HISTORIAL (EXISTENTES - SIN CAMBIOS)
+// ENDPOINTS - HISTORIAL
 // ============================================================
 
 app.post('/api/history/:agentId', async (req, res) => {
@@ -563,7 +580,7 @@ app.post('/api/history/:agentId', async (req, res) => {
     
     res.json({ success: true });
   } catch (error) {
-    console.error('Error adding history:', error);
+    logger.error('Error adding history:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -581,13 +598,13 @@ app.get('/api/history/:agentId', async (req, res) => {
     
     res.json(records);
   } catch (error) {
-    console.error('Error getting history:', error);
+    logger.error('Error getting history:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
 // ============================================================
-// ENDPOINTS - COMANDOS (EXISTENTES - SIN CAMBIOS)
+// ENDPOINTS - COMANDOS
 // ============================================================
 
 app.get('/api/commands/pending/:agentId', async (req, res) => {
@@ -618,7 +635,7 @@ app.get('/api/commands/pending/:agentId', async (req, res) => {
     
     res.json(pendingCommands);
   } catch (error) {
-    console.error('Error getting pending commands:', error);
+    logger.error('Error getting pending commands:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -643,7 +660,7 @@ app.post('/api/commands/:agentId', async (req, res) => {
       command_id: result.insertedId 
     });
   } catch (error) {
-    console.error('Error creating command:', error);
+    logger.error('Error creating command:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -676,13 +693,13 @@ app.post('/api/commands/:commandId/result', async (req, res) => {
     
     res.json({ success: true });
   } catch (error) {
-    console.error('Error updating command result:', error);
+    logger.error('Error updating command result:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
 // ============================================================
-// ENDPOINTS - LOGS (EXISTENTES - SIN CAMBIOS)
+// ENDPOINTS - LOGS
 // ============================================================
 
 app.post('/api/logs', async (req, res) => {
@@ -698,13 +715,13 @@ app.post('/api/logs', async (req, res) => {
     
     res.json({ success: true });
   } catch (error) {
-    console.error('Error adding log:', error);
+    logger.error('Error adding log:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
 // ============================================================
-// ENDPOINTS - ESTADÍSTICAS (EXISTENTES - SIN CAMBIOS)
+// ENDPOINTS - ESTADÍSTICAS
 // ============================================================
 
 app.get('/api/stats', async (req, res) => {
@@ -750,16 +767,16 @@ app.get('/api/stats', async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Error getting stats:', error);
+    logger.error('Error getting stats:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
 // ============================================================
-// === NUEVOS ENDPOINTS - MOVIMIENTOS RH ===
+// ENDPOINTS - MOVIMIENTOS RH
 // ============================================================
 
-app.post('/api/rh/movimientos', requireAuth, async (req, res) => {
+app.post('/api/rh/movimientos', authMiddleware, async (req, res) => {
   try {
     const movimientos = await getCollection(COLLECTIONS.RH_MOVIMIENTOS);
     
@@ -786,14 +803,14 @@ app.post('/api/rh/movimientos', requireAuth, async (req, res) => {
     
     res.status(201).json(movimiento);
     
-    console.log(`✅ Movimiento RH creado: ${movimiento._id} (${movimiento.tipo}) por ${req.usuario.username}`);
+    logger.info(`Movimiento RH creado: ${movimiento._id} (${movimiento.tipo}) por ${req.usuario.username}`);
   } catch (error) {
-    console.error('Error creando movimiento:', error);
+    logger.error('Error creando movimiento:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-app.get('/api/rh/movimientos', requireAuth, async (req, res) => {
+app.get('/api/rh/movimientos', authMiddleware, async (req, res) => {
   try {
     const movimientos = await getCollection(COLLECTIONS.RH_MOVIMIENTOS);
     const { tipo, estado, usuario, fecha_desde, fecha_hasta } = req.query;
@@ -808,12 +825,10 @@ app.get('/api/rh/movimientos', requireAuth, async (req, res) => {
       filter.estado = estado;
     }
     
-    // Si el usuario es RH, solo ver sus movimientos
     if (req.usuario.rol === 'RH' || usuario) {
       filter['creado_por.username'] = usuario || req.usuario.username;
     }
     
-    // Filtro de fechas
     if (fecha_desde || fecha_hasta) {
       filter.fecha_creacion = {};
       if (fecha_desde) {
@@ -823,7 +838,6 @@ app.get('/api/rh/movimientos', requireAuth, async (req, res) => {
         filter.fecha_creacion.$lte = new Date(fecha_hasta).toISOString();
       }
     } else {
-      // Por defecto, últimos 3 meses
       const tresMesesAtras = new Date();
       tresMesesAtras.setMonth(tresMesesAtras.getMonth() - 3);
       filter.fecha_creacion = { $gte: tresMesesAtras.toISOString() };
@@ -836,12 +850,12 @@ app.get('/api/rh/movimientos', requireAuth, async (req, res) => {
     
     res.json(movimientosList);
   } catch (error) {
-    console.error('Error obteniendo movimientos:', error);
+    logger.error('Error obteniendo movimientos:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-app.get('/api/rh/movimientos/:id', requireAuth, async (req, res) => {
+app.get('/api/rh/movimientos/:id', authMiddleware, async (req, res) => {
   try {
     const movimientos = await getCollection(COLLECTIONS.RH_MOVIMIENTOS);
     const movimiento = await movimientos.findOne({ 
@@ -852,7 +866,6 @@ app.get('/api/rh/movimientos/:id', requireAuth, async (req, res) => {
       return res.status(404).json({ error: 'Movimiento no encontrado' });
     }
     
-    // Si es RH, solo puede ver sus propios movimientos
     if (req.usuario.rol === 'RH' && 
         movimiento.creado_por.username !== req.usuario.username) {
       return res.status(403).json({ error: 'Sin permisos para ver este movimiento' });
@@ -860,12 +873,12 @@ app.get('/api/rh/movimientos/:id', requireAuth, async (req, res) => {
     
     res.json(movimiento);
   } catch (error) {
-    console.error('Error obteniendo movimiento:', error);
+    logger.error('Error obteniendo movimiento:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-app.put('/api/rh/movimientos/:id', requireAuth, async (req, res) => {
+app.put('/api/rh/movimientos/:id', authMiddleware, async (req, res) => {
   try {
     const movimientos = await getCollection(COLLECTIONS.RH_MOVIMIENTOS);
     const updates = { ...req.body };
@@ -878,7 +891,6 @@ app.put('/api/rh/movimientos/:id', requireAuth, async (req, res) => {
       return res.status(404).json({ error: 'Movimiento no encontrado' });
     }
     
-    // Validar permisos
     if (movimiento.estado !== 'PENDIENTE' && req.usuario.rol === 'RH') {
       return res.status(403).json({ 
         error: 'Solo puedes editar movimientos pendientes' 
@@ -892,7 +904,6 @@ app.put('/api/rh/movimientos/:id', requireAuth, async (req, res) => {
       });
     }
     
-    // No permitir cambiar estado por esta ruta
     delete updates.estado;
     delete updates._id;
     
@@ -923,16 +934,15 @@ app.put('/api/rh/movimientos/:id', requireAuth, async (req, res) => {
     
     res.json(movimientoActualizado);
     
-    console.log(`✅ Movimiento actualizado: ${req.params.id} por ${req.usuario.username}`);
+    logger.info(`Movimiento actualizado: ${req.params.id} por ${req.usuario.username}`);
   } catch (error) {
-    console.error('Error actualizando movimiento:', error);
+    logger.error('Error actualizando movimiento:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-app.patch('/api/rh/movimientos/:id/estado', requireAuth, async (req, res) => {
+app.patch('/api/rh/movimientos/:id/estado', authMiddleware, async (req, res) => {
   try {
-    // Solo SISTEMAS y ADMIN pueden cambiar estados
     if (req.usuario.rol !== 'SISTEMAS' && req.usuario.rol !== 'ADMIN') {
       return res.status(403).json({ 
         error: 'Solo Sistemas y Admin pueden cambiar estados' 
@@ -985,18 +995,18 @@ app.patch('/api/rh/movimientos/:id/estado', requireAuth, async (req, res) => {
     
     res.json(movimiento);
     
-    console.log(`✅ Estado cambiado: ${req.params.id} -> ${estado} por ${req.usuario.username}`);
+    logger.info(`Estado cambiado: ${req.params.id} -> ${estado} por ${req.usuario.username}`);
   } catch (error) {
-    console.error('Error cambiando estado:', error);
+    logger.error('Error cambiando estado:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
 // ============================================================
-// === NUEVOS ENDPOINTS - NOTIFICACIONES ===
+// ENDPOINTS - NOTIFICACIONES
 // ============================================================
 
-app.post('/api/notificaciones', requireAuth, async (req, res) => {
+app.post('/api/notificaciones', authMiddleware, async (req, res) => {
   try {
     const notificaciones = await getCollection(COLLECTIONS.NOTIFICACIONES);
     
@@ -1012,12 +1022,12 @@ app.post('/api/notificaciones', requireAuth, async (req, res) => {
     
     res.status(201).json({ id: notificacion._id });
   } catch (error) {
-    console.error('Error creando notificación:', error);
+    logger.error('Error creando notificación:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-app.get('/api/notificaciones', requireAuth, async (req, res) => {
+app.get('/api/notificaciones', authMiddleware, async (req, res) => {
   try {
     const notificaciones = await getCollection(COLLECTIONS.NOTIFICACIONES);
     const { username, soloNoLeidas } = req.query;
@@ -1043,12 +1053,12 @@ app.get('/api/notificaciones', requireAuth, async (req, res) => {
     
     res.json({ notificaciones: notificacionesList, total_no_leidas });
   } catch (error) {
-    console.error('Error obteniendo notificaciones:', error);
+    logger.error('Error obteniendo notificaciones:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-app.patch('/api/notificaciones/:id/leer', requireAuth, async (req, res) => {
+app.patch('/api/notificaciones/:id/leer', authMiddleware, async (req, res) => {
   try {
     const notificaciones = await getCollection(COLLECTIONS.NOTIFICACIONES);
     
@@ -1067,12 +1077,12 @@ app.patch('/api/notificaciones/:id/leer', requireAuth, async (req, res) => {
     
     res.json({ success: true });
   } catch (error) {
-    console.error('Error marcando notificación:', error);
+    logger.error('Error marcando notificación:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-app.patch('/api/notificaciones/leer-todas', requireAuth, async (req, res) => {
+app.patch('/api/notificaciones/leer-todas', authMiddleware, async (req, res) => {
   try {
     const notificaciones = await getCollection(COLLECTIONS.NOTIFICACIONES);
     
@@ -1091,7 +1101,7 @@ app.patch('/api/notificaciones/leer-todas', requireAuth, async (req, res) => {
     
     res.json({ success: true });
   } catch (error) {
-    console.error('Error marcando todas las notificaciones:', error);
+    logger.error('Error marcando todas las notificaciones:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -1139,7 +1149,7 @@ app.get('/', (req, res) => {
 // ============================================================
 
 app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err);
+  logger.error('Unhandled error:', err);
   res.status(500).json({ 
     error: 'Internal server error',
     message: err.message 
@@ -1161,9 +1171,9 @@ app.listen(PORT, async () => {
   
   try {
     await connectDB();
-    console.log('✅ Conectado a MongoDB Atlas');
+    logger.info('✅ Conectado a MongoDB Atlas');
     await initializeDB();
-    console.log('✅ Base de datos inicializada');
+    logger.info('✅ Base de datos inicializada');
     console.log('');
     console.log('📋 Endpoints disponibles:');
     console.log('   - Auth: /api/auth/login');
@@ -1174,7 +1184,7 @@ app.listen(PORT, async () => {
     console.log('   - Notifications: /api/notificaciones');
     console.log('');
   } catch (error) {
-    console.error('❌ Error fatal al iniciar:', error);
+    logger.error('❌ Error fatal al iniciar:', error);
     process.exit(1);
   }
 });
@@ -1185,8 +1195,7 @@ process.on('SIGINT', async () => {
   console.log('🛑 Cerrando servidor...');
   if (cachedClient) {
     await cachedClient.close();
-    console.log('✅ Conexión a MongoDB cerrada');
+    logger.info('✅ Conexión a MongoDB cerrada');
   }
   process.exit(0);
 });
-
