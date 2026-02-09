@@ -4,9 +4,24 @@ import express from 'express';
 import { MongoClient, ObjectId } from 'mongodb';
 import cors from 'cors';
 import crypto from 'crypto';
+import Joi from 'joi';
+import winston from 'winston';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Configurar logger (para depuración y monitoreo)
+const logger = winston.createLogger({
+    level: 'info',
+    format: winston.format.combine(
+        winston.format.timestamp(),
+        winston.format.json()
+    ),
+    transports: [
+        new winston.transports.Console(),
+        new winston.transports.File({ filename: 'error.log', level: 'error' })  // Log errores a file
+    ]
+});
 
 // ============================================================
 // CONFIGURACIÓN
@@ -28,6 +43,25 @@ const COLLECTIONS = {
 };
 
 // ============================================================
+// SCHEMA DE VALIDACIÓN UNIFICADO (para create y update)
+// ============================================================
+const userSchema = Joi.object({
+    username: Joi.string().min(3).max(50).required().messages({
+        'string.min': 'Username debe tener al menos 3 caracteres',
+        'any.required': 'Username es requerido'
+    }),
+    password: Joi.string().min(6).optional().messages({  // Opcional en update
+        'string.min': 'Contraseña debe tener al menos 6 caracteres'
+    }),
+    nombre: Joi.string().min(3).max(100).required(),
+    email: Joi.string().email().required(),
+    rol: Joi.string().valid('ADMIN', 'RH', 'SISTEMAS', 'GERENTE', 'USUARIO').required().messages({  // Solo roles permitidos
+        'any.only': 'Rol inválido. Opciones: ADMIN, RH, SISTEMAS, GERENTE, USUARIO'
+    }),
+    activo: Joi.boolean().default(true)
+});
+
+// ============================================================
 // MIDDLEWARE
 // ============================================================
 
@@ -38,6 +72,26 @@ app.use((req, res, next) => {
   console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
   next();
 });
+const authMiddleware = async (req, res, next) => {
+    try {
+        const token = req.headers.authorization?.split(' ')[1];
+        if (!token) return res.status(401).json({ error: 'Token requerido' });
+
+        const payload = verifyJWT(token);
+        req.usuario = payload;
+
+        // Verificar si es admin para create/update/delete
+        if (!SistemaPermisos.esAdmin(payload)) {
+            logger.warn(`Intento no autorizado: ${payload.username} intentó operación admin`);
+            return res.status(403).json({ error: 'Requiere rol ADMIN' });
+        }
+
+        next();
+    } catch (error) {
+        logger.error(`Error en auth: ${error.message}`);
+        res.status(401).json({ error: 'Autenticación fallida' });
+    }
+};
 
 // ============================================================
 // JWT UTILS
@@ -275,184 +329,123 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 // ============================================================
-// ENDPOINTS - USUARIOS
+// ENDPOINT CREAR USUARIO (POST /api/users) - Refactorizado
 // ============================================================
+app.post('/api/users', authMiddleware, async (req, res) => {
+    const client = await connectDB();
+    const db = client.db(DB_NAME);
+    const collection = db.collection(COLLECTIONS.USERS);
 
-app.get('/api/users', async (req, res) => {
-  try {
-    const users = await getCollection(COLLECTIONS.USERS);
-    const { rol } = req.query;
-    
-    const filter = {};
-    if (rol) {
-      filter.rol = rol;
-      filter.activo = true;
-    }
-    
-    const userList = await users
-      .find(filter)
-      .project({ password: 0 }) // No enviar passwords
-      .toArray();
-    
-    res.json(userList);
-  } catch (error) {
-    console.error('Error getting users:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.get('/api/users/:username', async (req, res) => {
-  try {
-    const users = await getCollection(COLLECTIONS.USERS);
-    const user = await users.findOne(
-      { username: req.params.username },
-      { projection: { password: 0 } }
-    );
-    
-    if (!user) {
-      return res.status(404).json({ error: 'Usuario no encontrado' });
-    }
-    
-    res.json(user);
-  } catch (error) {
-    console.error('Error getting user:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.post('/api/users', requireAuth, async (req, res) => {
-  try {
-    // Solo ADMIN puede crear usuarios
-    if (req.usuario.rol !== 'ADMIN') {
-      return res.status(403).json({ error: 'Se requiere rol ADMIN' });
-    }
-    
-    const users = await getCollection(COLLECTIONS.USERS);
-    const { username, password, nombre, rol, email } = req.body;
-    
-    // Validar campos requeridos
-    if (!username || !password || !nombre || !rol) {
-      return res.status(400).json({ error: 'Campos requeridos faltantes' });
-    }
-    
-    // Verificar si ya existe
-    const existe = await users.findOne({ username });
-    if (existe) {
-      return res.status(400).json({ error: 'Usuario ya existe' });
-    }
-    
-    // Validar rol
-    const rolesValidos = ['ADMIN', 'SISTEMAS', 'RH', 'GERENTE', 'EJECUTIVO', 'CONSULTA'];
-    if (!rolesValidos.includes(rol)) {
-      return res.status(400).json({ error: 'Rol inválido' });
-    }
-    
-    // Hash password
-    const passwordHash = hashPassword(password);
-    
-    const nuevoUsuario = {
-      username,
-      password: passwordHash,
-      nombre,
-      rol,
-      email: email || null,
-      activo: true,
-      permisos: rol === 'ADMIN' ? ['*'] : [],
-      creadoEn: new Date().toISOString(),
-      creadoPor: req.usuario.username
-    };
-    
-    const result = await users.insertOne(nuevoUsuario);
-    
-    // No devolver password
-    delete nuevoUsuario.password;
-    
-    res.status(201).json({ success: true, user: nuevoUsuario });
-    
-    console.log(`✅ Usuario creado: ${username} (${rol}) por ${req.usuario.username}`);
-  } catch (error) {
-    console.error('Error creating user:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.put('/api/users/:username', requireAuth, async (req, res) => {
-  try {
-    const users = await getCollection(COLLECTIONS.USERS);
-    const updates = { ...req.body };
-    
-    // Solo ADMIN puede actualizar otros usuarios
-    if (req.usuario.rol !== 'ADMIN' && req.usuario.username !== req.params.username) {
-      return res.status(403).json({ error: 'Sin permisos' });
-    }
-    
-    // No permitir cambiar username
-    delete updates.username;
-    
-    // Hash password si se está actualizando
-    if (updates.password) {
-      updates.password = hashPassword(updates.password);
-    }
-    
-    // Solo ADMIN puede cambiar rol
-    if (updates.rol && req.usuario.rol !== 'ADMIN') {
-      delete updates.rol;
-    }
-    
-    updates.actualizadoEn = new Date().toISOString();
-    updates.actualizadoPor = req.usuario.username;
-    
-    const result = await users.updateOne(
-      { username: req.params.username },
-      { $set: updates }
-    );
-    
-    if (result.matchedCount === 0) {
-      return res.status(404).json({ error: 'Usuario no encontrado' });
-    }
-    
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Error updating user:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.delete('/api/users/:username', requireAuth, async (req, res) => {
-  try {
-    // Solo ADMIN puede eliminar
-    if (req.usuario.rol !== 'ADMIN') {
-      return res.status(403).json({ error: 'Se requiere rol ADMIN' });
-    }
-    
-    // No permitir eliminar admin principal
-    if (req.params.username === 'admin') {
-      return res.status(400).json({ error: 'No se puede eliminar el administrador principal' });
-    }
-    
-    const users = await getCollection(COLLECTIONS.USERS);
-    
-    // Soft delete
-    const result = await users.updateOne(
-      { username: req.params.username },
-      { 
-        $set: { 
-          activo: false,
-          eliminadoEn: new Date().toISOString(),
-          eliminadoPor: req.usuario.username
+    try {
+        // Validar con Joi
+        const { error, value } = userSchema.validate(req.body, { abortEarly: false });
+        if (error) {
+            const errors = error.details.map(d => d.message).join('; ');
+            logger.warn(`Validación fallida al crear usuario: ${errors}`);
+            return res.status(400).json({ error: errors });
         }
-      }
-    );
-    
-    if (result.matchedCount === 0) {
-      return res.status(404).json({ error: 'Usuario no encontrado' });
+
+        // Requerir password en creación
+        if (!value.password) {
+            return res.status(400).json({ error: 'Contraseña requerida para creación' });
+        }
+
+        // Verificar duplicado
+        const existing = await collection.findOne({ username: value.username });
+        if (existing) {
+            logger.warn(`Intento de duplicado: ${value.username}`);
+            return res.status(409).json({ error: 'Username ya existe' });
+        }
+
+        // Hashear password
+        const hashedPassword = await bcrypt.hash(value.password, 12);
+        value.password = hashedPassword;  // Reemplazar plain con hash
+
+        // Insertar con timestamp
+        value.createdAt = new Date();
+        const result = await collection.insertOne(value);
+
+        logger.info(`Usuario creado: ${value.username} por ${req.usuario.username}`);
+        res.status(201).json({ success: true, user: { ...value, _id: result.insertedId }, password: undefined });  // No retornar password
+
+    } catch (error) {
+        logger.error(`Error creando usuario: ${error.message}`);
+        res.status(500).json({ error: 'Error interno al crear usuario' });
     }
-    
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Error deleting user:', error);
-    res.status(500).json({ error: error.message });
-  }
+});
+
+// ============================================================
+// ENDPOINT ACTUALIZAR USUARIO (PUT /api/users/:username) - Refactorizado
+// ============================================================
+app.put('/api/users/:username', authMiddleware, async (req, res) => {
+    const client = await connectDB();
+    const db = client.db(DB_NAME);
+    const collection = db.collection(COLLECTIONS.USERS);
+
+    try {
+        const username = req.params.username;
+
+        // Validar updates (password opcional)
+        const { error, value } = userSchema.validate(req.body, { abortEarly: false, stripUnknown: true });  // Ignorar campos extra
+        if (error) {
+            const errors = error.details.map(d => d.message).join('; ');
+            logger.warn(`Validación fallida al actualizar: ${errors}`);
+            return res.status(400).json({ error: errors });
+        }
+
+        // Hashear si hay nueva password
+        if (value.password) {
+            value.password = await bcrypt.hash(value.password, 12);
+        }
+
+        // Actualizar con timestamp
+        value.updatedAt = new Date();
+        const result = await collection.updateOne(
+            { username },
+            { $set: value }
+        );
+
+        if (result.matchedCount === 0) {
+            return res.status(404).json({ error: 'Usuario no encontrado' });
+        }
+
+        logger.info(`Usuario actualizado: ${username} por ${req.usuario.username}`);
+        res.json({ success: true });
+
+    } catch (error) {
+        logger.error(`Error actualizando usuario: ${error.message}`);
+        res.status(500).json({ error: 'Error interno al actualizar' });
+    }
+});
+
+// ============================================================
+// ENDPOINT ELIMINAR (DELETE /api/users/:username) - Mejora: Soft delete
+// ============================================================
+app.delete('/api/users/:username', authMiddleware, async (req, res) => {
+    const client = await connectDB();
+    const db = client.db(DB_NAME);
+    const collection = db.collection(COLLECTIONS.USERS);
+
+    try {
+        const username = req.params.username;
+
+        // Soft delete: Set activo=false en vez de borrar
+        const result = await collection.updateOne(
+            { username },
+            { $set: { activo: false, deletedAt: new Date() } }
+        );
+
+        if (result.matchedCount === 0) {
+            return res.status(404).json({ error: 'Usuario no encontrado' });
+        }
+
+        logger.info(`Usuario eliminado (soft): ${username} por ${req.usuario.username}`);
+        res.json({ success: true });
+
+    } catch (error) {
+        logger.error(`Error eliminando usuario: ${error.message}`);
+        res.status(500).json({ error: 'Error interno al eliminar' });
+    }
 });
 
 // ============================================================
@@ -1196,3 +1189,4 @@ process.on('SIGINT', async () => {
   }
   process.exit(0);
 });
+
