@@ -1,15 +1,16 @@
+
 {
   "version": 2,
   "builds": [
     {
-      "src": "server-vercel-gdrive.js",
+      "src": "server.js",  
       "use": "@vercel/node"
     }
   ],
   "routes": [
     {
       "src": "/(.*)",
-      "dest": "server-vercel-gdrive.js"
+      "dest": "server.js" 
     }
   ],
   "env": {
