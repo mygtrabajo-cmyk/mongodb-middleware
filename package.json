@@ -1,27 +1,12 @@
 {
   "name": "myg-servidor-unificado",
-  "version": "3.0.0",
-  "description": "Servidor unificado MYG Telecom: MongoDB/IQU + RH + Formatos de Activación",
+  "version": "3.1.0",
+  "description": "Servidor unificado MYG Telecom con Google Drive",
   "type": "module",
-  "main": "server-unificado.js",
+  "main": "server-vercel-gdrive.js",
   "scripts": {
-    "start": "node server-unificado.js",
-    "dev": "node --watch server-unificado.js",
-    "test": "node test-server.js"
+    "start": "node server-vercel-gdrive.js"
   },
-  "keywords": [
-    "mongodb",
-    "middleware",
-    "iqu",
-    "rh",
-    "excel",
-    "exceljs",
-    "formatos",
-    "activacion",
-    "myg"
-  ],
-  "author": "IT Department - MYG Telecom",
-  "license": "MIT",
   "dependencies": {
     "express": "^4.18.2",
     "mongodb": "^6.3.0",
@@ -29,9 +14,6 @@
     "cors": "^2.8.5",
     "joi": "^17.13.3",
     "winston": "^3.13.1"
-  },
-  "devDependencies": {
-    "nodemon": "^3.0.1"
   },
   "engines": {
     "node": ">=18.0.0"
