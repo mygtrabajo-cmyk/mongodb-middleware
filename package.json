@@ -1,11 +1,12 @@
+
 {
   "name": "myg-servidor-unificado",
   "version": "3.1.0",
   "description": "Servidor unificado MYG Telecom con Google Drive",
   "type": "module",
-  "main": "server-vercel-gdrive.js",
+  "main": "server.js",  
   "scripts": {
-    "start": "node server-vercel-gdrive.js"
+    "start": "node server.js"  
   },
   "dependencies": {
     "express": "^4.18.2",
