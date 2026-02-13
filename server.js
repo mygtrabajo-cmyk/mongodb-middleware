@@ -1,16 +1,15 @@
-/* ============================================================
-   SERVIDOR UNIFICADO - MYG TELECOM
+/* ==================================================================
+   MYG TELECOM - SERVIDOR UNIFICADO v3.2 (HÍBRIDO)
    
-   Módulos:
-   - MongoDB Middleware (IQU Agents)
-   - Sistema RH (Movimientos y Notificaciones)
-   - Generador de Formatos de Activación (ExcelJS)
-   - Autenticación JWT
+   Características:
+   - Detección automática de entorno (local/cloud)
+   - Plantillas: filesystem (local) + Google Drive (cloud/fallback)
+   - Caché en memoria para templates descargados
+   - Sistema completo: MongoDB + RH + Formatos + Notificaciones
+   - Compatible: Node.js local + Vercel serverless
    
-   Puerto: 3000
-   Versión: 3.0 (UNIFICADO)
    Autor: Director IT - MYG Telecom
-   ============================================================ */
+   ================================================================== */
 
 import express from 'express';
 import { MongoClient, ObjectId } from 'mongodb';
@@ -30,11 +29,23 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ============================================================
-// LOGGER
+// CONFIGURACIÓN DE ENTORNO
+// ============================================================
+
+const IS_VERCEL = process.env.VERCEL === '1';
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+const TEMPLATES_DIR = path.join(__dirname, 'plantillas');
+
+// Cache de plantillas en memoria (para cloud)
+const templateCache = new Map();
+const CACHE_TTL = 60 * 60 * 1000; // 1 hora
+
+// ============================================================
+// LOGGER HÍBRIDO
 // ============================================================
 
 const logger = winston.createLogger({
-    level: process.env.LOG_LEVEL || 'info',
+    level: process.env.LOG_LEVEL || (IS_PRODUCTION ? 'info' : 'debug'),
     format: winston.format.combine(
         winston.format.timestamp(),
         winston.format.json()
@@ -45,16 +56,20 @@ const logger = winston.createLogger({
                 winston.format.colorize(),
                 winston.format.simple()
             )
-        }),
-        new winston.transports.File({ 
-            filename: 'logs/error.log', 
-            level: 'error' 
-        }),
-        new winston.transports.File({ 
-            filename: 'logs/combined.log' 
         })
     ]
 });
+
+// Solo agregar file transport si NO estamos en Vercel
+if (!IS_VERCEL) {
+    logger.add(new winston.transports.File({ 
+        filename: 'logs/error.log', 
+        level: 'error' 
+    }));
+    logger.add(new winston.transports.File({ 
+        filename: 'logs/combined.log' 
+    }));
+}
 
 // ============================================================
 // CONFIGURACIÓN
@@ -76,78 +91,88 @@ const COLLECTIONS = {
     NOTIFICACIONES: 'notificaciones'
 };
 
-// Configuración de plantillas de activación
-const TEMPLATES_DIR = path.join(__dirname, 'plantillas');
-
+// Configuración HÍBRIDA de plantillas (filesystem + Google Drive)
 const ACTIVATION_TEMPLATES = {
     ACCWEB: {
         file: 'ACTIVACION_ACCWEB.xlsx',
+        driveId: process.env.DRIVE_ID_ACCWEB,
         label: 'AccWeb',
         description: 'Sistema de Acceso Web',
         fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6', correo: 'H6' }
     },
     ASCC: {
         file: 'ACTIVACION_ASCC.xlsx',
+        driveId: process.env.DRIVE_ID_ASCC,
         label: 'ASCC',
         description: 'Alta Servicio Call Center',
         fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6', correo: 'H6' }
     },
     ASD: {
         file: 'ACTIVACION_ASD.xlsx',
+        driveId: process.env.DRIVE_ID_ASD,
         label: 'ASD',
         description: 'Sistema ASD',
         fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6', correo: 'H6' }
     },
     AVS: {
         file: 'ACTIVACION_AVS.xlsx',
+        driveId: process.env.DRIVE_ID_AVS,
         label: 'AVS',
         description: 'Sistema AVS',
         fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6', correo: 'H6' }
     },
     DIGITAL: {
         file: 'ACTIVACION_DIGITAL.xlsx',
+        driveId: process.env.DRIVE_ID_DIGITAL,
         label: 'DIGITAL',
         description: 'Sistema Digital',
         fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6', correo: 'H6' }
     },
     IC: {
         file: 'ACTIVACION_IC.xlsx',
+        driveId: process.env.DRIVE_ID_IC,
         label: 'IC',
         description: 'Información Comercial',
         fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6', correo: 'H6' }
     },
     IDM: {
         file: 'ACTIVACION_IDM.xlsx',
+        driveId: process.env.DRIVE_ID_IDM,
         label: 'IDM',
         description: 'Sistema IDM',
         fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6', correo: 'H6' }
     },
     OFA: {
         file: 'ACTIVACION_OFA.xlsx',
+        driveId: process.env.DRIVE_ID_OFA,
         label: 'OFA',
         description: 'Sistema OFA',
         fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6', correo: 'H6' }
     },
     PAYMENTBOX: {
         file: 'ACTIVACION_PAYMENTBOX.xlsx',
+        driveId: process.env.DRIVE_ID_PAYMENTBOX,
         label: 'PAYMENTBOX',
         description: 'Sistema Payment Box',
         fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6', correo: 'H6' }
     },
     RED: {
         file: 'ACTIVACION_RED.xlsx',
+        driveId: process.env.DRIVE_ID_RED,
         label: 'RED',
         description: 'Sistema de Red',
         fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6', correo: 'H6' }
     },
     SALESFORCE: {
         file: 'ACTIVACION_SALESFORCE.xlsx',
+        driveId: process.env.DRIVE_ID_SALESFORCE,
         label: 'SALESFORCE',
         description: 'Sistema Salesforce',
         fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6', correo: 'H6' }
     },
     VPN: {
         file: 'ACTIVACION_VPN.xlsx',
+        driveId: process.env.DRIVE_ID_VPN,
         label: 'VPN',
         description: 'Red Privada Virtual',
         fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6', correo: 'H6' }
@@ -186,7 +211,8 @@ app.use(express.json({ limit: '10mb' }));
 app.use((req, res, next) => {
     logger.info(`${req.method} ${req.path}`, { 
         ip: req.ip,
-        userAgent: req.get('user-agent')
+        userAgent: req.get('user-agent'),
+        env: IS_VERCEL ? 'vercel' : 'local'
     });
     next();
 });
@@ -327,79 +353,112 @@ async function getCollection(collectionName) {
 }
 
 // ============================================================
-// INICIALIZACIÓN
+// TEMPLATE LOADING - SISTEMA HÍBRIDO
 // ============================================================
 
-async function initializeDB() {
+/**
+ * Descarga plantilla desde Google Drive
+ * @param {string} driveId - ID del archivo en Google Drive
+ * @param {string} filename - Nombre del archivo (para logs)
+ * @returns {Promise<Buffer>} Buffer del archivo
+ */
+async function downloadTemplateFromDrive(driveId, filename) {
     try {
-        // Crear usuario admin por defecto
-        const users = await getCollection(COLLECTIONS.USERS);
-        const admin = await users.findOne({ username: 'admin' });
-
-        if (!admin) {
-            const passwordHash = hashPassword('myg2025');
-            await users.insertOne({
-                username: 'admin',
-                password: passwordHash,
-                nombre: 'Administrador',
-                email: 'admin@mygtelecom.mx',
-                rol: 'ADMIN',
-                activo: true,
-                permisos: ['*'],
-                creadoEn: new Date().toISOString(),
-                actualizadoEn: new Date().toISOString(),
-                ultimoAcceso: null
-            });
-            logger.info('✅ Admin user created (username: admin, password: myg2025)');
+        const url = `https://drive.google.com/uc?export=download&id=${driveId}`;
+        logger.info(`📥 Downloading from Drive: ${filename}`);
+        
+        const response = await fetch(url, { 
+            headers: { 'User-Agent': 'Mozilla/5.0' },
+            signal: AbortSignal.timeout(30000) // 30s timeout
+        });
+        
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
         }
         
-        // Crear índices
-        const rhMovimientos = await getCollection(COLLECTIONS.RH_MOVIMIENTOS);
-        await rhMovimientos.createIndex({ fecha_creacion: -1 });
-        await rhMovimientos.createIndex({ estado: 1 });
-        await rhMovimientos.createIndex({ 'creado_por.username': 1 });
+        const arrayBuffer = await response.arrayBuffer();
+        const buffer = Buffer.from(arrayBuffer);
         
-        const notificaciones = await getCollection(COLLECTIONS.NOTIFICACIONES);
-        await notificaciones.createIndex({ usuario_destino: 1, leida: 1 });
-        await notificaciones.createIndex({ fecha_creacion: -1 });
+        logger.info(`✅ Downloaded: ${buffer.length} bytes`);
+        return buffer;
         
-        logger.info('✅ Database indexes created');
     } catch (error) {
-        logger.error('Error initializing DB:', error);
-        throw error;
+        logger.error(`❌ Drive download failed (${filename}):`, error.message);
+        throw new Error(`No se pudo descargar plantilla desde Drive: ${error.message}`);
     }
 }
 
-// Verificar plantillas de activación
-async function verificarPlantillas() {
+/**
+ * Carga plantilla desde filesystem local
+ * @param {string} templatePath - Ruta completa del archivo
+ * @param {string} filename - Nombre del archivo (para logs)
+ * @returns {Promise<Buffer>} Buffer del archivo
+ */
+async function loadTemplateFromFilesystem(templatePath, filename) {
     try {
-        await fs.access(TEMPLATES_DIR);
-        logger.info(`✅ Templates directory found: ${TEMPLATES_DIR}`);
-    } catch {
-        logger.warn(`⚠️  Templates directory not found: ${TEMPLATES_DIR}`);
-        logger.warn('   Formatos de activación NO estarán disponibles');
-        logger.warn('   Crear directorio: mkdir plantillas');
-        return false;
+        logger.info(`📂 Loading from filesystem: ${filename}`);
+        const buffer = await fs.readFile(templatePath);
+        logger.info(`✅ Loaded: ${buffer.length} bytes`);
+        return buffer;
+    } catch (error) {
+        logger.error(`❌ Filesystem load failed (${filename}):`, error.message);
+        throw new Error(`No se pudo cargar plantilla del filesystem: ${error.message}`);
     }
+}
 
-    const missing = [];
-    for (const [key, config] of Object.entries(ACTIVATION_TEMPLATES)) {
-        const templatePath = path.join(TEMPLATES_DIR, config.file);
+/**
+ * CARGA HÍBRIDA DE PLANTILLAS
+ * Estrategia: filesystem → cache → Google Drive
+ * 
+ * @param {string} sistema - Nombre del sistema (ACCWEB, ASCC, etc)
+ * @param {object} config - Configuración del template
+ * @returns {Promise<Buffer>} Buffer del archivo Excel
+ */
+async function loadTemplate(sistema, config) {
+    const cacheKey = `template_${sistema}`;
+    const templatePath = path.join(TEMPLATES_DIR, config.file);
+    
+    // 1. INTENTAR FILESYSTEM (si no estamos en Vercel)
+    if (!IS_VERCEL) {
         try {
             await fs.access(templatePath);
-        } catch {
-            missing.push(config.file);
+            return await loadTemplateFromFilesystem(templatePath, config.file);
+        } catch (error) {
+            logger.warn(`⚠️  Filesystem unavailable for ${config.file}, trying alternatives...`);
         }
     }
-
-    if (missing.length > 0) {
-        logger.warn(`⚠️  Missing ${missing.length} templates:`);
-        missing.forEach(file => logger.warn(`   - ${file}`));
-        return false;
+    
+    // 2. VERIFICAR CACHE (para entornos cloud)
+    if (templateCache.has(cacheKey)) {
+        const cached = templateCache.get(cacheKey);
+        const age = Date.now() - cached.timestamp;
+        
+        if (age < CACHE_TTL) {
+            logger.info(`♻️  Using cached template: ${config.file} (age: ${Math.round(age/1000)}s)`);
+            return cached.buffer;
+        } else {
+            logger.debug(`⏰ Cache expired for ${config.file}, refreshing...`);
+            templateCache.delete(cacheKey);
+        }
     }
-
-    logger.info(`✅ All ${Object.keys(ACTIVATION_TEMPLATES).length} templates found`);
-    return true;
+    
+    // 3. DESCARGAR DESDE GOOGLE DRIVE
+    if (!config.driveId) {
+        throw new Error(
+            `Plantilla ${config.file} no disponible: ` +
+            `falta filesystem Y variable DRIVE_ID_${sistema}`
+        );
+    }
+    
+    const buffer = await downloadTemplateFromDrive(config.driveId, config.file);
+    
+    // Guardar en cache
+    templateCache.set(cacheKey, {
+        buffer,
+        timestamp: Date.now()
+    });
+    
+    return buffer;
 }
 
 // ============================================================
@@ -463,19 +522,136 @@ function generateSafeFilename(sistema, nombre) {
 }
 
 // ============================================================
+// INICIALIZACIÓN
+// ============================================================
+
+async function initializeDB() {
+    try {
+        // Crear usuario admin por defecto
+        const users = await getCollection(COLLECTIONS.USERS);
+        const admin = await users.findOne({ username: 'admin' });
+
+        if (!admin) {
+            const passwordHash = hashPassword('myg2025');
+            await users.insertOne({
+                username: 'admin',
+                password: passwordHash,
+                nombre: 'Administrador',
+                email: 'admin@mygtelecom.mx',
+                rol: 'ADMIN',
+                activo: true,
+                permisos: ['*'],
+                creadoEn: new Date().toISOString(),
+                actualizadoEn: new Date().toISOString(),
+                ultimoAcceso: null
+            });
+            logger.info('✅ Admin user created (username: admin, password: myg2025)');
+        }
+        
+        // Crear índices
+        const rhMovimientos = await getCollection(COLLECTIONS.RH_MOVIMIENTOS);
+        await rhMovimientos.createIndex({ fecha_creacion: -1 });
+        await rhMovimientos.createIndex({ estado: 1 });
+        await rhMovimientos.createIndex({ 'creado_por.username': 1 });
+        
+        const notificaciones = await getCollection(COLLECTIONS.NOTIFICACIONES);
+        await notificaciones.createIndex({ usuario_destino: 1, leida: 1 });
+        await notificaciones.createIndex({ fecha_creacion: -1 });
+        
+        logger.info('✅ Database indexes created');
+    } catch (error) {
+        logger.error('Error initializing DB:', error);
+        throw error;
+    }
+}
+
+// Verificar disponibilidad de plantillas
+async function verificarPlantillas() {
+    const status = {
+        filesystem: false,
+        googleDrive: false,
+        available: [],
+        missing: [],
+        mode: IS_VERCEL ? 'cloud' : 'local'
+    };
+
+    // Verificar filesystem (solo si no estamos en Vercel)
+    if (!IS_VERCEL) {
+        try {
+            await fs.access(TEMPLATES_DIR);
+            status.filesystem = true;
+            logger.info(`✅ Templates directory found: ${TEMPLATES_DIR}`);
+        } catch {
+            logger.warn(`⚠️  Templates directory not found: ${TEMPLATES_DIR}`);
+        }
+    }
+
+    // Verificar cada plantilla
+    for (const [key, config] of Object.entries(ACTIVATION_TEMPLATES)) {
+        let available = false;
+        
+        // Verificar filesystem
+        if (status.filesystem) {
+            const templatePath = path.join(TEMPLATES_DIR, config.file);
+            try {
+                await fs.access(templatePath);
+                available = true;
+                status.available.push({ sistema: key, source: 'filesystem' });
+            } catch {}
+        }
+        
+        // Verificar Google Drive
+        if (!available && config.driveId) {
+            status.googleDrive = true;
+            available = true;
+            status.available.push({ sistema: key, source: 'drive' });
+        }
+        
+        if (!available) {
+            status.missing.push({ 
+                sistema: key, 
+                file: config.file,
+                needsDriveId: `DRIVE_ID_${key}`
+            });
+        }
+    }
+
+    // Log resumen
+    logger.info(`📊 Templates status:`);
+    logger.info(`   Mode: ${status.mode}`);
+    logger.info(`   Filesystem: ${status.filesystem ? '✅' : '❌'}`);
+    logger.info(`   Google Drive: ${status.googleDrive ? '✅' : '❌'}`);
+    logger.info(`   Available: ${status.available.length}/${Object.keys(ACTIVATION_TEMPLATES).length}`);
+    
+    if (status.missing.length > 0) {
+        logger.warn(`⚠️  Missing ${status.missing.length} templates:`);
+        status.missing.forEach(item => {
+            logger.warn(`   - ${item.file} (set ${item.needsDriveId})`);
+        });
+    }
+
+    return status;
+}
+
+// ============================================================
 // ENDPOINTS - ROOT & HEALTH
 // ============================================================
 
 app.get('/', (req, res) => {
     res.json({
         name: 'MYG Telecom - Servidor Unificado',
-        version: '3.0.0',
+        version: '3.2.0',
+        mode: IS_VERCEL ? 'cloud (Vercel)' : 'local',
         status: 'running',
         modules: [
             'MongoDB Middleware (IQU Agents)',
             'Sistema RH (Movimientos + Notificaciones)',
-            'Generador de Formatos de Activación'
+            'Generador de Formatos de Activación (Híbrido)'
         ],
+        storage: {
+            templates: IS_VERCEL ? 'Google Drive' : 'Filesystem + Google Drive (fallback)',
+            cache: `In-memory (TTL: ${CACHE_TTL/1000}s)`
+        },
         endpoints: {
             auth: '/api/auth/login',
             users: '/api/users',
@@ -491,31 +667,37 @@ app.get('/', (req, res) => {
 app.get('/health', async (req, res) => {
     try {
         await connectDB();
-        const plantillasOK = await verificarPlantillas();
+        const plantillasStatus = await verificarPlantillas();
         
         res.json({
             status: 'ok',
             timestamp: new Date().toISOString(),
-            database: 'mongodb',
-            version: '3.0.0',
+            environment: {
+                mode: IS_VERCEL ? 'cloud' : 'local',
+                isProduction: IS_PRODUCTION,
+                nodeVersion: process.version
+            },
+            database: {
+                type: 'mongodb',
+                status: 'connected'
+            },
+            storage: {
+                templates: plantillasStatus,
+                cacheSize: templateCache.size
+            },
+            version: '3.2.0',
             modules: {
                 mongodb: 'ok',
                 rh: 'ok',
-                formatos: plantillasOK ? 'ok' : 'partial (templates missing)'
-            },
-            endpoints: {
-                auth: 'POST /api/auth/login',
-                users: 'GET,POST,PUT,DELETE /api/users',
-                devices: 'GET,POST /api/devices',
-                rh: 'GET,POST,PUT,PATCH /api/rh/movimientos',
-                notifications: 'GET,POST,PATCH /api/notificaciones',
-                formats: 'GET,POST /api/formatos/*'
+                formatos: plantillasStatus.available.length > 0 ? 'ok' : 'degraded'
             }
         });
     } catch (error) {
+        logger.error('Health check failed:', error);
         res.status(500).json({
             status: 'error',
-            error: error.message
+            error: error.message,
+            timestamp: new Date().toISOString()
         });
     }
 });
@@ -688,18 +870,38 @@ app.delete('/api/users/:username', authMiddleware, requireAdmin, async (req, res
 // ============================================================
 
 // Listar sistemas disponibles
-app.get('/api/formatos/sistemas', authMiddleware, (req, res) => {
-    const sistemas = Object.keys(ACTIVATION_TEMPLATES).map(key => ({
-        id: key,
-        label: ACTIVATION_TEMPLATES[key].label,
-        description: ACTIVATION_TEMPLATES[key].description,
-        file: ACTIVATION_TEMPLATES[key].file
-    })).sort((a, b) => a.label.localeCompare(b.label));
+app.get('/api/formatos/sistemas', authMiddleware, async (req, res) => {
+    try {
+        const plantillasStatus = await verificarPlantillas();
+        
+        const sistemas = Object.keys(ACTIVATION_TEMPLATES).map(key => {
+            const config = ACTIVATION_TEMPLATES[key];
+            const availableItem = plantillasStatus.available.find(item => item.sistema === key);
+            const missingItem = plantillasStatus.missing.find(item => item.sistema === key);
+            
+            return {
+                id: key,
+                label: config.label,
+                description: config.description,
+                file: config.file,
+                status: availableItem ? 'available' : 'unavailable',
+                source: availableItem?.source || null,
+                driveConfigured: !!config.driveId,
+                missingEnvVar: missingItem?.needsDriveId || null
+            };
+        }).sort((a, b) => a.label.localeCompare(b.label));
 
-    res.json({
-        total: sistemas.length,
-        sistemas
-    });
+        res.json({
+            total: sistemas.length,
+            available: sistemas.filter(s => s.status === 'available').length,
+            mode: IS_VERCEL ? 'cloud' : 'local',
+            storage: plantillasStatus,
+            sistemas
+        });
+    } catch (error) {
+        logger.error('Error listing systems:', error);
+        res.status(500).json({ error: error.message });
+    }
 });
 
 // Generar formato (requiere autenticación)
@@ -723,17 +925,6 @@ app.post('/api/formatos/generar', authMiddleware, async (req, res) => {
         }
 
         const config = ACTIVATION_TEMPLATES[sistema];
-        const templatePath = path.join(TEMPLATES_DIR, config.file);
-
-        // Verificar plantilla
-        try {
-            await fs.access(templatePath);
-        } catch {
-            return res.status(404).json({ 
-                error: `Plantilla no encontrada: ${config.file}`,
-                ruta: templatePath
-            });
-        }
 
         // Mapear datos
         const fieldData = mapUserDataForFormato(userData);
@@ -748,9 +939,12 @@ app.post('/api/formatos/generar', authMiddleware, async (req, res) => {
 
         logger.info(`Generating format: ${sistema} for ${fieldData.nombre}`);
 
+        // CARGA HÍBRIDA DE PLANTILLA
+        const templateBuffer = await loadTemplate(sistema, config);
+
         // Cargar plantilla con ExcelJS
         const workbook = new ExcelJS.Workbook();
-        await workbook.xlsx.readFile(templatePath);
+        await workbook.xlsx.load(templateBuffer);
 
         const worksheet = workbook.worksheets[0];
 
@@ -790,6 +984,7 @@ app.post('/api/formatos/generar', authMiddleware, async (req, res) => {
                 filename,
                 size_bytes: buffer.length,
                 duracion_ms: elapsedTime,
+                environment: IS_VERCEL ? 'cloud' : 'local',
                 timestamp: new Date().toISOString()
             });
         } catch (logError) {
@@ -802,6 +997,7 @@ app.post('/api/formatos/generar', authMiddleware, async (req, res) => {
         res.setHeader('Content-Disposition', 
             `attachment; filename="${filename}"`);
         res.setHeader('X-Generated-In-Ms', elapsedTime.toString());
+        res.setHeader('X-Source', IS_VERCEL ? 'drive' : 'filesystem');
         res.send(buffer);
 
     } catch (error) {
@@ -809,9 +1005,22 @@ app.post('/api/formatos/generar', authMiddleware, async (req, res) => {
         logger.error('Error generating format:', error);
         res.status(500).json({ 
             error: error.message,
-            elapsedTime
+            elapsedTime,
+            sistema: req.body.sistema
         });
     }
+});
+
+// Limpiar cache (solo ADMIN)
+app.post('/api/formatos/clear-cache', authMiddleware, requireAdmin, (req, res) => {
+    const beforeSize = templateCache.size;
+    templateCache.clear();
+    logger.info(`Cache cleared by ${req.usuario.username} (${beforeSize} items)`);
+    res.json({
+        success: true,
+        itemsCleared: beforeSize,
+        message: `Cache cleared: ${beforeSize} templates removed`
+    });
 });
 
 // ============================================================
@@ -1072,7 +1281,8 @@ app.patch('/api/notificaciones/:id/leer', authMiddleware, async (req, res) => {
 app.use((req, res) => {
     res.status(404).json({
         error: 'Endpoint no encontrado',
-        path: req.path
+        path: req.path,
+        method: req.method
     });
 });
 
@@ -1080,7 +1290,7 @@ app.use((err, req, res, next) => {
     logger.error('Unhandled error:', err);
     res.status(500).json({ 
         error: 'Internal server error',
-        message: err.message 
+        message: IS_PRODUCTION ? 'An error occurred' : err.message
     });
 });
 
@@ -1090,8 +1300,10 @@ app.use((err, req, res, next) => {
 
 async function startServer() {
     try {
-        // Crear directorio de logs
-        await fs.mkdir('logs', { recursive: true });
+        // Crear directorio de logs (solo local)
+        if (!IS_VERCEL) {
+            await fs.mkdir('logs', { recursive: true });
+        }
         
         // Conectar MongoDB
         await connectDB();
@@ -1101,36 +1313,45 @@ async function startServer() {
         await initializeDB();
         
         // Verificar plantillas
-        await verificarPlantillas();
+        const plantillasStatus = await verificarPlantillas();
         
         // Iniciar servidor
         app.listen(PORT, () => {
             console.log('');
             console.log('='.repeat(60));
-            console.log('🚀 SERVIDOR UNIFICADO - MYG TELECOM');
+            console.log('🚀 SERVIDOR UNIFICADO v3.2 - MYG TELECOM');
             console.log('='.repeat(60));
             console.log('');
             console.log(`✅ Estado: ACTIVO`);
             console.log(`🌐 Puerto: ${PORT}`);
             console.log(`🔗 URL: http://localhost:${PORT}`);
+            console.log(`📦 Modo: ${IS_VERCEL ? 'CLOUD (Vercel)' : 'LOCAL'}`);
             console.log('');
             console.log('📦 Módulos cargados:');
             console.log('   ✅ MongoDB Middleware (IQU Agents)');
             console.log('   ✅ Sistema RH (Movimientos + Notificaciones)');
-            console.log('   ✅ Generador de Formatos de Activación');
+            console.log('   ✅ Generador de Formatos de Activación (HÍBRIDO)');
+            console.log('');
+            console.log('💾 Storage:');
+            if (!IS_VERCEL) {
+                console.log(`   📂 Filesystem: ${plantillasStatus.filesystem ? '✅' : '❌'}`);
+            }
+            console.log(`   ☁️  Google Drive: ${plantillasStatus.googleDrive ? '✅ (configurado)' : '❌ (no configurado)'}`);
+            console.log(`   ♻️  Cache: ${templateCache.size} plantillas en memoria`);
             console.log('');
             console.log('🔐 Autenticación:');
             console.log('   Usuario: admin');
             console.log('   Password: myg2025');
             console.log('');
             console.log('📌 Endpoints principales:');
-            console.log('   POST /api/auth/login           - Login');
-            console.log('   GET  /api/users                - Usuarios');
-            console.log('   GET  /api/devices              - Dispositivos IQU');
-            console.log('   POST /api/rh/movimientos       - Movimientos RH');
-            console.log('   GET  /api/notificaciones       - Notificaciones');
-            console.log('   GET  /api/formatos/sistemas    - Sistemas disponibles');
-            console.log('   POST /api/formatos/generar     - Generar formato');
+            console.log('   POST /api/auth/login                - Login');
+            console.log('   GET  /api/users                     - Usuarios');
+            console.log('   GET  /api/devices                   - Dispositivos IQU');
+            console.log('   POST /api/rh/movimientos            - Movimientos RH');
+            console.log('   GET  /api/notificaciones            - Notificaciones');
+            console.log('   GET  /api/formatos/sistemas         - Sistemas disponibles');
+            console.log('   POST /api/formatos/generar          - Generar formato');
+            console.log('   POST /api/formatos/clear-cache      - Limpiar caché (ADMIN)');
             console.log('');
             console.log('='.repeat(60));
             console.log('');
@@ -1148,6 +1369,7 @@ startServer();
 // Graceful shutdown
 process.on('SIGINT', async () => {
     console.log('\n🛑 Shutting down server...');
+    templateCache.clear();
     if (cachedClient) {
         await cachedClient.close();
         logger.info('✅ MongoDB connection closed');
@@ -1157,8 +1379,12 @@ process.on('SIGINT', async () => {
 
 process.on('SIGTERM', async () => {
     console.log('\n🛑 SIGTERM received, shutting down...');
+    templateCache.clear();
     if (cachedClient) {
         await cachedClient.close();
     }
     process.exit(0);
 });
+
+// Export para Vercel
+export default app;
