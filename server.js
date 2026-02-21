@@ -8,7 +8,7 @@
    - Sistema completo: MongoDB + RH + Formatos + Notificaciones
    - Compatible: Node.js local + Vercel serverless
    
-   Autor: Director IT - MYG Telecom
+   Autor: luis oliva - MYG Telecom
    ================================================================== */
 
 import express from 'express';
@@ -33,7 +33,11 @@ const PORT = process.env.PORT || 3000;
 // ============================================================
 
 const IS_VERCEL = process.env.VERCEL === '1';
+const IS_RENDER = process.env.RENDER === 'true';
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+// IS_CLOUD: true en cualquier entorno cloud (Vercel, Render, Railway, etc.)
+// En cloud no existe filesystem local → siempre usar Google Drive
+const IS_CLOUD = IS_VERCEL || IS_RENDER || IS_PRODUCTION;
 const TEMPLATES_DIR = path.join(__dirname, 'plantillas');
 
 // Cache de plantillas en memoria (para cloud)
@@ -61,7 +65,7 @@ const logger = winston.createLogger({
 });
 
 // Solo agregar file transport si NO estamos en Vercel
-if (!IS_VERCEL) {
+if (!IS_CLOUD) {
     logger.add(new winston.transports.File({ 
         filename: 'logs/error.log', 
         level: 'error' 
@@ -95,7 +99,7 @@ const COLLECTIONS = {
 const ACTIVATION_TEMPLATES = {
     ACCWEB: {
         file: 'ACTIVACION_ACCWEB.xlsx',
-        driveId: process.env.DRIVE_ID_ACCWEB,
+        driveId: process.env.DRIVE_ID_ASCCWEB || process.env.DRIVE_ID_ACCWEB, // soporta ambos nombres
         label: 'AccWeb',
         description: 'Sistema de Acceso Web',
         fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6', correo: 'H6' }
@@ -212,7 +216,7 @@ app.use((req, res, next) => {
     logger.info(`${req.method} ${req.path}`, { 
         ip: req.ip,
         userAgent: req.get('user-agent'),
-        env: IS_VERCEL ? 'vercel' : 'local'
+        env: IS_CLOUD ? 'cloud' : 'local'
     });
     next();
 });
@@ -418,8 +422,8 @@ async function loadTemplate(sistema, config) {
     const cacheKey = `template_${sistema}`;
     const templatePath = path.join(TEMPLATES_DIR, config.file);
     
-    // 1. INTENTAR FILESYSTEM (si no estamos en Vercel)
-    if (!IS_VERCEL) {
+    // 1. INTENTAR FILESYSTEM (solo si no estamos en cloud)
+    if (!IS_CLOUD) {
         try {
             await fs.access(templatePath);
             return await loadTemplateFromFilesystem(templatePath, config.file);
@@ -572,11 +576,11 @@ async function verificarPlantillas() {
         googleDrive: false,
         available: [],
         missing: [],
-        mode: IS_VERCEL ? 'cloud' : 'local'
+        mode: IS_CLOUD ? 'cloud' : 'local'
     };
 
-    // Verificar filesystem (solo si no estamos en Vercel)
-    if (!IS_VERCEL) {
+    // Verificar filesystem (solo si no estamos en cloud)
+    if (!IS_CLOUD) {
         try {
             await fs.access(TEMPLATES_DIR);
             status.filesystem = true;
@@ -641,7 +645,7 @@ app.get('/', (req, res) => {
     res.json({
         name: 'MYG Telecom - Servidor Unificado',
         version: '3.2.0',
-        mode: IS_VERCEL ? 'cloud (Vercel)' : 'local',
+        mode: IS_CLOUD ? 'cloud (Render/Vercel)' : 'local',
         status: 'running',
         modules: [
             'MongoDB Middleware (IQU Agents)',
@@ -649,7 +653,7 @@ app.get('/', (req, res) => {
             'Generador de Formatos de Activación (Híbrido)'
         ],
         storage: {
-            templates: IS_VERCEL ? 'Google Drive' : 'Filesystem + Google Drive (fallback)',
+            templates: IS_CLOUD ? 'Google Drive' : 'Filesystem + Google Drive (fallback)',
             cache: `In-memory (TTL: ${CACHE_TTL/1000}s)`
         },
         endpoints: {
@@ -673,7 +677,7 @@ app.get('/health', async (req, res) => {
             status: 'ok',
             timestamp: new Date().toISOString(),
             environment: {
-                mode: IS_VERCEL ? 'cloud' : 'local',
+                mode: IS_CLOUD ? 'cloud' : 'local',
                 isProduction: IS_PRODUCTION,
                 nodeVersion: process.version
             },
@@ -894,7 +898,7 @@ app.get('/api/formatos/sistemas', authMiddleware, async (req, res) => {
         res.json({
             total: sistemas.length,
             available: sistemas.filter(s => s.status === 'available').length,
-            mode: IS_VERCEL ? 'cloud' : 'local',
+            mode: IS_CLOUD ? 'cloud' : 'local',
             storage: plantillasStatus,
             sistemas
         });
@@ -984,7 +988,7 @@ app.post('/api/formatos/generar', authMiddleware, async (req, res) => {
                 filename,
                 size_bytes: buffer.length,
                 duracion_ms: elapsedTime,
-                environment: IS_VERCEL ? 'cloud' : 'local',
+                environment: IS_CLOUD ? 'cloud' : 'local',
                 timestamp: new Date().toISOString()
             });
         } catch (logError) {
@@ -997,7 +1001,7 @@ app.post('/api/formatos/generar', authMiddleware, async (req, res) => {
         res.setHeader('Content-Disposition', 
             `attachment; filename="${filename}"`);
         res.setHeader('X-Generated-In-Ms', elapsedTime.toString());
-        res.setHeader('X-Source', IS_VERCEL ? 'drive' : 'filesystem');
+        res.setHeader('X-Source', IS_CLOUD ? 'drive' : 'filesystem');
         res.send(buffer);
 
     } catch (error) {
@@ -1301,7 +1305,7 @@ app.use((err, req, res, next) => {
 async function startServer() {
     try {
         // Crear directorio de logs (solo local)
-        if (!IS_VERCEL) {
+        if (!IS_CLOUD) {
             await fs.mkdir('logs', { recursive: true });
         }
         
@@ -1325,7 +1329,7 @@ async function startServer() {
             console.log(`✅ Estado: ACTIVO`);
             console.log(`🌐 Puerto: ${PORT}`);
             console.log(`🔗 URL: http://localhost:${PORT}`);
-            console.log(`📦 Modo: ${IS_VERCEL ? 'CLOUD (Vercel)' : 'LOCAL'}`);
+            console.log(`📦 Modo: ${IS_CLOUD ? 'CLOUD (Render/Vercel)' : 'LOCAL'}`);
             console.log('');
             console.log('📦 Módulos cargados:');
             console.log('   ✅ MongoDB Middleware (IQU Agents)');
@@ -1333,7 +1337,7 @@ async function startServer() {
             console.log('   ✅ Generador de Formatos de Activación (HÍBRIDO)');
             console.log('');
             console.log('💾 Storage:');
-            if (!IS_VERCEL) {
+            if (!IS_CLOUD) {
                 console.log(`   📂 Filesystem: ${plantillasStatus.filesystem ? '✅' : '❌'}`);
             }
             console.log(`   ☁️  Google Drive: ${plantillasStatus.googleDrive ? '✅ (configurado)' : '❌ (no configurado)'}`);
