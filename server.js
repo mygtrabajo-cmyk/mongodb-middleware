@@ -101,85 +101,85 @@ const ACTIVATION_TEMPLATES = {
         file: 'ACTIVACION_ACCWEB.xlsx',
         driveId: process.env.DRIVE_ID_ASCCWEB || process.env.DRIVE_ID_ACCWEB, // soporta ambos nombres
         label: 'AccWeb',
-        description: 'Sistema de Acceso Web',
-        fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6', correo: 'H6' }
+        description: 'ACCWEB',
+        fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6'}
     },
     ASCC: {
         file: 'ACTIVACION_ASCC.xlsx',
         driveId: process.env.DRIVE_ID_ASCC,
         label: 'ASCC',
-        description: 'Alta Servicio Call Center',
-        fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6', correo: 'H6' }
+        description: 'ASCC',
+        fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6'}
     },
     ASD: {
         file: 'ACTIVACION_ASD.xlsx',
         driveId: process.env.DRIVE_ID_ASD,
         label: 'ASD',
-        description: 'Sistema ASD',
-        fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6', correo: 'H6' }
+        description: 'ASD',
+        fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6'}
     },
     AVS: {
         file: 'ACTIVACION_AVS.xlsx',
         driveId: process.env.DRIVE_ID_AVS,
         label: 'AVS',
-        description: 'Sistema AVS',
-        fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6', correo: 'H6' }
+        description: 'AVS',
+        fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6'}
     },
     DIGITAL: {
         file: 'ACTIVACION_DIGITAL.xlsx',
         driveId: process.env.DRIVE_ID_DIGITAL,
         label: 'DIGITAL',
-        description: 'Sistema Digital',
-        fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6', correo: 'H6' }
+        description: 'Digital',
+        fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6'}
     },
     IC: {
         file: 'ACTIVACION_IC.xlsx',
         driveId: process.env.DRIVE_ID_IC,
         label: 'IC',
-        description: 'Información Comercial',
-        fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6', correo: 'H6' }
+        description: 'Inventario Ciclico',
+        fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6'}
     },
     IDM: {
         file: 'ACTIVACION_IDM.xlsx',
         driveId: process.env.DRIVE_ID_IDM,
         label: 'IDM',
-        description: 'Sistema IDM',
-        fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6', correo: 'H6' }
+        description: 'IDM',
+        fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6'}
     },
     OFA: {
         file: 'ACTIVACION_OFA.xlsx',
         driveId: process.env.DRIVE_ID_OFA,
         label: 'OFA',
-        description: 'Sistema OFA',
-        fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6', correo: 'H6' }
+        description: 'Oracle',
+        fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6'}
     },
     PAYMENTBOX: {
         file: 'ACTIVACION_PAYMENTBOX.xlsx',
         driveId: process.env.DRIVE_ID_PAYMENTBOX,
         label: 'PAYMENTBOX',
-        description: 'Sistema Payment Box',
-        fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6', correo: 'H6' }
+        description: 'Paymentbox',
+        fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6'}
     },
     RED: {
         file: 'ACTIVACION_RED.xlsx',
         driveId: process.env.DRIVE_ID_RED,
         label: 'RED',
-        description: 'Sistema de Red',
-        fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6', correo: 'H6' }
+        description: 'RED',
+        fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6'}
     },
     SALESFORCE: {
         file: 'ACTIVACION_SALESFORCE.xlsx',
         driveId: process.env.DRIVE_ID_SALESFORCE,
         label: 'SALESFORCE',
-        description: 'Sistema Salesforce',
-        fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6', correo: 'H6' }
+        description: 'Salesforce',
+        fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6' }
     },
     VPN: {
         file: 'ACTIVACION_VPN.xlsx',
         driveId: process.env.DRIVE_ID_VPN,
         label: 'VPN',
-        description: 'Red Privada Virtual',
-        fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6', correo: 'H6' }
+        description: 'VPN',
+        fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6' }
     }
 };
 
@@ -1392,3 +1392,4 @@ process.on('SIGTERM', async () => {
 
 // Export para Vercel
 export default app;
+
