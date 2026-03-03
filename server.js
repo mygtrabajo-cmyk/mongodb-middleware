@@ -92,7 +92,12 @@ const COLLECTIONS = {
     COMMANDS: 'commands',
     AGENTS_LOG: 'agents_log',
     RH_MOVIMIENTOS: 'rh_movimientos',
-    NOTIFICACIONES: 'notificaciones'
+    NOTIFICACIONES: 'notificaciones',
+    HUB_MENSAJES:  'hub_mensajes',
+    HUB_REUNIONES: 'hub_reuniones',
+    HUB_MINUTAS:   'hub_minutas',
+    HUB_TAREAS:    'hub_tareas',
+    HUB_ANUNCIOS:  'hub_anuncios',
 };
 
 // Configuración HÍBRIDA de plantillas (filesystem + Google Drive)
@@ -1392,4 +1397,5 @@ process.on('SIGTERM', async () => {
 
 // Export para Vercel
 export default app;
+
 
