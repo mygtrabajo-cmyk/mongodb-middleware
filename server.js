@@ -1300,6 +1300,494 @@ app.patch('/api/notificaciones/:id/leer', authMiddleware, async (req, res) => {
 });
 
 // ============================================================
+// ENDPOINTS - HUB DE SISTEMAS
+// ============================================================
+
+const requireHubAccess = (req, res, next) => {
+    if (!req.usuario || !['SISTEMAS', 'ADMIN'].includes(req.usuario.rol)) {
+        return res.status(403).json({ error: 'Acceso solo para roles SISTEMAS y ADMIN' });
+    }
+    next();
+};
+
+// ── Canales estáticos del Hub ──────────────────────────────
+const HUB_CANALES = [
+    { id: 'general',   name: 'general',    emoji: '💬', desc: 'Canal general del área de sistemas', pinned: true  },
+    { id: 'proyectos', name: 'proyectos',  emoji: '🚀', desc: 'Seguimiento y avances de proyectos',  pinned: false },
+    { id: 'soporte',   name: 'soporte',    emoji: '🛠️', desc: 'Tickets, incidencias y soporte',      pinned: false },
+    { id: 'dev',       name: 'desarrollo', emoji: '💻', desc: 'Desarrollo y actualizaciones',         pinned: false },
+    { id: 'anuncios',  name: 'anuncios',   emoji: '📣', desc: 'Comunicados oficiales (solo admin)',   pinned: true  },
+];
+
+// ─────────────────────────────────────────────────────────────
+// MENSAJES
+// ─────────────────────────────────────────────────────────────
+
+// GET /api/hub/mensajes/:canal — obtener mensajes del canal
+app.get('/api/hub/mensajes/:canal', authMiddleware, requireHubAccess, async (req, res) => {
+    try {
+        const { canal } = req.params;
+        const limit = parseInt(req.query.limit) || 100;
+
+        const col = await getCollection(COLLECTIONS.HUB_MENSAJES);
+        const mensajes = await col
+            .find({ canal })
+            .sort({ createdAt: 1 })
+            .limit(limit)
+            .toArray();
+
+        res.json({ canal, mensajes, canales: HUB_CANALES });
+    } catch (error) {
+        logger.error('Hub mensajes GET error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// POST /api/hub/mensajes/:canal — enviar mensaje
+app.post('/api/hub/mensajes/:canal', authMiddleware, requireHubAccess, async (req, res) => {
+    try {
+        const { canal } = req.params;
+        const { content } = req.body;
+
+        if (!content?.trim()) {
+            return res.status(400).json({ error: 'El contenido del mensaje es requerido' });
+        }
+
+        const col = await getCollection(COLLECTIONS.HUB_MENSAJES);
+        const mensaje = {
+            _id: new ObjectId(),
+            canal,
+            userId: req.usuario.username,
+            userName: req.usuario.nombre,
+            avatar: req.usuario.nombre?.charAt(0).toUpperCase() || '?',
+            content: content.trim(),
+            reactions: {},
+            edited: false,
+            createdAt: new Date(),
+        };
+
+        await col.insertOne(mensaje);
+        logger.info(`Hub mensaje en #${canal} por ${req.usuario.username}`);
+        res.status(201).json(mensaje);
+    } catch (error) {
+        logger.error('Hub mensaje POST error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// PATCH /api/hub/mensajes/:id — editar mensaje (solo autor)
+app.patch('/api/hub/mensajes/:id', authMiddleware, requireHubAccess, async (req, res) => {
+    try {
+        const { content } = req.body;
+        if (!content?.trim()) return res.status(400).json({ error: 'Contenido requerido' });
+
+        const col = await getCollection(COLLECTIONS.HUB_MENSAJES);
+        const result = await col.updateOne(
+            { _id: new ObjectId(req.params.id), userId: req.usuario.username },
+            { $set: { content: content.trim(), edited: true, editedAt: new Date() } }
+        );
+
+        if (result.matchedCount === 0) {
+            return res.status(404).json({ error: 'Mensaje no encontrado o no autorizado' });
+        }
+
+        const updated = await col.findOne({ _id: new ObjectId(req.params.id) });
+        res.json(updated);
+    } catch (error) {
+        logger.error('Hub mensaje PATCH error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// DELETE /api/hub/mensajes/:id — eliminar mensaje (autor o ADMIN)
+app.delete('/api/hub/mensajes/:id', authMiddleware, requireHubAccess, async (req, res) => {
+    try {
+        const col = await getCollection(COLLECTIONS.HUB_MENSAJES);
+
+        // Admin puede borrar cualquiera; usuario solo los suyos
+        const filter = req.usuario.rol === 'ADMIN'
+            ? { _id: new ObjectId(req.params.id) }
+            : { _id: new ObjectId(req.params.id), userId: req.usuario.username };
+
+        const result = await col.deleteOne(filter);
+        if (result.deletedCount === 0) {
+            return res.status(404).json({ error: 'Mensaje no encontrado o no autorizado' });
+        }
+
+        res.json({ success: true });
+    } catch (error) {
+        logger.error('Hub mensaje DELETE error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// PATCH /api/hub/mensajes/:id/reaction — toggle reacción
+app.patch('/api/hub/mensajes/:id/reaction', authMiddleware, requireHubAccess, async (req, res) => {
+    try {
+        const { emoji } = req.body;
+        if (!emoji) return res.status(400).json({ error: 'Emoji requerido' });
+
+        const col = await getCollection(COLLECTIONS.HUB_MENSAJES);
+        const msg = await col.findOne({ _id: new ObjectId(req.params.id) });
+        if (!msg) return res.status(404).json({ error: 'Mensaje no encontrado' });
+
+        const userId = req.usuario.username;
+        const current = msg.reactions?.[emoji] || [];
+        const updated = current.includes(userId)
+            ? current.filter(u => u !== userId)
+            : [...current, userId];
+
+        await col.updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $set: { [`reactions.${emoji}`]: updated } }
+        );
+
+        const updatedMsg = await col.findOne({ _id: new ObjectId(req.params.id) });
+        res.json(updatedMsg);
+    } catch (error) {
+        logger.error('Hub reaction error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ─────────────────────────────────────────────────────────────
+// REUNIONES
+// ─────────────────────────────────────────────────────────────
+
+// GET /api/hub/reuniones
+app.get('/api/hub/reuniones', authMiddleware, requireHubAccess, async (req, res) => {
+    try {
+        const col = await getCollection(COLLECTIONS.HUB_REUNIONES);
+        const reuniones = await col.find({}).sort({ fecha: 1, hora: 1 }).toArray();
+        res.json(reuniones);
+    } catch (error) {
+        logger.error('Hub reuniones GET error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// POST /api/hub/reuniones
+app.post('/api/hub/reuniones', authMiddleware, requireHubAccess, async (req, res) => {
+    try {
+        const { title, desc, date, time, duration, location, attendees, agenda } = req.body;
+        if (!title?.trim() || !date || !time) {
+            return res.status(400).json({ error: 'Título, fecha y hora son requeridos' });
+        }
+
+        const col = await getCollection(COLLECTIONS.HUB_REUNIONES);
+        const reunion = {
+            _id: new ObjectId(),
+            title: title.trim(),
+            desc: desc || '',
+            date,
+            time,
+            duration: duration || 60,
+            location: location || '',
+            attendees: Array.isArray(attendees) ? attendees : (attendees || '').split(',').map(a => a.trim()).filter(Boolean),
+            agenda: agenda || '',
+            organizer: req.usuario.nombre,
+            organizerUsername: req.usuario.username,
+            status: 'scheduled',
+            createdAt: new Date(),
+        };
+
+        await col.insertOne(reunion);
+        logger.info(`Hub reunión creada: "${title}" por ${req.usuario.username}`);
+        res.status(201).json(reunion);
+    } catch (error) {
+        logger.error('Hub reunión POST error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// PATCH /api/hub/reuniones/:id
+app.patch('/api/hub/reuniones/:id', authMiddleware, requireHubAccess, async (req, res) => {
+    try {
+        const allowed = ['title', 'desc', 'date', 'time', 'duration', 'location', 'attendees', 'agenda', 'status'];
+        const updates = {};
+        allowed.forEach(k => { if (req.body[k] !== undefined) updates[k] = req.body[k]; });
+        updates.updatedAt = new Date();
+
+        const col = await getCollection(COLLECTIONS.HUB_REUNIONES);
+        const result = await col.updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $set: updates }
+        );
+
+        if (result.matchedCount === 0) return res.status(404).json({ error: 'Reunión no encontrada' });
+
+        const updated = await col.findOne({ _id: new ObjectId(req.params.id) });
+        res.json(updated);
+    } catch (error) {
+        logger.error('Hub reunión PATCH error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// DELETE /api/hub/reuniones/:id
+app.delete('/api/hub/reuniones/:id', authMiddleware, requireHubAccess, async (req, res) => {
+    try {
+        const col = await getCollection(COLLECTIONS.HUB_REUNIONES);
+        const result = await col.deleteOne({ _id: new ObjectId(req.params.id) });
+        if (result.deletedCount === 0) return res.status(404).json({ error: 'Reunión no encontrada' });
+        res.json({ success: true });
+    } catch (error) {
+        logger.error('Hub reunión DELETE error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ─────────────────────────────────────────────────────────────
+// MINUTAS
+// ─────────────────────────────────────────────────────────────
+
+// GET /api/hub/minutas
+app.get('/api/hub/minutas', authMiddleware, requireHubAccess, async (req, res) => {
+    try {
+        const col = await getCollection(COLLECTIONS.HUB_MINUTAS);
+        const minutas = await col.find({}).sort({ createdAt: -1 }).toArray();
+        res.json(minutas);
+    } catch (error) {
+        logger.error('Hub minutas GET error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// POST /api/hub/minutas
+app.post('/api/hub/minutas', authMiddleware, requireHubAccess, async (req, res) => {
+    try {
+        const { title, date, summary, decisions, actionItems, attendees, meetingId } = req.body;
+        if (!title?.trim() || !summary?.trim()) {
+            return res.status(400).json({ error: 'Título y resumen son requeridos' });
+        }
+
+        const parsedActions = (Array.isArray(actionItems) ? actionItems : (actionItems || '').split('\n'))
+            .map(t => t.trim()).filter(Boolean)
+            .map(text => ({ id: new ObjectId().toString(), text, done: false }));
+
+        const col = await getCollection(COLLECTIONS.HUB_MINUTAS);
+        const minuta = {
+            _id: new ObjectId(),
+            meetingId: meetingId || null,
+            title: title.trim(),
+            date: date || '',
+            summary: summary.trim(),
+            decisions: decisions || '',
+            actionItems: parsedActions,
+            attendees: attendees || '',
+            author: req.usuario.nombre,
+            authorUsername: req.usuario.username,
+            comments: [],
+            createdAt: new Date(),
+        };
+
+        await col.insertOne(minuta);
+        logger.info(`Hub minuta creada: "${title}" por ${req.usuario.username}`);
+        res.status(201).json(minuta);
+    } catch (error) {
+        logger.error('Hub minuta POST error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// POST /api/hub/minutas/:id/comentarios — agregar comentario
+app.post('/api/hub/minutas/:id/comentarios', authMiddleware, requireHubAccess, async (req, res) => {
+    try {
+        const { content } = req.body;
+        if (!content?.trim()) return res.status(400).json({ error: 'Contenido requerido' });
+
+        const comment = {
+            id: new ObjectId().toString(),
+            userId: req.usuario.username,
+            userName: req.usuario.nombre,
+            content: content.trim(),
+            ts: Date.now(),
+        };
+
+        const col = await getCollection(COLLECTIONS.HUB_MINUTAS);
+        const result = await col.updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $push: { comments: comment } }
+        );
+
+        if (result.matchedCount === 0) return res.status(404).json({ error: 'Minuta no encontrada' });
+
+        const updated = await col.findOne({ _id: new ObjectId(req.params.id) });
+        res.status(201).json(updated);
+    } catch (error) {
+        logger.error('Hub comentario POST error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// PATCH /api/hub/minutas/:id/acciones/:itemId — toggle punto de acción
+app.patch('/api/hub/minutas/:id/acciones/:itemId', authMiddleware, requireHubAccess, async (req, res) => {
+    try {
+        const col = await getCollection(COLLECTIONS.HUB_MINUTAS);
+        const minuta = await col.findOne({ _id: new ObjectId(req.params.id) });
+        if (!minuta) return res.status(404).json({ error: 'Minuta no encontrada' });
+
+        const updatedActions = (minuta.actionItems || []).map(a =>
+            a.id === req.params.itemId ? { ...a, done: !a.done } : a
+        );
+
+        await col.updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $set: { actionItems: updatedActions } }
+        );
+
+        const updated = await col.findOne({ _id: new ObjectId(req.params.id) });
+        res.json(updated);
+    } catch (error) {
+        logger.error('Hub acción PATCH error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ─────────────────────────────────────────────────────────────
+// TAREAS (KANBAN)
+// ─────────────────────────────────────────────────────────────
+
+// GET /api/hub/tareas
+app.get('/api/hub/tareas', authMiddleware, requireHubAccess, async (req, res) => {
+    try {
+        const col = await getCollection(COLLECTIONS.HUB_TAREAS);
+        const tareas = await col.find({}).sort({ columna: 1, orden: 1, createdAt: -1 }).toArray();
+        res.json(tareas);
+    } catch (error) {
+        logger.error('Hub tareas GET error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// POST /api/hub/tareas
+app.post('/api/hub/tareas', authMiddleware, requireHubAccess, async (req, res) => {
+    try {
+        const { title, desc, priority, assignee, dueDate, tags } = req.body;
+        if (!title?.trim()) return res.status(400).json({ error: 'El título es requerido' });
+
+        const col = await getCollection(COLLECTIONS.HUB_TAREAS);
+        const tarea = {
+            _id: new ObjectId(),
+            title: title.trim(),
+            desc: desc || '',
+            priority: priority || 'media',
+            assignee: assignee || '',
+            dueDate: dueDate || null,
+            tags: Array.isArray(tags) ? tags : (tags || '').split(',').map(t => t.trim()).filter(Boolean),
+            status: 'todo',
+            orden: Date.now(),
+            creadoPor: req.usuario.nombre,
+            creadoPorUsername: req.usuario.username,
+            createdAt: new Date(),
+        };
+
+        await col.insertOne(tarea);
+        logger.info(`Hub tarea creada: "${title}" por ${req.usuario.username}`);
+        res.status(201).json(tarea);
+    } catch (error) {
+        logger.error('Hub tarea POST error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// PATCH /api/hub/tareas/:id — mover columna o editar
+app.patch('/api/hub/tareas/:id', authMiddleware, requireHubAccess, async (req, res) => {
+    try {
+        const allowed = ['title', 'desc', 'priority', 'assignee', 'dueDate', 'tags', 'status', 'orden'];
+        const updates = { updatedAt: new Date() };
+        allowed.forEach(k => { if (req.body[k] !== undefined) updates[k] = req.body[k]; });
+
+        const col = await getCollection(COLLECTIONS.HUB_TAREAS);
+        const result = await col.updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $set: updates }
+        );
+
+        if (result.matchedCount === 0) return res.status(404).json({ error: 'Tarea no encontrada' });
+
+        const updated = await col.findOne({ _id: new ObjectId(req.params.id) });
+        res.json(updated);
+    } catch (error) {
+        logger.error('Hub tarea PATCH error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// DELETE /api/hub/tareas/:id
+app.delete('/api/hub/tareas/:id', authMiddleware, requireHubAccess, async (req, res) => {
+    try {
+        const col = await getCollection(COLLECTIONS.HUB_TAREAS);
+        const result = await col.deleteOne({ _id: new ObjectId(req.params.id) });
+        if (result.deletedCount === 0) return res.status(404).json({ error: 'Tarea no encontrada' });
+        res.json({ success: true });
+    } catch (error) {
+        logger.error('Hub tarea DELETE error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ─────────────────────────────────────────────────────────────
+// ANUNCIOS
+// ─────────────────────────────────────────────────────────────
+
+// GET /api/hub/anuncios
+app.get('/api/hub/anuncios', authMiddleware, requireHubAccess, async (req, res) => {
+    try {
+        const col = await getCollection(COLLECTIONS.HUB_ANUNCIOS);
+        const anuncios = await col.find({}).sort({ pinned: -1, createdAt: -1 }).toArray();
+        res.json(anuncios);
+    } catch (error) {
+        logger.error('Hub anuncios GET error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// POST /api/hub/anuncios — solo ADMIN o SISTEMAS
+app.post('/api/hub/anuncios', authMiddleware, requireHubAccess, async (req, res) => {
+    try {
+        const { title, content, priority, pinned } = req.body;
+        if (!title?.trim() || !content?.trim()) {
+            return res.status(400).json({ error: 'Título y contenido son requeridos' });
+        }
+
+        const col = await getCollection(COLLECTIONS.HUB_ANUNCIOS);
+        const anuncio = {
+            _id: new ObjectId(),
+            title: title.trim(),
+            content: content.trim(),
+            priority: priority || 'normal',
+            pinned: !!pinned,
+            author: req.usuario.nombre,
+            authorUsername: req.usuario.username,
+            createdAt: new Date(),
+        };
+
+        await col.insertOne(anuncio);
+        logger.info(`Hub anuncio creado: "${title}" por ${req.usuario.username}`);
+        res.status(201).json(anuncio);
+    } catch (error) {
+        logger.error('Hub anuncio POST error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// DELETE /api/hub/anuncios/:id
+app.delete('/api/hub/anuncios/:id', authMiddleware, requireHubAccess, async (req, res) => {
+    try {
+        const col = await getCollection(COLLECTIONS.HUB_ANUNCIOS);
+        const result = await col.deleteOne({ _id: new ObjectId(req.params.id) });
+        if (result.deletedCount === 0) return res.status(404).json({ error: 'Anuncio no encontrado' });
+        res.json({ success: true });
+    } catch (error) {
+        logger.error('Hub anuncio DELETE error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ── FIN ENDPOINTS HUB DE SISTEMAS ─────────────────────────────
+
+// ============================================================
 // ERROR HANDLER
 // ============================================================
 
@@ -1413,6 +1901,7 @@ process.on('SIGTERM', async () => {
 
 // Export para Vercel
 export default app;
+
 
 
 
