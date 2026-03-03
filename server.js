@@ -566,7 +566,23 @@ async function initializeDB() {
         const notificaciones = await getCollection(COLLECTIONS.NOTIFICACIONES);
         await notificaciones.createIndex({ usuario_destino: 1, leida: 1 });
         await notificaciones.createIndex({ fecha_creacion: -1 });
-        
+        // Índices Hub Sistemas
+         const hubMensajes  = await getCollection(COLLECTIONS.HUB_MENSAJES);
+         await hubMensajes.createIndex({ canal: 1, createdAt: -1 });
+         
+         const hubReuniones = await getCollection(COLLECTIONS.HUB_REUNIONES);
+         await hubReuniones.createIndex({ fecha: 1 });
+         
+         const hubMinutas   = await getCollection(COLLECTIONS.HUB_MINUTAS);
+         await hubMinutas.createIndex({ createdAt: -1 });
+         
+         const hubTareas    = await getCollection(COLLECTIONS.HUB_TAREAS);
+         await hubTareas.createIndex({ columna: 1, orden: 1 });
+         
+         const hubAnuncios  = await getCollection(COLLECTIONS.HUB_ANUNCIOS);
+         await hubAnuncios.createIndex({ pinned: -1, createdAt: -1 });
+         
+         logger.info('✅ Hub Sistemas indexes created');
         logger.info('✅ Database indexes created');
     } catch (error) {
         logger.error('Error initializing DB:', error);
@@ -1397,5 +1413,6 @@ process.on('SIGTERM', async () => {
 
 // Export para Vercel
 export default app;
+
 
 
