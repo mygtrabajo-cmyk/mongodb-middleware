@@ -146,11 +146,16 @@ const COLLECTIONS = {
     AGENTS_LOG: 'agents_log',
     RH_MOVIMIENTOS: 'rh_movimientos',
     NOTIFICACIONES: 'notificaciones',
-    HUB_MENSAJES:  'hub_mensajes',
-    HUB_REUNIONES: 'hub_reuniones',
-    HUB_MINUTAS:   'hub_minutas',
-    HUB_TAREAS:    'hub_tareas',
-    HUB_ANUNCIOS:  'hub_anuncios',
+    HUB_MENSAJES:     'hub_mensajes',
+    HUB_REUNIONES:    'hub_reuniones',
+    HUB_MINUTAS:      'hub_minutas',
+    HUB_TAREAS:       'hub_tareas',
+    HUB_ANUNCIOS:     'hub_anuncios',
+    // Hub v3.0 — nuevos módulos
+    HUB_RECURSOS:     'hub_recursos',
+    HUB_GUIAS:        'hub_guias',
+    HUB_PLANTILLAS:   'hub_plantillas',
+    HUB_CAPACITACION: 'hub_capacitacion',
 };
 
 // Configuración HÍBRIDA de plantillas (filesystem + Google Drive)
@@ -634,8 +639,23 @@ async function initializeDB() {
          
          const hubAnuncios  = await getCollection(COLLECTIONS.HUB_ANUNCIOS);
          await hubAnuncios.createIndex({ pinned: -1, createdAt: -1 });
-         
-         logger.info('✅ Hub Sistemas indexes created');
+
+         // Hub v3.0 — nuevos módulos
+         const hubRecursos     = await getCollection(COLLECTIONS.HUB_RECURSOS);
+         await hubRecursos.createIndex({ categoria: 1, createdAt: -1 });
+
+         const hubGuias        = await getCollection(COLLECTIONS.HUB_GUIAS);
+         await hubGuias.createIndex({ categoria: 1, createdAt: -1 });
+         await hubGuias.createIndex({ titulo: 'text', descripcion: 'text' });
+
+         const hubPlantillas   = await getCollection(COLLECTIONS.HUB_PLANTILLAS);
+         await hubPlantillas.createIndex({ tipo: 1, nombre: 1 });
+
+         const hubCapacitacion = await getCollection(COLLECTIONS.HUB_CAPACITACION);
+         await hubCapacitacion.createIndex({ orden: 1 });
+         await hubCapacitacion.createIndex({ progreso: 1 });
+
+         logger.info('✅ Hub Sistemas indexes created (v3.0: recursos, guías, plantillas, capacitación)');
         logger.info('✅ Database indexes created');
     } catch (error) {
         logger.error('Error initializing DB:', error);
@@ -939,6 +959,56 @@ app.delete('/api/users/:username', authMiddleware, requireAdmin, async (req, res
         res.json({ success: true });
     } catch (error) {
         logger.error('Error deleting user:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ─────────────────────────────────────────────────────────────
+// PATCH /api/users/:username/password — el propio usuario cambia su contraseña
+// El usuario debe confirmar su contraseña actual. ADMIN puede cambiar sin verificarla.
+// ─────────────────────────────────────────────────────────────
+app.patch('/api/users/:username/password', authMiddleware, async (req, res) => {
+    try {
+        const { username } = req.params;
+        const { passwordActual, passwordNueva } = req.body;
+
+        // Solo el propio usuario o ADMIN pueden operar sobre este endpoint
+        if (req.usuario.username !== username && req.usuario.rol !== 'ADMIN') {
+            return res.status(403).json({ error: 'Solo puedes cambiar tu propia contraseña' });
+        }
+
+        if (!passwordActual || !passwordNueva) {
+            return res.status(400).json({ error: 'Se requieren passwordActual y passwordNueva' });
+        }
+
+        if (passwordNueva.length < 6) {
+            return res.status(400).json({ error: 'La contraseña nueva debe tener al menos 6 caracteres' });
+        }
+
+        const col = await getCollection(COLLECTIONS.USERS);
+        const user = await col.findOne({ username });
+
+        if (!user) {
+            return res.status(404).json({ error: 'Usuario no encontrado' });
+        }
+
+        // Si no es ADMIN, verificar que la contraseña actual sea correcta
+        if (req.usuario.rol !== 'ADMIN') {
+            const hashActual = hashPassword(passwordActual);
+            if (user.password !== hashActual) {
+                return res.status(401).json({ error: 'La contraseña actual no es correcta' });
+            }
+        }
+
+        await col.updateOne(
+            { username },
+            { $set: { password: hashPassword(passwordNueva), actualizadoEn: new Date().toISOString() } }
+        );
+
+        logger.info(`Password changed: ${username} (solicitado por: ${req.usuario.username})`);
+        res.json({ success: true, message: 'Contraseña actualizada correctamente' });
+    } catch (error) {
+        logger.error('Password change error:', error);
         res.status(500).json({ error: error.message });
     }
 });
@@ -1971,6 +2041,373 @@ app.delete('/api/hub/anuncios/:id', authMiddleware, requireHubAccess, async (req
         res.json({ success: true });
     } catch (error) {
         logger.error('Hub anuncio DELETE error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ─────────────────────────────────────────────────────────────
+// RECURSOS — Hub v3.0
+// Archivos y enlaces de Drive compartidos del área
+// ─────────────────────────────────────────────────────────────
+
+// GET /api/hub/recursos — listar (filtro ?categoria=documentos|presentaciones|hojas|manuales|otros)
+app.get('/api/hub/recursos', authMiddleware, requireHubAccess, async (req, res) => {
+    try {
+        const { categoria } = req.query;
+        const filter = categoria ? { categoria } : {};
+
+        const col = await getCollection(COLLECTIONS.HUB_RECURSOS);
+        const recursos = await col.find(filter).sort({ createdAt: -1 }).toArray();
+        res.json(recursos);
+    } catch (error) {
+        logger.error('Hub recursos GET error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// POST /api/hub/recursos — crear recurso (solo SISTEMAS/ADMIN)
+app.post('/api/hub/recursos', authMiddleware, requireHubAccess, async (req, res) => {
+    try {
+        const { nombre, descripcion, url, categoria, tipo } = req.body;
+
+        if (!nombre?.trim())
+            return res.status(400).json({ error: 'El nombre del recurso es requerido' });
+        if (!url?.trim())
+            return res.status(400).json({ error: 'La URL del recurso es requerida' });
+
+        try { new URL(url.trim()); }
+        catch { return res.status(400).json({ error: 'La URL proporcionada no es válida' }); }
+
+        const categoriasValidas = ['documentos', 'presentaciones', 'hojas', 'manuales', 'otros'];
+        const col = await getCollection(COLLECTIONS.HUB_RECURSOS);
+        const recurso = {
+            _id: new ObjectId(),
+            nombre: nombre.trim(),
+            descripcion: descripcion?.trim() || '',
+            url: url.trim(),
+            categoria: categoriasValidas.includes(categoria) ? categoria : 'otros',
+            tipo: tipo || 'enlace',
+            uploadedBy: req.usuario.nombre,
+            uploadedByUsername: req.usuario.username,
+            createdAt: new Date(),
+        };
+
+        await col.insertOne(recurso);
+        logger.info(`Hub recurso creado: "${nombre}" por ${req.usuario.username}`);
+        res.status(201).json(recurso);
+    } catch (error) {
+        logger.error('Hub recursos POST error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// DELETE /api/hub/recursos/:id
+app.delete('/api/hub/recursos/:id', authMiddleware, requireHubAccess, async (req, res) => {
+    try {
+        const col = await getCollection(COLLECTIONS.HUB_RECURSOS);
+        const result = await col.deleteOne({ _id: new ObjectId(req.params.id) });
+        if (result.deletedCount === 0)
+            return res.status(404).json({ error: 'Recurso no encontrado' });
+        logger.info(`Hub recurso eliminado: ${req.params.id} por ${req.usuario.username}`);
+        res.json({ success: true });
+    } catch (error) {
+        logger.error('Hub recursos DELETE error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ─────────────────────────────────────────────────────────────
+// GUÍAS — Hub v3.0
+// Procedimientos y documentación técnica del área
+// ─────────────────────────────────────────────────────────────
+
+// GET /api/hub/guias — listar (filtro ?categoria=accesos|hardware|... y ?q=búsqueda)
+app.get('/api/hub/guias', authMiddleware, requireHubAccess, async (req, res) => {
+    try {
+        const { categoria, q } = req.query;
+        const filter = {};
+
+        if (categoria) filter.categoria = categoria;
+        if (q?.trim()) {
+            const regex = new RegExp(q.trim(), 'i');
+            filter.$or = [{ titulo: regex }, { descripcion: regex }, { contenido: regex }];
+        }
+
+        const col = await getCollection(COLLECTIONS.HUB_GUIAS);
+        const guias = await col.find(filter).sort({ createdAt: -1 }).toArray();
+        res.json(guias);
+    } catch (error) {
+        logger.error('Hub guias GET error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// POST /api/hub/guias — crear guía
+app.post('/api/hub/guias', authMiddleware, requireHubAccess, async (req, res) => {
+    try {
+        const { titulo, descripcion, categoria, url, contenido, version, autor } = req.body;
+
+        if (!titulo?.trim())
+            return res.status(400).json({ error: 'El título de la guía es requerido' });
+
+        if (url?.trim()) {
+            try { new URL(url.trim()); }
+            catch { return res.status(400).json({ error: 'La URL proporcionada no es válida' }); }
+        }
+
+        const categoriasValidas = ['accesos', 'hardware', 'correos', 'sistemas', 'soporte', 'procesos', 'otros'];
+        const col = await getCollection(COLLECTIONS.HUB_GUIAS);
+        const guia = {
+            _id: new ObjectId(),
+            titulo: titulo.trim(),
+            descripcion: descripcion?.trim() || '',
+            categoria: categoriasValidas.includes(categoria) ? categoria : 'otros',
+            url: url?.trim() || '',
+            contenido: contenido?.trim() || '',
+            version: version?.trim() || '1.0',
+            autor: autor?.trim() || req.usuario.nombre,
+            autorUsername: req.usuario.username,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+        };
+
+        await col.insertOne(guia);
+        logger.info(`Hub guía creada: "${titulo}" por ${req.usuario.username}`);
+        res.status(201).json(guia);
+    } catch (error) {
+        logger.error('Hub guias POST error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// PATCH /api/hub/guias/:id — actualizar (versión, contenido, URL, etc.)
+app.patch('/api/hub/guias/:id', authMiddleware, requireHubAccess, async (req, res) => {
+    try {
+        const allowed = ['titulo', 'descripcion', 'categoria', 'url', 'contenido', 'version'];
+        const updates = { updatedAt: new Date() };
+        allowed.forEach(k => { if (req.body[k] !== undefined) updates[k] = req.body[k]; });
+
+        const col = await getCollection(COLLECTIONS.HUB_GUIAS);
+        const result = await col.updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $set: updates }
+        );
+
+        if (result.matchedCount === 0)
+            return res.status(404).json({ error: 'Guía no encontrada' });
+
+        const updated = await col.findOne({ _id: new ObjectId(req.params.id) });
+        res.json(updated);
+    } catch (error) {
+        logger.error('Hub guias PATCH error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// DELETE /api/hub/guias/:id
+app.delete('/api/hub/guias/:id', authMiddleware, requireHubAccess, async (req, res) => {
+    try {
+        const col = await getCollection(COLLECTIONS.HUB_GUIAS);
+        const result = await col.deleteOne({ _id: new ObjectId(req.params.id) });
+        if (result.deletedCount === 0)
+            return res.status(404).json({ error: 'Guía no encontrada' });
+        logger.info(`Hub guía eliminada: ${req.params.id} por ${req.usuario.username}`);
+        res.json({ success: true });
+    } catch (error) {
+        logger.error('Hub guias DELETE error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ─────────────────────────────────────────────────────────────
+// PLANTILLAS — Hub v3.0
+// Formatos de responsiva y documentos oficiales del área
+// ─────────────────────────────────────────────────────────────
+
+// GET /api/hub/plantillas — listar (filtro ?tipo=responsiva|alta_baja|inventario|...)
+app.get('/api/hub/plantillas', authMiddleware, requireHubAccess, async (req, res) => {
+    try {
+        const { tipo } = req.query;
+        const filter = tipo ? { tipo } : {};
+
+        const col = await getCollection(COLLECTIONS.HUB_PLANTILLAS);
+        const plantillas = await col.find(filter).sort({ tipo: 1, nombre: 1 }).toArray();
+        res.json(plantillas);
+    } catch (error) {
+        logger.error('Hub plantillas GET error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// POST /api/hub/plantillas — crear plantilla
+app.post('/api/hub/plantillas', authMiddleware, requireHubAccess, async (req, res) => {
+    try {
+        const { nombre, descripcion, tipo, url, instrucciones } = req.body;
+
+        if (!nombre?.trim())
+            return res.status(400).json({ error: 'El nombre de la plantilla es requerido' });
+        if (!url?.trim())
+            return res.status(400).json({ error: 'La URL de la plantilla es requerida' });
+
+        try { new URL(url.trim()); }
+        catch { return res.status(400).json({ error: 'La URL proporcionada no es válida' }); }
+
+        const tiposValidos = ['responsiva', 'alta_baja', 'inventario', 'incidencias', 'formatos', 'otros'];
+        const col = await getCollection(COLLECTIONS.HUB_PLANTILLAS);
+        const plantilla = {
+            _id: new ObjectId(),
+            nombre: nombre.trim(),
+            descripcion: descripcion?.trim() || '',
+            tipo: tiposValidos.includes(tipo) ? tipo : 'otros',
+            url: url.trim(),
+            instrucciones: instrucciones?.trim() || '',
+            uploadedBy: req.usuario.nombre,
+            uploadedByUsername: req.usuario.username,
+            createdAt: new Date(),
+        };
+
+        await col.insertOne(plantilla);
+        logger.info(`Hub plantilla creada: "${nombre}" por ${req.usuario.username}`);
+        res.status(201).json(plantilla);
+    } catch (error) {
+        logger.error('Hub plantillas POST error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// DELETE /api/hub/plantillas/:id
+app.delete('/api/hub/plantillas/:id', authMiddleware, requireHubAccess, async (req, res) => {
+    try {
+        const col = await getCollection(COLLECTIONS.HUB_PLANTILLAS);
+        const result = await col.deleteOne({ _id: new ObjectId(req.params.id) });
+        if (result.deletedCount === 0)
+            return res.status(404).json({ error: 'Plantilla no encontrada' });
+        logger.info(`Hub plantilla eliminada: ${req.params.id} por ${req.usuario.username}`);
+        res.json({ success: true });
+    } catch (error) {
+        logger.error('Hub plantillas DELETE error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ─────────────────────────────────────────────────────────────
+// CAPACITACIÓN — Hub v3.0
+// Tracker del plan de capacitación del área (trainee / analista)
+// ─────────────────────────────────────────────────────────────
+
+// GET /api/hub/capacitacion — listar tareas (filtro ?progreso=sin_asignar|en_curso|...)
+app.get('/api/hub/capacitacion', authMiddleware, requireHubAccess, async (req, res) => {
+    try {
+        const { progreso } = req.query;
+        const filter = progreso ? { progreso } : {};
+
+        const col = await getCollection(COLLECTIONS.HUB_CAPACITACION);
+        const tareas = await col.find(filter).sort({ orden: 1, createdAt: 1 }).toArray();
+        res.json(tareas);
+    } catch (error) {
+        logger.error('Hub capacitacion GET error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// POST /api/hub/capacitacion — crear tarea
+app.post('/api/hub/capacitacion', authMiddleware, requireHubAccess, async (req, res) => {
+    try {
+        const { funcion, frecuencia, herramienta, progreso, fecha, notas, confAnalista, confSupervisor } = req.body;
+
+        if (!funcion?.trim())
+            return res.status(400).json({ error: 'La función/actividad es requerida' });
+
+        const progresoValidos     = ['sin_asignar', 'en_curso', 'completado', 'pausado'];
+        const supervisorValidos   = ['pendiente', 'aprobado', 'rechazado'];
+
+        // Auto-incrementar orden
+        const col = await getCollection(COLLECTIONS.HUB_CAPACITACION);
+        const lastTask = await col.findOne({}, { sort: { orden: -1 } });
+        const nextOrden = (lastTask?.orden || 0) + 1;
+
+        const tarea = {
+            _id: new ObjectId(),
+            orden: nextOrden,
+            funcion: funcion.trim(),
+            frecuencia: frecuencia?.trim() || 'Según necesidad',
+            herramienta: herramienta?.trim() || '',
+            progreso: progresoValidos.includes(progreso) ? progreso : 'sin_asignar',
+            fecha: fecha || null,
+            notas: notas?.trim() || '',
+            confAnalista: !!confAnalista,
+            confSupervisor: supervisorValidos.includes(confSupervisor) ? confSupervisor : null,
+            creadoPor: req.usuario.nombre,
+            creadoPorUsername: req.usuario.username,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+        };
+
+        await col.insertOne(tarea);
+        logger.info(`Hub capacitacion tarea creada: "${funcion.trim()}" por ${req.usuario.username}`);
+        res.status(201).json(tarea);
+    } catch (error) {
+        logger.error('Hub capacitacion POST error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// PATCH /api/hub/capacitacion/:id — actualizar progreso, confirmaciones, fecha, notas
+app.patch('/api/hub/capacitacion/:id', authMiddleware, requireHubAccess, async (req, res) => {
+    try {
+        const allowed = [
+            'funcion', 'frecuencia', 'herramienta', 'progreso',
+            'fecha', 'notas', 'confAnalista', 'confSupervisor', 'orden'
+        ];
+        const updates = { updatedAt: new Date() };
+        allowed.forEach(k => { if (req.body[k] !== undefined) updates[k] = req.body[k]; });
+
+        // Validar enum progreso
+        if (updates.progreso) {
+            const validos = ['sin_asignar', 'en_curso', 'completado', 'pausado'];
+            if (!validos.includes(updates.progreso))
+                return res.status(400).json({ error: `Valor de progreso inválido: ${updates.progreso}` });
+        }
+
+        // Validar enum confSupervisor (puede ser null para limpiar)
+        if (updates.confSupervisor !== undefined && updates.confSupervisor !== null) {
+            const validos = ['pendiente', 'aprobado', 'rechazado'];
+            if (!validos.includes(updates.confSupervisor))
+                updates.confSupervisor = null;
+        }
+
+        const col = await getCollection(COLLECTIONS.HUB_CAPACITACION);
+        const result = await col.updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $set: updates }
+        );
+
+        if (result.matchedCount === 0)
+            return res.status(404).json({ error: 'Tarea no encontrada' });
+
+        const updated = await col.findOne({ _id: new ObjectId(req.params.id) });
+        res.json(updated);
+    } catch (error) {
+        logger.error('Hub capacitacion PATCH error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// DELETE /api/hub/capacitacion/:id — solo ADMIN
+app.delete('/api/hub/capacitacion/:id', authMiddleware, requireHubAccess, async (req, res) => {
+    try {
+        if (req.usuario.rol !== 'ADMIN')
+            return res.status(403).json({ error: 'Solo el administrador puede eliminar tareas de capacitación' });
+
+        const col = await getCollection(COLLECTIONS.HUB_CAPACITACION);
+        const result = await col.deleteOne({ _id: new ObjectId(req.params.id) });
+        if (result.deletedCount === 0)
+            return res.status(404).json({ error: 'Tarea no encontrada' });
+
+        logger.info(`Hub capacitacion tarea eliminada: ${req.params.id} por ${req.usuario.username}`);
+        res.json({ success: true });
+    } catch (error) {
+        logger.error('Hub capacitacion DELETE error:', error);
         res.status(500).json({ error: error.message });
     }
 });
