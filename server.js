@@ -45,6 +45,59 @@ const templateCache = new Map();
 const CACHE_TTL = 60 * 60 * 1000; // 1 hora
 
 // ============================================================
+// SSE — REGISTRO DE CONEXIONES EN TIEMPO REAL
+// Mapa: username → Set de objetos Response (múltiples tabs)
+// ============================================================
+const sseClients = new Map(); // username → Set<res>
+
+/**
+ * Envía un evento SSE a todas las tabs abiertas de un usuario.
+ * @param {string} username
+ * @param {string} event  - nombre del evento (ej: 'notificacion')
+ * @param {object} data   - payload JSON
+ */
+function sseEnviar(username, event, data) {
+    const conns = sseClients.get(username);
+    if (!conns || conns.size === 0) return;
+    const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+    for (const res of conns) {
+        try { res.write(payload); } catch { /* conexión muerta */ }
+    }
+}
+
+/**
+ * Broadcast a todos los usuarios conectados.
+ * Útil para notificaciones globales (usuario_destino: '*')
+ */
+function sseBroadcast(event, data) {
+    for (const [, conns] of sseClients) {
+        const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+        for (const res of conns) {
+            try { res.write(payload); } catch { /* conexión muerta */ }
+        }
+    }
+}
+
+/**
+ * Registra una conexión SSE y devuelve la función de limpieza.
+ */
+function sseRegistrar(username, res) {
+    if (!sseClients.has(username)) sseClients.set(username, new Set());
+    sseClients.get(username).add(res);
+    logger.info(`SSE conectado: ${username} (tabs abiertas: ${sseClients.get(username).size})`);
+
+    return () => {
+        const conns = sseClients.get(username);
+        if (conns) {
+            conns.delete(res);
+            if (conns.size === 0) sseClients.delete(username);
+        }
+        logger.info(`SSE desconectado: ${username}`);
+    };
+}
+
+
+// ============================================================
 // LOGGER HÍBRIDO
 // ============================================================
 
@@ -1253,6 +1306,46 @@ app.patch('/api/rh/movimientos/:id/estado', authMiddleware, requireSistemas, asy
     }
 });
 
+
+// GET /api/notificaciones/sse — canal en tiempo real (Server-Sent Events)
+// El token se pasa por query string porque EventSource no soporta headers custom
+app.get('/api/notificaciones/sse', async (req, res) => {
+    const { token } = req.query;
+    if (!token) return res.status(401).end();
+
+    let usuario;
+    try {
+        usuario = verifyJWT(token);
+    } catch {
+        return res.status(401).end();
+    }
+
+    // Cabeceras SSE — críticas para Cloudflare y proxies
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');   // Nginx/Cloudflare: no buffering
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.flushHeaders();
+
+    // Evento inicial: confirmación de conexión
+    res.write(`event: connected\ndata: ${JSON.stringify({ username: usuario.username, ts: Date.now() })}\n\n`);
+
+    // Heartbeat cada 25s para mantener la conexión viva a través del proxy
+    const heartbeat = setInterval(() => {
+        try { res.write(': heartbeat\n\n'); } catch { clearInterval(heartbeat); }
+    }, 25000);
+
+    // Registrar y obtener función de cleanup
+    const cleanup = sseRegistrar(usuario.username, res);
+
+    // Cleanup cuando el cliente cierra la tab o pierde conexión
+    req.on('close', () => {
+        clearInterval(heartbeat);
+        cleanup();
+    });
+});
+
 // ============================================================
 // ENDPOINTS - NOTIFICACIONES
 // ============================================================
@@ -1299,39 +1392,50 @@ app.patch('/api/notificaciones/:id/leer', authMiddleware, async (req, res) => {
     }
 });
 
-
-// POST /api/notificaciones — crear notificación (cualquier usuario autenticado)
+// POST /api/notificaciones — crear notificación con push SSE en tiempo real
 app.post('/api/notificaciones', authMiddleware, async (req, res) => {
     try {
         const { titulo, mensaje, tipo, icono, tab_destino, subtab, usuario_destino } = req.body;
-
         if (!titulo || !mensaje) {
             return res.status(400).json({ error: 'titulo y mensaje son requeridos' });
         }
 
-        const notificaciones = await getCollection(COLLECTIONS.NOTIFICACIONES);
+        const col = await getCollection(COLLECTIONS.NOTIFICACIONES);
 
-        // Si usuario_destino === '*' se replica para todos los usuarios activos
-        const destinos = usuario_destino === '*'
-            ? await (await getCollection(COLLECTIONS.USERS)).distinct('username', { activo: true })
-            : [usuario_destino || req.usuario.username];
+        // usuario_destino '*' → broadcast a todos los usuarios activos en DB
+        let destinos;
+        if (usuario_destino === '*') {
+            const users = await getCollection(COLLECTIONS.USERS);
+            destinos = await users.distinct('username', { activo: true });
+        } else {
+            destinos = [usuario_destino || req.usuario.username];
+        }
 
+        const now = new Date().toISOString();
         const docs = destinos.map(dest => ({
-            titulo: titulo.trim(),
-            mensaje: mensaje.trim(),
-            tipo:          tipo        || 'info',   // info | success | warning | error
-            icono:         icono       || null,      // emoji override (ej: '🎫')
-            tab_destino:   tab_destino || null,      // 'rh' | 'tickets' | 'hub' | etc.
-            subtab:        subtab      || null,      // 'altas' | 'cambios' | etc.
+            titulo:          titulo.trim(),
+            mensaje:         mensaje.trim(),
+            tipo:            tipo        || 'info',
+            icono:           icono       || null,
+            tab_destino:     tab_destino || null,
+            subtab:          subtab      || null,
             usuario_destino: dest,
-            autor:         req.usuario.username,
-            leida:         false,
-            fecha_creacion: new Date().toISOString(),
-            fecha_lectura:  null
+            autor:           req.usuario.username,
+            leida:           false,
+            fecha_creacion:  now,
+            fecha_lectura:   null
         }));
 
-        await notificaciones.insertMany(docs);
-        logger.info(`Notificación creada por ${req.usuario.username} para: ${destinos.join(', ')}`);
+        const result = await col.insertMany(docs);
+        const insertedIds = Object.values(result.insertedIds);
+
+        // ── Push en tiempo real via SSE ──────────────────────────
+        docs.forEach((doc, i) => {
+            const notifConId = { ...doc, _id: insertedIds[i] };
+            sseEnviar(doc.usuario_destino, 'notificacion', notifConId);
+        });
+
+        logger.info(`Notif creada por ${req.usuario.username} → SSE push a: ${destinos.join(', ')}`);
         res.status(201).json({ success: true, creadas: docs.length });
     } catch (error) {
         logger.error('Error creating notification:', error);
@@ -1342,14 +1446,14 @@ app.post('/api/notificaciones', authMiddleware, async (req, res) => {
 // PATCH /api/notificaciones/leer-todas — marcar todas como leídas
 app.patch('/api/notificaciones/leer-todas', authMiddleware, async (req, res) => {
     try {
-        const notificaciones = await getCollection(COLLECTIONS.NOTIFICACIONES);
-        const result = await notificaciones.updateMany(
+        const col = await getCollection(COLLECTIONS.NOTIFICACIONES);
+        const result = await col.updateMany(
             { usuario_destino: req.usuario.username, leida: false },
             { $set: { leida: true, fecha_lectura: new Date().toISOString() } }
         );
         res.json({ success: true, actualizadas: result.modifiedCount });
     } catch (error) {
-        logger.error('Error marking all notifications:', error);
+        logger.error('Error marking all read:', error);
         res.status(500).json({ error: error.message });
     }
 });
@@ -1357,8 +1461,8 @@ app.patch('/api/notificaciones/leer-todas', authMiddleware, async (req, res) => 
 // DELETE /api/notificaciones/:id — eliminar notificación propia
 app.delete('/api/notificaciones/:id', authMiddleware, async (req, res) => {
     try {
-        const notificaciones = await getCollection(COLLECTIONS.NOTIFICACIONES);
-        await notificaciones.deleteOne({
+        const col = await getCollection(COLLECTIONS.NOTIFICACIONES);
+        await col.deleteOne({
             _id: new ObjectId(req.params.id),
             usuario_destino: req.usuario.username
         });
@@ -1372,8 +1476,8 @@ app.delete('/api/notificaciones/:id', authMiddleware, async (req, res) => {
 // DELETE /api/notificaciones — eliminar todas las leídas del usuario
 app.delete('/api/notificaciones', authMiddleware, async (req, res) => {
     try {
-        const notificaciones = await getCollection(COLLECTIONS.NOTIFICACIONES);
-        const result = await notificaciones.deleteMany({
+        const col = await getCollection(COLLECTIONS.NOTIFICACIONES);
+        const result = await col.deleteMany({
             usuario_destino: req.usuario.username,
             leida: true
         });
@@ -1383,6 +1487,7 @@ app.delete('/api/notificaciones', authMiddleware, async (req, res) => {
         res.status(500).json({ error: error.message });
     }
 });
+
 
 // ============================================================
 // ENDPOINTS - HUB DE SISTEMAS
