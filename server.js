@@ -264,7 +264,10 @@ const userUpdateSchema = Joi.object({
     nombre: Joi.string().min(3).max(100).optional(),
     email: Joi.string().email().optional(),
     rol: Joi.string().valid('ADMIN', 'RH', 'SISTEMAS', 'GERENTE', 'USUARIO').optional(),
-    activo: Joi.boolean().optional()
+    activo: Joi.boolean().optional(),
+    // Campos de perfil personal (actualizables por el propio usuario)
+    telefono: Joi.string().max(20).optional().allow(''),
+    puesto: Joi.string().max(100).optional().allow(''),
 });
 
 // ============================================================
@@ -959,6 +962,55 @@ app.delete('/api/users/:username', authMiddleware, requireAdmin, async (req, res
         res.json({ success: true });
     } catch (error) {
         logger.error('Error deleting user:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ─────────────────────────────────────────────────────────────
+// PATCH /api/users/:username/profile — el propio usuario actualiza su perfil
+// Campos permitidos: nombre, email, telefono, puesto  (ROL no se puede cambiar)
+// ─────────────────────────────────────────────────────────────
+app.patch('/api/users/:username/profile', authMiddleware, async (req, res) => {
+    try {
+        const { username } = req.params;
+
+        // Solo el propio usuario o ADMIN pueden actualizar el perfil
+        if (req.usuario.username !== username && req.usuario.rol !== 'ADMIN') {
+            return res.status(403).json({ error: 'Solo puedes actualizar tu propio perfil' });
+        }
+
+        const profileSchema = Joi.object({
+            nombre:   Joi.string().min(3).max(100).optional(),
+            email:    Joi.string().email().optional(),
+            telefono: Joi.string().max(20).optional().allow(''),
+            puesto:   Joi.string().max(100).optional().allow(''),
+        });
+
+        const { error, value } = profileSchema.validate(req.body, { stripUnknown: true });
+        if (error) {
+            return res.status(400).json({ error: error.details.map(d => d.message).join('; ') });
+        }
+
+        if (Object.keys(value).length === 0) {
+            return res.status(400).json({ error: 'No se enviaron campos válidos para actualizar' });
+        }
+
+        value.actualizadoEn = new Date().toISOString();
+
+        const col = await getCollection(COLLECTIONS.USERS);
+        const result = await col.updateOne(
+            { username },
+            { $set: value }
+        );
+
+        if (result.matchedCount === 0) {
+            return res.status(404).json({ error: 'Usuario no encontrado' });
+        }
+
+        logger.info(`Profile updated: ${username} (por: ${req.usuario.username})`);
+        res.json({ success: true, updated: value });
+    } catch (error) {
+        logger.error('Profile update error:', error);
         res.status(500).json({ error: error.message });
     }
 });
