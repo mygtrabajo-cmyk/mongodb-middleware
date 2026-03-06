@@ -882,6 +882,29 @@ app.get('/api/users', authMiddleware, async (req, res) => {
     }
 });
 
+// ─────────────────────────────────────────────────────────────
+// GET /api/users/:username — perfil completo de un usuario
+// El propio usuario siempre puede leer su perfil (necesario para
+// mostrar telefono y puesto que no están en el JWT).
+// ADMIN puede leer cualquier perfil.
+// ─────────────────────────────────────────────────────────────
+app.get('/api/users/:username', authMiddleware, async (req, res) => {
+    try {
+        const { username } = req.params;
+        if (req.usuario.username !== username && req.usuario.rol !== 'ADMIN') {
+            return res.status(403).json({ error: 'Solo puedes consultar tu propio perfil' });
+        }
+        const col = await getCollection(COLLECTIONS.USERS);
+        const user = await col.findOne({ username }, { projection: { password: 0 } });
+        if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
+        logger.info(`Profile GET: ${username} (por: ${req.usuario.username})`);
+        res.json(user);
+    } catch (error) {
+        logger.error('Error getting user profile:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
 app.post('/api/users', authMiddleware, requireAdmin, async (req, res) => {
     try {
         const { error, value } = userCreateSchema.validate(req.body, { abortEarly: false });
@@ -982,7 +1005,7 @@ app.patch('/api/users/:username/profile', authMiddleware, async (req, res) => {
 
         const profileSchema = Joi.object({
             nombre:   Joi.string().min(3).max(100).optional(),
-            email:    Joi.string().email().optional(),
+            email:    Joi.string().email().optional().allow(''),
             telefono: Joi.string().max(20).optional().allow(''),
             puesto:   Joi.string().max(100).optional().allow(''),
         });
@@ -992,24 +1015,35 @@ app.patch('/api/users/:username/profile', authMiddleware, async (req, res) => {
             return res.status(400).json({ error: error.details.map(d => d.message).join('; ') });
         }
 
-        if (Object.keys(value).length === 0) {
+        // FIX CRÍTICO: descartar strings vacíos.
+        // telefono y puesto no viajan en el JWT, así que el frontend
+        // los inicializa como ''. Sin este filtro, MongoDB los sobreescribiría
+        // con '' borrando los valores reales.
+        const camposValidos = Object.fromEntries(
+            Object.entries(value).filter(([, v]) => v !== '' && v !== null && v !== undefined)
+        );
+
+        if (Object.keys(camposValidos).length === 0) {
             return res.status(400).json({ error: 'No se enviaron campos válidos para actualizar' });
         }
 
-        value.actualizadoEn = new Date().toISOString();
+        camposValidos.actualizadoEn = new Date().toISOString();
 
         const col = await getCollection(COLLECTIONS.USERS);
         const result = await col.updateOne(
             { username },
-            { $set: value }
+            { $set: camposValidos }
         );
 
         if (result.matchedCount === 0) {
             return res.status(404).json({ error: 'Usuario no encontrado' });
         }
 
-        logger.info(`Profile updated: ${username} (por: ${req.usuario.username})`);
-        res.json({ success: true, updated: value });
+        // Devolver perfil completo actualizado para que el frontend sincronice estado
+        const updatedUser = await col.findOne({ username }, { projection: { password: 0 } });
+
+        logger.info(`Profile updated: ${username} → [${Object.keys(camposValidos).join(', ')}] (por: ${req.usuario.username})`);
+        res.json({ success: true, updated: camposValidos, user: updatedUser });
     } catch (error) {
         logger.error('Profile update error:', error);
         res.status(500).json({ error: error.message });
