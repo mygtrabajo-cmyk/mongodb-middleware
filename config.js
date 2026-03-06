@@ -27,8 +27,8 @@ var CONFIG = {
     // ========== NUEVO: API Backend Unificado v3.2 ==========
     api: {
         // URL base del servidor (ajustar según entorno)
-        baseURL: window.location.hostname === 'localhost' 
-            ? 'http://localhost:5500'  
+        baseURL: window.location.hostname === 'Netlify' 
+            ? 'https://mygtelecom.netlify.app/'  
             : 'https://myg-mongodb-api.onrender.com',
 
         // URL directa a Render para SSE — NO pasa por Cloudflare Worker.
@@ -78,3 +78,4 @@ const ITEMS_POR_PAGINA = 30;
     console.log('   Sheets configuradas:', Object.keys(CONFIG.sheetsPublicUrls).length);
     console.log('   Endpoints API:', Object.keys(CONFIG.api.endpoints).length);
 })();
+
