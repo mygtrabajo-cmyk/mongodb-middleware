@@ -20,7 +20,8 @@ var CONFIG = {
         equiposIQU: '12nG-UPe8JPj5LC2QvQ1yLA3dtC1hIS4rVi8BMw_hVeE',
         dashboardTickets: '15D9LtufL60YwhOh26hrJmuEFkJolTURN22iiPcHwX1Q',
         pdvDetalles: '1oqWDNGdZhACoTepi9pGTYKE-UhVZPNCpxSHW0GCINL8', 
-        correosDetallados: '12sZGOsKCpyHpc6poigKdc2KjalpYcWUo' 
+        correosDetallados: '12sZGOsKCpyHpc6poigKdc2KjalpYcWUo',
+        ticketsConteo: '1jxDODo8aVGoy1uhotLS2E4Lq5ogQTA_rlfTZxn1Yo38'
     },
     
     // ========== NUEVO: API Backend Unificado v3.2 ==========
@@ -28,7 +29,13 @@ var CONFIG = {
         // URL base del servidor (ajustar según entorno)
         baseURL: window.location.hostname === 'localhost' 
             ? 'http://localhost:5500'  
-            : 'https://myg-mongodb-api.onrender.com',  
+            : 'https://myg-mongodb-api.onrender.com',
+
+        // URL directa a Render para SSE — NO pasa por Cloudflare Worker.
+        // Workers tiene límite ~30s por request; SSE dura horas → Worker lo corta.
+        sseBaseURL: window.location.hostname === 'localhost'
+            ? 'http://localhost:5500'
+            : 'https://myg-mongodb-api.onrender.com',
         
         // Endpoints disponibles
         endpoints: {
@@ -48,7 +55,9 @@ var CONFIG = {
             // Formatos de Activación (NUEVO)
             formatosSistemas: '/api/formatos/sistemas',
             formatosGenerar: '/api/formatos/generar',
-            formatosClearCache: '/api/formatos/clear-cache'
+            formatosClearCache: '/api/formatos/clear-cache',
+
+            activosMovimientos: '/api/activos/movimientos'
         },
         
         // Timeout para requests (ms)
