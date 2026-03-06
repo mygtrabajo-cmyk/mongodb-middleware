@@ -1,5 +1,5 @@
 /* ==================================================================
-   MYG TELECOM - SERVIDOR UNIFICADO v3.2 (HÍBRIDO)
+   MYG TELECOM - SERVIDOR UNIFICADO v3.3 (HÍBRIDO)
    
    Características:
    - Detección automática de entorno (local/cloud)
@@ -7,6 +7,7 @@
    - Caché en memoria para templates descargados
    - Sistema completo: MongoDB + RH + Formatos + Notificaciones
    - Compatible: Node.js local + Vercel serverless
+   - v3.3: Endpoint /api/chat (Proxy seguro Anthropic Claude)
    
    Autor: luis oliva - MYG Telecom
    ================================================================== */
@@ -1429,6 +1430,64 @@ app.patch('/api/rh/movimientos/:id/estado', authMiddleware, requireSistemas, asy
 });
 
 
+// ============================================================
+// ENDPOINT - CHATBOT IA (Proxy seguro → Anthropic Claude)
+// La API key NUNCA se expone al cliente — vive solo en Render.
+// Requiere variable de entorno: ANTHROPIC_API_KEY
+// ============================================================
+app.post('/api/chat', authMiddleware, async (req, res) => {
+    try {
+        const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
+
+        if (!ANTHROPIC_KEY) {
+            logger.error('/api/chat: ANTHROPIC_API_KEY no configurada en Render');
+            return res.status(503).json({
+                error: 'Servicio de IA no disponible. Configura ANTHROPIC_API_KEY en las variables de entorno de Render.'
+            });
+        }
+
+        const { messages, system, max_tokens = 1000, temperature = 0.7 } = req.body;
+
+        if (!messages || !Array.isArray(messages) || messages.length === 0) {
+            return res.status(400).json({ error: 'El campo "messages" es requerido y debe ser un array.' });
+        }
+
+        const anthropicBody = {
+            model: 'claude-sonnet-4-20250514',
+            max_tokens,
+            temperature,
+            messages,
+            ...(system && { system }),
+        };
+
+        const anthropicRes = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: {
+                'Content-Type':      'application/json',
+                'x-api-key':         ANTHROPIC_KEY,
+                'anthropic-version': '2023-06-01',
+            },
+            body: JSON.stringify(anthropicBody),
+        });
+
+        const data = await anthropicRes.json();
+
+        if (!anthropicRes.ok) {
+            logger.error(`Anthropic API error ${anthropicRes.status}:`, data);
+            return res.status(anthropicRes.status).json({
+                error: data.error?.message || 'Error en el servicio de IA'
+            });
+        }
+
+        logger.info(`/api/chat OK — usuario: ${req.usuario.username}, tokens: ${data.usage?.output_tokens ?? '?'}`);
+        res.json(data);
+
+    } catch (error) {
+        logger.error('/api/chat error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
 // GET /api/notificaciones/sse — canal en tiempo real (Server-Sent Events)
 // El token se pasa por query string porque EventSource no soporta headers custom
 app.get('/api/notificaciones/sse', async (req, res) => {
@@ -2511,7 +2570,7 @@ async function startServer() {
         app.listen(PORT, () => {
             console.log('');
             console.log('='.repeat(60));
-            console.log('🚀 SERVIDOR UNIFICADO v3.2 - MYG TELECOM');
+            console.log('🚀 SERVIDOR UNIFICADO v3.3 - MYG TELECOM');
             console.log('='.repeat(60));
             console.log('');
             console.log(`✅ Estado: ACTIVO`);
@@ -2523,6 +2582,7 @@ async function startServer() {
             console.log('   ✅ MongoDB Middleware (IQU Agents)');
             console.log('   ✅ Sistema RH (Movimientos + Notificaciones)');
             console.log('   ✅ Generador de Formatos de Activación (HÍBRIDO)');
+            console.log('   ✅ Chatbot IA — Proxy Anthropic Claude (v3.3)');
             console.log('');
             console.log('💾 Storage:');
             if (!IS_CLOUD) {
@@ -2538,9 +2598,13 @@ async function startServer() {
             console.log('📌 Endpoints principales:');
             console.log('   POST /api/auth/login                - Login');
             console.log('   GET  /api/users                     - Usuarios');
+            console.log('   PATCH /api/users/:u/profile         - Perfil propio');
+            console.log('   PATCH /api/users/:u/password        - Contraseña propia');
             console.log('   GET  /api/devices                   - Dispositivos IQU');
             console.log('   POST /api/rh/movimientos            - Movimientos RH');
             console.log('   GET  /api/notificaciones            - Notificaciones');
+            console.log('   GET  /api/notificaciones/sse        - Notificaciones SSE');
+            console.log('   POST /api/chat                      - Chatbot IA (Anthropic)');
             console.log('   GET  /api/formatos/sistemas         - Sistemas disponibles');
             console.log('   POST /api/formatos/generar          - Generar formato');
             console.log('   POST /api/formatos/clear-cache      - Limpiar caché (ADMIN)');
