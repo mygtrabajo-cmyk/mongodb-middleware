@@ -53,6 +53,7 @@ const sseClients = new Map(); // username → Set<res>
 
 /**
  * Envía un evento SSE a todas las tabs abiertas de un usuario.
+ * FIX: elimina del Set las conexiones muertas detectadas en el write.
  * @param {string} username
  * @param {string} event  - nombre del evento (ej: 'notificacion')
  * @param {object} data   - payload JSON
@@ -61,21 +62,37 @@ function sseEnviar(username, event, data) {
     const conns = sseClients.get(username);
     if (!conns || conns.size === 0) return;
     const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+    const muertas = [];
     for (const res of conns) {
-        try { res.write(payload); } catch { /* conexión muerta */ }
+        try { res.write(payload); }
+        catch { muertas.push(res); }   // FIX: registrar para limpiar después del loop
     }
+    // Limpiar conexiones muertas fuera del loop para no mutar el Set mientras se itera
+    for (const res of muertas) {
+        conns.delete(res);
+        logger.warn(`SSE: conexión muerta eliminada para ${username}`);
+    }
+    if (conns.size === 0) sseClients.delete(username);
 }
 
 /**
  * Broadcast a todos los usuarios conectados.
+ * FIX: elimina conexiones muertas detectadas en el write.
  * Útil para notificaciones globales (usuario_destino: '*')
  */
 function sseBroadcast(event, data) {
-    for (const [, conns] of sseClients) {
-        const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+    const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+    for (const [username, conns] of sseClients) {
+        const muertas = [];
         for (const res of conns) {
-            try { res.write(payload); } catch { /* conexión muerta */ }
+            try { res.write(payload); }
+            catch { muertas.push(res); }
         }
+        for (const res of muertas) {
+            conns.delete(res);
+            logger.warn(`SSE broadcast: conexión muerta eliminada para ${username}`);
+        }
+        if (conns.size === 0) sseClients.delete(username);
     }
 }
 
@@ -1568,22 +1585,25 @@ app.get('/api/notificaciones/sse', async (req, res) => {
 app.get('/api/notificaciones', authMiddleware, async (req, res) => {
     try {
         const notificaciones = await getCollection(COLLECTIONS.NOTIFICACIONES);
-        const { username, soloNoLeidas } = req.query;
-        
-        const filter = { usuario_destino: username || req.usuario.username };
+        const { soloNoLeidas } = req.query;
+
+        // FIX SEGURIDAD: siempre usar el usuario del JWT — nunca aceptar
+        // ?username= como parámetro (cualquier usuario autenticado podría
+        // leer notificaciones ajenas pasando ?username=otrousuario)
+        const filter = { usuario_destino: req.usuario.username };
         if (soloNoLeidas === 'true') filter.leida = false;
-        
+
         const notificacionesList = await notificaciones
             .find(filter)
             .sort({ fecha_creacion: -1 })
             .limit(50)
             .toArray();
-        
+
         const total_no_leidas = await notificaciones.countDocuments({
-            usuario_destino: username || req.usuario.username,
+            usuario_destino: req.usuario.username,
             leida: false
         });
-        
+
         res.json({ notificaciones: notificacionesList, total_no_leidas });
     } catch (error) {
         logger.error('Error getting notifications:', error);
@@ -1613,6 +1633,12 @@ app.post('/api/notificaciones', authMiddleware, async (req, res) => {
         const { titulo, mensaje, tipo, icono, tab_destino, subtab, usuario_destino } = req.body;
         if (!titulo || !mensaje) {
             return res.status(400).json({ error: 'titulo y mensaje son requeridos' });
+        }
+
+        // FIX SEGURIDAD: broadcast '*' solo para roles privilegiados.
+        // Un usuario normal no debería poder enviar notificaciones a toda la empresa.
+        if (usuario_destino === '*' && !['ADMIN', 'SISTEMAS'].includes(req.usuario.rol)) {
+            return res.status(403).json({ error: 'Solo ADMIN o SISTEMAS pueden enviar notificaciones globales' });
         }
 
         const col = await getCollection(COLLECTIONS.NOTIFICACIONES);
