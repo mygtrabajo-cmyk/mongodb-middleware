@@ -1984,6 +1984,61 @@ app.get('/api/hub/minutas', authMiddleware, requireHubAccess, async (req, res) =
     }
 });
 
+// PATCH /api/hub/minutas/:id — editar minuta completa
+app.patch('/api/hub/minutas/:id', authMiddleware, requireHubAccess, async (req, res) => {
+    try {
+        const allowed = ['title', 'date', 'summary', 'decisions', 'actionItems', 'attendees'];
+        const updates = { updatedAt: new Date() };
+        allowed.forEach(k => { if (req.body[k] !== undefined) updates[k] = req.body[k]; });
+
+        // Re-parsear actionItems si vienen como strings
+        if (updates.actionItems && Array.isArray(updates.actionItems)) {
+            updates.actionItems = updates.actionItems.map(a =>
+                typeof a === 'string'
+                    ? { id: new ObjectId().toString(), text: a.trim(), done: false }
+                    : a
+            ).filter(a => a.text?.trim());
+        }
+
+        const col = await getCollection(COLLECTIONS.HUB_MINUTAS);
+        const result = await col.updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $set: updates }
+        );
+
+        if (result.matchedCount === 0)
+            return res.status(404).json({ error: 'Minuta no encontrada' });
+
+        const updated = await col.findOne({ _id: new ObjectId(req.params.id) });
+        logger.info(`Hub minuta actualizada: ${req.params.id} por ${req.usuario.username}`);
+        res.json(updated);
+    } catch (error) {
+        logger.error('Hub minuta PATCH error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// DELETE /api/hub/minutas/:id — eliminar minuta (autor o ADMIN)
+app.delete('/api/hub/minutas/:id', authMiddleware, requireHubAccess, async (req, res) => {
+    try {
+        const col = await getCollection(COLLECTIONS.HUB_MINUTAS);
+
+        // ADMIN puede borrar cualquiera; el autor solo las suyas
+        const filter = req.usuario.rol === 'ADMIN'
+            ? { _id: new ObjectId(req.params.id) }
+            : { _id: new ObjectId(req.params.id), authorUsername: req.usuario.username };
+
+        const result = await col.deleteOne(filter);
+        if (result.deletedCount === 0)
+            return res.status(404).json({ error: 'Minuta no encontrada o no autorizada' });
+
+        logger.info(`Hub minuta eliminada: ${req.params.id} por ${req.usuario.username}`);
+        res.json({ success: true });
+    } catch (error) {
+        logger.error('Hub minuta DELETE error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
 // POST /api/hub/minutas
 app.post('/api/hub/minutas', authMiddleware, requireHubAccess, async (req, res) => {
     try {
@@ -2704,3 +2759,4 @@ process.on('SIGTERM', async () => {
 
 // Export para Vercel
 export default app;
+
