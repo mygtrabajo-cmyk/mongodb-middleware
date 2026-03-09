@@ -174,6 +174,9 @@ const COLLECTIONS = {
     HUB_GUIAS:        'hub_guias',
     HUB_PLANTILLAS:   'hub_plantillas',
     HUB_CAPACITACION: 'hub_capacitacion',
+    // Admin Panel v1.0
+    ADMIN_ACCESS_LOGS: 'admin_access_logs',
+    ROLE_PERMISSIONS:  'role_permissions',
 };
 
 // Configuración HÍBRIDA de plantillas (filesystem + Google Drive)
@@ -407,6 +410,116 @@ function hashPassword(password) {
 }
 
 // ============================================================
+
+// ============================================================
+// SISTEMA DE PERMISOS DINÁMICO — Admin Panel v1.0
+// ============================================================
+
+const MODULOS_PERMISOS = {
+    // Dashboard
+    'dashboard.ver':          'Ver Dashboard principal',
+    'dashboard.rh':           'Módulo RH (Movimientos)',
+    'dashboard.headcount':    'Módulo Headcount',
+    'dashboard.activos':      'Módulo Activos',
+    'dashboard.tickets':      'Módulo Tickets',
+    'dashboard.dispositivos': 'Módulo Dispositivos IQU',
+    // Hub de Sistemas
+    'hub.acceso':             'Acceder al Hub de Sistemas',
+    'hub.mensajes':           'Mensajes del Hub',
+    'hub.reuniones':          'Reuniones',
+    'hub.minutas':            'Minutas',
+    'hub.tareas':             'Kanban de Tareas',
+    'hub.anuncios':           'Anuncios',
+    'hub.recursos':           'Recursos compartidos',
+    'hub.guias':              'Guías y procedimientos',
+    'hub.plantillas':         'Plantillas del Hub',
+    'hub.capacitacion':       'Tracker de Capacitación',
+    // Formatos
+    'formatos.generar':       'Generar formatos de activación',
+    // RH
+    'rh.movimientos.crear':    'Crear solicitudes RH',
+    'rh.movimientos.ver':      'Ver movimientos RH',
+    'rh.movimientos.gestionar':'Cambiar estado de movimientos',
+    // Activos
+    'activos.ver':             'Ver activos e inventario',
+    'activos.registrar':       'Registrar movimientos de activos',
+    // Chatbot
+    'chatbot.usar':            'Usar chatbot IA',
+    // Admin
+    'admin.panel':             'Acceder al Panel de Administración',
+    'admin.usuarios':          'Gestión de usuarios (CRUD)',
+    'admin.permisos':          'Gestión de permisos y roles',
+    'admin.logs':              'Ver logs de acceso',
+    'admin.formularios':       'Ver entradas de formularios',
+};
+
+const ROL_PERMISOS_DEFAULT = {
+    ADMIN: ['*'],
+    SISTEMAS: [
+        'dashboard.ver', 'dashboard.dispositivos',
+        'hub.acceso', 'hub.mensajes', 'hub.reuniones', 'hub.minutas',
+        'hub.tareas', 'hub.anuncios', 'hub.recursos', 'hub.guias',
+        'hub.plantillas', 'hub.capacitacion',
+        'formatos.generar',
+        'rh.movimientos.ver', 'rh.movimientos.gestionar',
+        'activos.ver', 'activos.registrar',
+        'chatbot.usar',
+    ],
+    RH: [
+        'dashboard.ver', 'dashboard.rh', 'dashboard.headcount',
+        'rh.movimientos.crear', 'rh.movimientos.ver',
+        'chatbot.usar',
+    ],
+    GERENTE: [
+        'dashboard.ver', 'dashboard.rh', 'dashboard.headcount',
+        'dashboard.activos', 'dashboard.tickets',
+        'rh.movimientos.ver',
+        'chatbot.usar',
+    ],
+    USUARIO: [
+        'dashboard.ver',
+        'chatbot.usar',
+    ],
+};
+
+/**
+ * Verifica si un usuario tiene un permiso.
+ * Prioridad: ADMIN siempre OK → override.removed bloquea → override.added habilita → permisos del rol
+ */
+function usuarioTienePermiso(usuario, permiso, overrides = null) {
+    if (!usuario) return false;
+    if (usuario.rol === 'ADMIN') return true;
+    const added   = overrides?.added   || usuario.permisosOverride?.added   || [];
+    const removed = overrides?.removed || usuario.permisosOverride?.removed || [];
+    if (removed.includes(permiso)) return false;
+    if (added.includes(permiso))   return true;
+    const rolPermisos = ROL_PERMISOS_DEFAULT[usuario.rol] || [];
+    if (rolPermisos.includes('*')) return true;
+    return rolPermisos.includes(permiso);
+}
+
+/**
+ * Middleware de permiso dinámico con overrides desde DB.
+ * Uso: app.get('/ruta', authMiddleware, requirePermiso('hub.acceso'), handler)
+ */
+const requirePermiso = (permiso) => async (req, res, next) => {
+    try {
+        if (!req.usuario) return res.status(401).json({ error: 'No autenticado' });
+        if (req.usuario.rol === 'ADMIN') return next();
+        const col  = await getCollection(COLLECTIONS.USERS);
+        const user = await col.findOne(
+            { username: req.usuario.username },
+            { projection: { permisosOverride: 1 } }
+        );
+        if (usuarioTienePermiso(req.usuario, permiso, user?.permisosOverride)) return next();
+        logger.warn(`Permiso denegado: ${req.usuario.username} → [${permiso}]`);
+        return res.status(403).json({ error: `Acceso denegado. Permiso requerido: ${permiso}`, permiso });
+    } catch (err) {
+        logger.error('requirePermiso error:', err);
+        return res.status(500).json({ error: err.message });
+    }
+};
+
 // MONGODB CONNECTION
 // ============================================================
 
@@ -677,6 +790,25 @@ async function initializeDB() {
          await hubCapacitacion.createIndex({ progreso: 1 });
 
          logger.info('✅ Hub Sistemas indexes created (v3.0: recursos, guías, plantillas, capacitación)');
+         // Admin Panel — índices y seed de permisos
+         const adminLogs = await getCollection(COLLECTIONS.ADMIN_ACCESS_LOGS);
+         await adminLogs.createIndex({ timestamp: -1 });
+         await adminLogs.createIndex({ username: 1, timestamp: -1 });
+         await adminLogs.createIndex({ resultado: 1 });
+
+         const rolePermsCol = await getCollection(COLLECTIONS.ROLE_PERMISSIONS);
+         const existingPerms = await rolePermsCol.findOne({ type: 'role_defaults' });
+         if (!existingPerms) {
+             await rolePermsCol.insertOne({
+                 type: 'role_defaults',
+                 permisos: ROL_PERMISOS_DEFAULT,
+                 modulos: MODULOS_PERMISOS,
+                 version: '1.0',
+                 actualizadoEn: new Date().toISOString(),
+                 actualizadoPor: 'system',
+             });
+             logger.info('✅ Role permissions seeded');
+         }
         logger.info('✅ Database indexes created');
     } catch (error) {
         logger.error('Error initializing DB:', error);
@@ -841,7 +973,22 @@ app.post('/api/auth/login', async (req, res) => {
         }
 
         const passwordHash = hashPassword(password);
+        const passwordHash = hashPassword(password);
         if (passwordHash !== user.password) {
+            // Log acceso fallido
+            try {
+                const accessLogs = await getCollection(COLLECTIONS.ADMIN_ACCESS_LOGS);
+                await accessLogs.insertOne({
+                    username,
+                    nombre: user?.nombre || null,
+                    rol: user?.rol || null,
+                    ip: req.ip || req.headers['x-forwarded-for'] || 'unknown',
+                    userAgent: req.get('user-agent') || 'unknown',
+                    resultado: 'fallido',
+                    razon: 'password_incorrecto',
+                    timestamp: new Date().toISOString(),
+                });
+            } catch (logErr) { logger.warn('Error guardando access log fallido:', logErr.message); }
             return res.status(401).json({ error: 'Credenciales inválidas' });
         }
 
@@ -863,6 +1010,21 @@ app.post('/api/auth/login', async (req, res) => {
         const token = createJWT(payload);
 
         logger.info(`Login successful: ${username}`);
+
+        // Log acceso exitoso
+        try {
+            const accessLogs = await getCollection(COLLECTIONS.ADMIN_ACCESS_LOGS);
+            await accessLogs.insertOne({
+                username,
+                nombre: user.nombre,
+                rol: user.rol,
+                ip: req.ip || req.headers['x-forwarded-for'] || 'unknown',
+                userAgent: req.get('user-agent') || 'unknown',
+                resultado: 'exitoso',
+                timestamp: new Date().toISOString(),
+            });
+        } catch (logErr) { logger.warn('Error guardando access log:', logErr.message); }
+
 
         res.json({
             success: true,
@@ -2641,6 +2803,263 @@ app.delete('/api/hub/capacitacion/:id', authMiddleware, requireHubAccess, async 
 // ── FIN ENDPOINTS HUB DE SISTEMAS ─────────────────────────────
 
 // ============================================================
+
+// ============================================================
+// ENDPOINTS - ADMIN PANEL v1.0
+// Requiere: authMiddleware + requireAdmin
+// Solo accesible para rol ADMIN
+// ============================================================
+
+// GET /api/admin/stats — estadísticas generales del panel
+app.get('/api/admin/stats', authMiddleware, requireAdmin, async (req, res) => {
+    try {
+        const colUsers   = await getCollection(COLLECTIONS.USERS);
+        const colLogs    = await getCollection(COLLECTIONS.ADMIN_ACCESS_LOGS);
+        const colRH      = await getCollection(COLLECTIONS.RH_MOVIMIENTOS);
+        const colFmtLogs = await getCollection(COLLECTIONS.AGENTS_LOG);
+
+        const hoy = new Date();
+        hoy.setHours(0, 0, 0, 0);
+
+        const [
+            totalUsers,
+            usersActivos,
+            usersPorRol,
+            accesosHoy,
+            fallidosHoy,
+            movimientosTotal,
+            movimientosPendientes,
+            formatosTotal,
+        ] = await Promise.all([
+            colUsers.countDocuments(),
+            colUsers.countDocuments({ activo: true }),
+            colUsers.aggregate([{ $group: { _id: '$rol', count: { $sum: 1 } } }]).toArray(),
+            colLogs.countDocuments({ timestamp: { $gte: hoy.toISOString() } }),
+            colLogs.countDocuments({ resultado: 'fallido', timestamp: { $gte: hoy.toISOString() } }),
+            colRH.countDocuments(),
+            colRH.countDocuments({ estado: 'PENDIENTE' }),
+            colFmtLogs.countDocuments({ tipo: 'formato_activacion' }),
+        ]);
+
+        res.json({
+            usuarios:    { total: totalUsers, activos: usersActivos, porRol: usersPorRol },
+            accesos:     { hoy: accesosHoy, fallidosHoy },
+            formularios: { rhTotal: movimientosTotal, rhPendientes: movimientosPendientes, formatosTotal },
+        });
+    } catch (error) {
+        logger.error('Admin stats error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// GET /api/admin/access-logs — historial de accesos con filtros y paginación
+app.get('/api/admin/access-logs', authMiddleware, requireAdmin, async (req, res) => {
+    try {
+        const { username, resultado, desde, hasta, limit = 100, page = 1 } = req.query;
+        const filter = {};
+
+        if (username)  filter.username   = { $regex: username, $options: 'i' };
+        if (resultado) filter.resultado  = resultado;
+        if (desde || hasta) {
+            filter.timestamp = {};
+            if (desde) filter.timestamp.$gte = new Date(desde).toISOString();
+            if (hasta) filter.timestamp.$lte = new Date(hasta).toISOString();
+        }
+
+        const col   = await getCollection(COLLECTIONS.ADMIN_ACCESS_LOGS);
+        const skip  = (parseInt(page) - 1) * parseInt(limit);
+        const total = await col.countDocuments(filter);
+        const logs  = await col
+            .find(filter)
+            .sort({ timestamp: -1 })
+            .skip(skip)
+            .limit(parseInt(limit))
+            .toArray();
+
+        const hoy = new Date();
+        hoy.setHours(0, 0, 0, 0);
+        const accesosHoy  = await col.countDocuments({ timestamp: { $gte: hoy.toISOString() } });
+        const fallidosHoy = await col.countDocuments({ timestamp: { $gte: hoy.toISOString() }, resultado: 'fallido' });
+
+        res.json({ logs, total, page: parseInt(page), limit: parseInt(limit), stats: { accesosHoy, fallidosHoy } });
+    } catch (error) {
+        logger.error('Admin access logs error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// GET /api/admin/form-submissions — todas las entradas de formularios
+app.get('/api/admin/form-submissions', authMiddleware, requireAdmin, async (req, res) => {
+    try {
+        const { tipo, desde, hasta, limit = 50, page = 1 } = req.query;
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+        const dateFilter = {};
+        if (desde) dateFilter.$gte = new Date(desde).toISOString();
+        if (hasta) dateFilter.$lte = new Date(hasta).toISOString();
+
+        const results = {};
+
+        if (!tipo || tipo === 'rh') {
+            const colRH    = await getCollection(COLLECTIONS.RH_MOVIMIENTOS);
+            const filterRH = {};
+            if (Object.keys(dateFilter).length) filterRH.fecha_creacion = dateFilter;
+            results.rh = await colRH
+                .find(filterRH)
+                .sort({ fecha_creacion: -1 })
+                .skip(tipo === 'rh' ? skip : 0)
+                .limit(tipo === 'rh' ? parseInt(limit) : 20)
+                .project({ historial: 0 })
+                .toArray();
+        }
+
+        if (!tipo || tipo === 'formatos') {
+            const colLog    = await getCollection(COLLECTIONS.AGENTS_LOG);
+            const filterLog = { tipo: 'formato_activacion' };
+            if (Object.keys(dateFilter).length) filterLog.timestamp = dateFilter;
+            results.formatos = await colLog
+                .find(filterLog)
+                .sort({ timestamp: -1 })
+                .skip(tipo === 'formatos' ? skip : 0)
+                .limit(tipo === 'formatos' ? parseInt(limit) : 20)
+                .toArray();
+        }
+
+        if (!tipo || tipo === 'activos') {
+            try {
+                const colActivos    = await getCollection('activos_movimientos');
+                const filterActivos = {};
+                if (Object.keys(dateFilter).length) filterActivos.fecha = dateFilter;
+                results.activos = await colActivos
+                    .find(filterActivos)
+                    .sort({ fecha: -1 })
+                    .skip(tipo === 'activos' ? skip : 0)
+                    .limit(tipo === 'activos' ? parseInt(limit) : 20)
+                    .toArray();
+            } catch { results.activos = []; }
+        }
+
+        const colRH2     = await getCollection(COLLECTIONS.RH_MOVIMIENTOS);
+        const colLog2    = await getCollection(COLLECTIONS.AGENTS_LOG);
+        const totalRH    = await colRH2.countDocuments();
+        const totalFormatos = await colLog2.countDocuments({ tipo: 'formato_activacion' });
+
+        res.json({ ...results, totales: { rh: totalRH, formatos: totalFormatos } });
+    } catch (error) {
+        logger.error('Admin form submissions error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// GET /api/admin/permissions/roles — permisos actuales por rol (desde DB o defaults)
+app.get('/api/admin/permissions/roles', authMiddleware, requireAdmin, async (req, res) => {
+    try {
+        const col = await getCollection(COLLECTIONS.ROLE_PERMISSIONS);
+        const doc = await col.findOne({ type: 'role_defaults' });
+        res.json({
+            permisos:      doc?.permisos      || ROL_PERMISOS_DEFAULT,
+            modulos:       MODULOS_PERMISOS,
+            version:       doc?.version       || '1.0',
+            actualizadoEn: doc?.actualizadoEn,
+            actualizadoPor:doc?.actualizadoPor,
+        });
+    } catch (error) {
+        logger.error('Admin get role perms error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// PUT /api/admin/permissions/roles/:rol — actualizar permisos de un rol completo
+app.put('/api/admin/permissions/roles/:rol', authMiddleware, requireAdmin, async (req, res) => {
+    try {
+        const { rol } = req.params;
+        const rolesValidos = ['ADMIN', 'RH', 'SISTEMAS', 'GERENTE', 'USUARIO'];
+        if (!rolesValidos.includes(rol)) return res.status(400).json({ error: `Rol inválido: ${rol}` });
+        if (rol === 'ADMIN') return res.status(403).json({ error: 'Los permisos de ADMIN no se pueden modificar' });
+
+        const { permisos } = req.body;
+        if (!Array.isArray(permisos)) return res.status(400).json({ error: 'permisos debe ser un array' });
+
+        const permisosLimpios = permisos.filter(p => Object.keys(MODULOS_PERMISOS).includes(p));
+        const col = await getCollection(COLLECTIONS.ROLE_PERMISSIONS);
+        await col.updateOne(
+            { type: 'role_defaults' },
+            { $set: {
+                [`permisos.${rol}`]: permisosLimpios,
+                actualizadoEn:  new Date().toISOString(),
+                actualizadoPor: req.usuario.username,
+            }},
+            { upsert: true }
+        );
+        logger.info(`Permisos del rol ${rol} actualizados por ${req.usuario.username}`);
+        res.json({ success: true, rol, permisos: permisosLimpios });
+    } catch (error) {
+        logger.error('Admin update role perms error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// GET /api/admin/permissions/users/:username — overrides + permisos efectivos de un usuario
+app.get('/api/admin/permissions/users/:username', authMiddleware, requireAdmin, async (req, res) => {
+    try {
+        const colU  = await getCollection(COLLECTIONS.USERS);
+        const user  = await colU.findOne({ username: req.params.username }, { projection: { password: 0 } });
+        if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
+
+        const col2     = await getCollection(COLLECTIONS.ROLE_PERMISSIONS);
+        const roleDoc  = await col2.findOne({ type: 'role_defaults' });
+        const rolPerms = roleDoc?.permisos?.[user.rol] || ROL_PERMISOS_DEFAULT[user.rol] || [];
+        const overrides = user.permisosOverride || { added: [], removed: [] };
+
+        const efectivos = user.rol === 'ADMIN'
+            ? Object.keys(MODULOS_PERMISOS)
+            : [
+                ...rolPerms.filter(p => !overrides.removed.includes(p)),
+                ...overrides.added.filter(p => !rolPerms.includes(p))
+              ];
+
+        res.json({
+            user:      { username: user.username, nombre: user.nombre, rol: user.rol, email: user.email },
+            rolPermisos: rolPerms,
+            overrides,
+            efectivos,
+            modulos:   MODULOS_PERMISOS,
+        });
+    } catch (error) {
+        logger.error('Admin get user perms error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// PUT /api/admin/permissions/users/:username — guardar overrides individuales de un usuario
+app.put('/api/admin/permissions/users/:username', authMiddleware, requireAdmin, async (req, res) => {
+    try {
+        const { username } = req.params;
+        if (username === 'admin') return res.status(403).json({ error: 'Los permisos del admin no se pueden modificar' });
+
+        const { added = [], removed = [] } = req.body;
+        if (!Array.isArray(added) || !Array.isArray(removed)) return res.status(400).json({ error: 'added y removed deben ser arrays' });
+
+        const validos     = Object.keys(MODULOS_PERMISOS);
+        const addedFinal  = added.filter(p => validos.includes(p) && !removed.includes(p));
+        const removedFinal= removed.filter(p => validos.includes(p) && !added.includes(p));
+
+        const col    = await getCollection(COLLECTIONS.USERS);
+        const result = await col.updateOne(
+            { username },
+            { $set: { permisosOverride: { added: addedFinal, removed: removedFinal }, actualizadoEn: new Date().toISOString() } }
+        );
+        if (result.matchedCount === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
+
+        logger.info(`Overrides de ${username} actualizados por ${req.usuario.username} → +[${addedFinal}] -[${removedFinal}]`);
+        res.json({ success: true, username, overrides: { added: addedFinal, removed: removedFinal } });
+    } catch (error) {
+        logger.error('Admin update user perms error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ── FIN ENDPOINTS ADMIN PANEL ─────────────────────────────────
+
 // ERROR HANDLER
 // ============================================================
 
@@ -2759,4 +3178,3 @@ process.on('SIGTERM', async () => {
 
 // Export para Vercel
 export default app;
-
