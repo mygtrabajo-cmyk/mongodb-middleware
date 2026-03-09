@@ -57,7 +57,13 @@ var CONFIG = {
             formatosGenerar: '/api/formatos/generar',
             formatosClearCache: '/api/formatos/clear-cache',
 
-            activosMovimientos: '/api/activos/movimientos'
+            activosMovimientos: '/api/activos/movimientos',
+           // Admin Panel (solo ADMIN)
+            adminStats:       '/api/admin/stats',
+            adminAccessLogs:  '/api/admin/access-logs',
+            adminSubmissions: '/api/admin/form-submissions',
+            adminRolePerms:   '/api/admin/permissions/roles',
+            adminUserPerms:   '/api/admin/permissions/users', // + /:username
         },
         
         // Timeout para requests (ms)
@@ -78,4 +84,5 @@ const ITEMS_POR_PAGINA = 30;
     console.log('   Sheets configuradas:', Object.keys(CONFIG.sheetsPublicUrls).length);
     console.log('   Endpoints API:', Object.keys(CONFIG.api.endpoints).length);
 })();
+
 
