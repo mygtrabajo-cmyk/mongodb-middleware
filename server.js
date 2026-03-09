@@ -973,7 +973,6 @@ app.post('/api/auth/login', async (req, res) => {
         }
 
         const passwordHash = hashPassword(password);
-        const passwordHash = hashPassword(password);
         if (passwordHash !== user.password) {
             // Log acceso fallido
             try {
