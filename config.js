@@ -25,7 +25,9 @@ var CONFIG = {
         dashboardTickets:  '15D9LtufL60YwhOh26hrJmuEFkJolTURN22iiPcHwX1Q',
         pdvDetalles:       '1oqWDNGdZhACoTepi9pGTYKE-UhVZPNCpxSHW0GCINL8',
         correosDetallados: '12sZGOsKCpyHpc6poigKdc2KjalpYcWUo',
-        ticketsConteo:     '1jxDODo8aVGoy1uhotLS2E4Lq5ogQTA_rlfTZxn1Yo38'
+        ticketsConteo:     '1jxDODo8aVGoy1uhotLS2E4Lq5ogQTA_rlfTZxn1Yo38',
+        rhPOC:             '15WKfjBVel38DKRdHO1EtjOqi9EGRTB1cuhCnqAGb1V0',
+        rhHistorico:       '14ei47FFgK5ZRgCHEtZ_eMToKZqZ6XZZtr8U6PGlJsY8'
     },
 
     // ========== API Backend Unificado v3.3 ==========
@@ -96,3 +98,4 @@ const ITEMS_POR_PAGINA = 30;
     console.log('   Sheets configuradas:', Object.keys(CONFIG.sheetsPublicUrls).length);
     console.log('   Endpoints API:', Object.keys(CONFIG.api.endpoints).length);
 })();
+
