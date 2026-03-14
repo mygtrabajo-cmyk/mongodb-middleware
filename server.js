@@ -177,6 +177,9 @@ const COLLECTIONS = {
     // Admin Panel v1.0
     ADMIN_ACCESS_LOGS: 'admin_access_logs',
     ROLE_PERMISSIONS:  'role_permissions',
+    HUB_ASISTENCIAS: 'hub_asistencia',
+    HUB_VACACIONES: 'hub_vacaciones',
+    HUB_CONCENTRADO_CONFIG: 'hub_concentrado_config'
 };
 
 // Configuración HÍBRIDA de plantillas (filesystem + Google Drive)
@@ -434,6 +437,9 @@ const MODULOS_PERMISOS = {
     'hub.guias':              'Guías y procedimientos',
     'hub.plantillas':         'Plantillas del Hub',
     'hub.capacitacion':       'Tracker de Capacitación',
+    'hub.asistencia':         'Asistencias',
+    'hub.vacaciones':         'Vacaciones',
+    'hub.concentrado':        'Concentrado',
     // Formatos
     'formatos.generar':       'Generar formatos de activación',
     // RH
@@ -2798,7 +2804,223 @@ app.delete('/api/hub/capacitacion/:id', authMiddleware, requireHubAccess, async 
         res.status(500).json({ error: error.message });
     }
 });
+// ════════════════════════════════════════════════════════════════
+// HUB ASISTENCIA v1.0 — Control de asistencias y vacaciones
+// Collections: hub_asistencia, hub_vacaciones, hub_concentrado_config
+// ════════════════════════════════════════════════════════════════
 
+/** Verifica si el usuario puede acceder al concentrado (admin + autorizados) */
+async function canViewConcentrado(req) {
+  if (req.user.rol === 'ADMIN') return true;
+  try {
+    const col = await getCollection('hub_concentrado_config');
+    const cfg = await col.findOne({ _id: 'config' });
+    if (!cfg) return false;
+    const roles = cfg.allowedRoles || [];
+    const users = cfg.allowedUsers || [];
+    return roles.includes(req.user.rol) || users.includes(req.user.username);
+  } catch { return false; }
+}
+
+// ── GET /api/hub/asistencia ──────────────────────────────────────
+// Analistas: solo ven los propios. Admin: todos (filtrable por ?username=)
+router.get('/api/hub/asistencia', authMiddleware, async (req, res) => {
+  try {
+    const col   = await getCollection('hub_asistencia');
+    const query = {};
+    if (req.user.rol !== 'ADMIN') {
+      query.username = req.user.username;
+    } else if (req.query.username) {
+      query.username = req.query.username;
+    }
+    if (req.query.mes)  query.fecha = { $regex: `^${req.query.mes}` };
+    if (req.query.tipo) query.tipo  = req.query.tipo;
+    const docs = await col.find(query).sort({ fecha: -1 }).toArray();
+    res.json(docs);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── POST /api/hub/asistencia ─────────────────────────────────────
+router.post('/api/hub/asistencia', authMiddleware, async (req, res) => {
+  try {
+    const col = await getCollection('hub_asistencia');
+    const { fecha, tipo, horaEntrada, horaSalida, notas } = req.body;
+    if (!fecha || !tipo) return res.status(400).json({ error: 'fecha y tipo son requeridos' });
+    const TIPOS = ['asistencia', 'falta', 'retardo', 'incapacidad', 'permiso', 'homeoffice'];
+    if (!TIPOS.includes(tipo)) return res.status(400).json({ error: 'Tipo de asistencia inválido' });
+    // Un registro por día por usuario
+    const existe = await col.findOne({ username: req.user.username, fecha });
+    if (existe) return res.status(409).json({ error: 'Ya existe un registro para este día' });
+    const doc = {
+      _id: new ObjectId(),
+      username:    req.user.username,
+      nombre:      req.user.nombre || req.user.username,
+      fecha, tipo,
+      horaEntrada: horaEntrada || null,
+      horaSalida:  horaSalida  || null,
+      notas:       notas       || '',
+      creadoEn:    new Date().toISOString(),
+    };
+    await col.insertOne(doc);
+    res.status(201).json(doc);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── PATCH /api/hub/asistencia/:id ───────────────────────────────
+router.patch('/api/hub/asistencia/:id', authMiddleware, async (req, res) => {
+  try {
+    const col = await getCollection('hub_asistencia');
+    const doc = await col.findOne({ _id: new ObjectId(req.params.id) });
+    if (!doc) return res.status(404).json({ error: 'Registro no encontrado' });
+    if (doc.username !== req.user.username && req.user.rol !== 'ADMIN')
+      return res.status(403).json({ error: 'Sin permiso para editar este registro' });
+    const { tipo, horaEntrada, horaSalida, notas, fecha } = req.body;
+    const upd = { actualizadoEn: new Date().toISOString() };
+    if (tipo)                  upd.tipo        = tipo;
+    if (fecha)                 upd.fecha       = fecha;
+    if (horaEntrada !== undefined) upd.horaEntrada = horaEntrada;
+    if (horaSalida  !== undefined) upd.horaSalida  = horaSalida;
+    if (notas       !== undefined) upd.notas       = notas;
+    await col.updateOne({ _id: new ObjectId(req.params.id) }, { $set: upd });
+    res.json({ ...doc, ...upd });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── DELETE /api/hub/asistencia/:id ──────────────────────────────
+router.delete('/api/hub/asistencia/:id', authMiddleware, async (req, res) => {
+  try {
+    const col = await getCollection('hub_asistencia');
+    const doc = await col.findOne({ _id: new ObjectId(req.params.id) });
+    if (!doc) return res.status(404).json({ error: 'Registro no encontrado' });
+    if (doc.username !== req.user.username && req.user.rol !== 'ADMIN')
+      return res.status(403).json({ error: 'Sin permiso' });
+    await col.deleteOne({ _id: new ObjectId(req.params.id) });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── GET /api/hub/vacaciones ──────────────────────────────────────
+router.get('/api/hub/vacaciones', authMiddleware, async (req, res) => {
+  try {
+    const col   = await getCollection('hub_vacaciones');
+    const query = {};
+    if (req.user.rol !== 'ADMIN') {
+      query.username = req.user.username;
+    } else if (req.query.username) {
+      query.username = req.query.username;
+    }
+    if (req.query.status) query.status = req.query.status;
+    const docs = await col.find(query).sort({ creadoEn: -1 }).toArray();
+    res.json(docs);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── POST /api/hub/vacaciones ─────────────────────────────────────
+router.post('/api/hub/vacaciones', authMiddleware, async (req, res) => {
+  try {
+    const col = await getCollection('hub_vacaciones');
+    const { fechaInicio, fechaFin, notas } = req.body;
+    if (!fechaInicio || !fechaFin) return res.status(400).json({ error: 'fechaInicio y fechaFin requeridos' });
+    if (fechaInicio > fechaFin)    return res.status(400).json({ error: 'fechaInicio debe ser anterior a fechaFin' });
+    const dias = Math.round((new Date(fechaFin) - new Date(fechaInicio)) / 86400000) + 1;
+    const doc  = {
+      _id: new ObjectId(),
+      username:        req.user.username,
+      nombre:          req.user.nombre || req.user.username,
+      fechaInicio, fechaFin, dias,
+      notas:           notas || '',
+      status:          'pendiente',
+      comentarioAdmin: null,
+      creadoEn:        new Date().toISOString(),
+    };
+    await col.insertOne(doc);
+    res.status(201).json(doc);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── PATCH /api/hub/vacaciones/:id ───────────────────────────────
+// Admin: puede cambiar status + comentarioAdmin
+// Analista: solo puede editar solicitudes pendientes propias
+router.patch('/api/hub/vacaciones/:id', authMiddleware, async (req, res) => {
+  try {
+    const col = await getCollection('hub_vacaciones');
+    const doc = await col.findOne({ _id: new ObjectId(req.params.id) });
+    if (!doc) return res.status(404).json({ error: 'Solicitud no encontrada' });
+    const upd = { actualizadoEn: new Date().toISOString() };
+    if (req.user.rol === 'ADMIN') {
+      if (req.body.status          !== undefined) upd.status          = req.body.status;
+      if (req.body.comentarioAdmin !== undefined) upd.comentarioAdmin = req.body.comentarioAdmin;
+    } else if (doc.username === req.user.username) {
+      if (doc.status !== 'pendiente') return res.status(403).json({ error: 'No puedes editar una solicitud ya procesada' });
+      if (req.body.notas !== undefined) upd.notas = req.body.notas;
+    } else {
+      return res.status(403).json({ error: 'Sin permiso' });
+    }
+    await col.updateOne({ _id: new ObjectId(req.params.id) }, { $set: upd });
+    res.json({ ...doc, ...upd });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── DELETE /api/hub/vacaciones/:id ──────────────────────────────
+router.delete('/api/hub/vacaciones/:id', authMiddleware, async (req, res) => {
+  try {
+    const col = await getCollection('hub_vacaciones');
+    const doc = await col.findOne({ _id: new ObjectId(req.params.id) });
+    if (!doc) return res.status(404).json({ error: 'Solicitud no encontrada' });
+    if (doc.username !== req.user.username && req.user.rol !== 'ADMIN')
+      return res.status(403).json({ error: 'Sin permiso' });
+    if (doc.status !== 'pendiente' && req.user.rol !== 'ADMIN')
+      return res.status(403).json({ error: 'No puedes cancelar una solicitud ya procesada' });
+    await col.deleteOne({ _id: new ObjectId(req.params.id) });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── GET /api/hub/concentrado ─────────────────────────────────────
+// Solo ADMIN y usuarios/roles autorizados en hub_concentrado_config
+router.get('/api/hub/concentrado', authMiddleware, async (req, res) => {
+  try {
+    if (!(await canViewConcentrado(req))) return res.status(403).json({ error: 'Sin acceso al concentrado' });
+    const asistCol = await getCollection('hub_asistencia');
+    const vacCol   = await getCollection('hub_vacaciones');
+    const asistQ   = {};
+    if (req.query.mes)      asistQ.fecha    = { $regex: `^${req.query.mes}` };
+    if (req.query.username) asistQ.username = req.query.username;
+    if (req.query.tipo)     asistQ.tipo     = req.query.tipo;
+    const vacQ = {};
+    if (req.query.username) vacQ.username = req.query.username;
+    const [asistencias, vacaciones] = await Promise.all([
+      asistCol.find(asistQ).sort({ fecha: -1, username: 1 }).toArray(),
+      vacCol.find(vacQ).sort({ creadoEn: -1 }).toArray(),
+    ]);
+    res.json({ asistencias, vacaciones });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── GET /api/hub/concentrado/config ─────────────────────────────
+router.get('/api/hub/concentrado/config', authMiddleware, async (req, res) => {
+  if (req.user.rol !== 'ADMIN') return res.status(403).json({ error: 'Solo ADMIN' });
+  try {
+    const col = await getCollection('hub_concentrado_config');
+    const cfg = await col.findOne({ _id: 'config' });
+    res.json(cfg || { _id: 'config', allowedRoles: [], allowedUsers: [] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── PUT /api/hub/concentrado/config ──────────────────────────────
+router.put('/api/hub/concentrado/config', authMiddleware, async (req, res) => {
+  if (req.user.rol !== 'ADMIN') return res.status(403).json({ error: 'Solo ADMIN' });
+  try {
+    const col = await getCollection('hub_concentrado_config');
+    const { allowedRoles = [], allowedUsers = [] } = req.body;
+    await col.updateOne(
+      { _id: 'config' },
+      { $set: { allowedRoles, allowedUsers, actualizadoEn: new Date().toISOString() } },
+      { upsert: true }
+    );
+    res.json({ ok: true, allowedRoles, allowedUsers });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 // ── FIN ENDPOINTS HUB DE SISTEMAS ─────────────────────────────
 
 // ============================================================
