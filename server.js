@@ -1,6 +1,6 @@
 /* ==================================================================
-   MYG TELECOM - SERVIDOR UNIFICADO v3.4 (HÍBRIDO)
-   
+   MYG TELECOM - SERVIDOR UNIFICADO v3.5 (HÍBRIDO)
+
    Características:
    - Detección automática de entorno (local/cloud)
    - Plantillas: filesystem (local) + Google Drive (cloud/fallback)
@@ -9,25 +9,27 @@
    - Compatible: Node.js local + Vercel serverless
    - v3.3: Endpoint /api/chat (Proxy seguro Anthropic Claude)
    - v3.4: Hub Asistencia + Vacaciones + Concentrado RH
-   
+   - v3.5: FIXES — concentrado accesible a SISTEMAS, permisos,
+           validaciones fecha, re-fetch tras PATCH
+
    Autor: luis oliva - MYG Telecom
    ================================================================== */
 
-import express from 'express';
+import express    from 'express';
 import { MongoClient, ObjectId } from 'mongodb';
-import ExcelJS from 'exceljs';
-import cors from 'cors';
-import crypto from 'crypto';
-import Joi from 'joi';
-import winston from 'winston';
-import path from 'path';
+import ExcelJS    from 'exceljs';
+import cors       from 'cors';
+import crypto     from 'crypto';
+import Joi        from 'joi';
+import winston    from 'winston';
+import path       from 'path';
 import { fileURLToPath } from 'url';
-import fs from 'fs/promises';
+import fs         from 'fs/promises';
 
 const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const __dirname  = path.dirname(__filename);
 
-const app = express();
+const app  = express();
 const PORT = process.env.PORT || 3000;
 
 // ============================================================
@@ -42,7 +44,7 @@ const TEMPLATES_DIR = path.join(__dirname, 'plantillas');
 
 // Cache de plantillas en memoria (para cloud)
 const templateCache = new Map();
-const CACHE_TTL = 60 * 60 * 1000; // 1 hora
+const CACHE_TTL     = 60 * 60 * 1000; // 1 hora
 
 // ============================================================
 // SSE — REGISTRO DE CONEXIONES EN TIEMPO REAL
@@ -116,7 +118,7 @@ const logger = winston.createLogger({
 });
 
 if (!IS_CLOUD) {
-    logger.add(new winston.transports.File({ filename: 'logs/error.log', level: 'error' }));
+    logger.add(new winston.transports.File({ filename: 'logs/error.log',    level: 'error' }));
     logger.add(new winston.transports.File({ filename: 'logs/combined.log' }));
 }
 
@@ -160,73 +162,61 @@ const ACTIVATION_TEMPLATES = {
     ACCWEB: {
         file: 'ACTIVACION_ACCWEB.xlsx',
         driveId: process.env.DRIVE_ID_ASCCWEB || process.env.DRIVE_ID_ACCWEB,
-        label: 'AccWeb',
-        description: 'ACCWEB',
+        label: 'AccWeb', description: 'ACCWEB',
         fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6' }
     },
     ASCC: {
-        file: 'ACTIVACION_ASCC.xlsx',
-        driveId: process.env.DRIVE_ID_ASCC,
+        file: 'ACTIVACION_ASCC.xlsx', driveId: process.env.DRIVE_ID_ASCC,
         label: 'ASCC', description: 'ASCC',
         fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6' }
     },
     ASD: {
-        file: 'ACTIVACION_ASD.xlsx',
-        driveId: process.env.DRIVE_ID_ASD,
+        file: 'ACTIVACION_ASD.xlsx', driveId: process.env.DRIVE_ID_ASD,
         label: 'ASD', description: 'ASD',
         fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6' }
     },
     AVS: {
-        file: 'ACTIVACION_AVS.xlsx',
-        driveId: process.env.DRIVE_ID_AVS,
+        file: 'ACTIVACION_AVS.xlsx', driveId: process.env.DRIVE_ID_AVS,
         label: 'AVS', description: 'AVS',
         fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6' }
     },
     DIGITAL: {
-        file: 'ACTIVACION_DIGITAL.xlsx',
-        driveId: process.env.DRIVE_ID_DIGITAL,
+        file: 'ACTIVACION_DIGITAL.xlsx', driveId: process.env.DRIVE_ID_DIGITAL,
         label: 'DIGITAL', description: 'Digital',
         fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6' }
     },
     IC: {
-        file: 'ACTIVACION_IC.xlsx',
-        driveId: process.env.DRIVE_ID_IC,
+        file: 'ACTIVACION_IC.xlsx', driveId: process.env.DRIVE_ID_IC,
         label: 'IC', description: 'Inventario Ciclico',
         fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6' }
     },
     IDM: {
-        file: 'ACTIVACION_IDM.xlsx',
-        driveId: process.env.DRIVE_ID_IDM,
+        file: 'ACTIVACION_IDM.xlsx', driveId: process.env.DRIVE_ID_IDM,
         label: 'IDM', description: 'IDM',
         fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6' }
     },
     OFA: {
-        file: 'ACTIVACION_OFA.xlsx',
-        driveId: process.env.DRIVE_ID_OFA,
+        file: 'ACTIVACION_OFA.xlsx', driveId: process.env.DRIVE_ID_OFA,
         label: 'OFA', description: 'Oracle',
         fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6' }
     },
     PAYMENTBOX: {
-        file: 'ACTIVACION_PAYMENTBOX.xlsx',
-        driveId: process.env.DRIVE_ID_PAYMENTBOX,
+        file: 'ACTIVACION_PAYMENTBOX.xlsx', driveId: process.env.DRIVE_ID_PAYMENTBOX,
         label: 'PAYMENTBOX', description: 'Paymentbox',
         fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6' }
     },
     RED: {
-        file: 'ACTIVACION_RED.xlsx',
-        driveId: process.env.DRIVE_ID_RED,
+        file: 'ACTIVACION_RED.xlsx', driveId: process.env.DRIVE_ID_RED,
         label: 'RED', description: 'RED',
         fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6' }
     },
     SALESFORCE: {
-        file: 'ACTIVACION_SALESFORCE.xlsx',
-        driveId: process.env.DRIVE_ID_SALESFORCE,
+        file: 'ACTIVACION_SALESFORCE.xlsx', driveId: process.env.DRIVE_ID_SALESFORCE,
         label: 'SALESFORCE', description: 'Salesforce',
         fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6' }
     },
     VPN: {
-        file: 'ACTIVACION_VPN.xlsx',
-        driveId: process.env.DRIVE_ID_VPN,
+        file: 'ACTIVACION_VPN.xlsx', driveId: process.env.DRIVE_ID_VPN,
         label: 'VPN', description: 'VPN',
         fields: { nombre: 'A6', attuid: 'B6', puesto: 'D6', pdv: 'F6', clave_pdv: 'G6' }
     }
@@ -241,7 +231,7 @@ const userCreateSchema = Joi.object({
     password: Joi.string().min(6).required(),
     nombre:   Joi.string().min(3).max(100).required(),
     email:    Joi.string().email().required(),
-    rol:      Joi.string().valid('ADMIN', 'RH', 'SISTEMAS', 'GERENTE', 'USUARIO').required(),
+    rol:      Joi.string().valid('ADMIN','RH','SISTEMAS','GERENTE','USUARIO').required(),
     activo:   Joi.boolean().default(true)
 });
 
@@ -249,7 +239,7 @@ const userUpdateSchema = Joi.object({
     password: Joi.string().min(6).optional(),
     nombre:   Joi.string().min(3).max(100).optional(),
     email:    Joi.string().email().optional(),
-    rol:      Joi.string().valid('ADMIN', 'RH', 'SISTEMAS', 'GERENTE', 'USUARIO').optional(),
+    rol:      Joi.string().valid('ADMIN','RH','SISTEMAS','GERENTE','USUARIO').optional(),
     activo:   Joi.boolean().optional(),
     telefono: Joi.string().max(20).optional().allow(''),
     puesto:   Joi.string().max(100).optional().allow(''),
@@ -275,8 +265,8 @@ const authMiddleware = async (req, res, next) => {
     try {
         const token = req.headers.authorization?.split(' ')[1];
         if (!token) return res.status(401).json({ error: 'Token requerido' });
-        const payload = verifyJWT(token);
-        req.usuario = payload;
+        const payload  = verifyJWT(token);
+        req.usuario    = payload;
         next();
     } catch (error) {
         logger.error(`Auth error: ${error.message}`);
@@ -318,7 +308,7 @@ function createJWT(payload) {
     const header  = { alg: 'HS256', typ: 'JWT' };
     const enc     = s => base64UrlEncode(JSON.stringify(s));
     const message = `${enc(header)}.${enc(payload)}`;
-    const sig = crypto.createHmac('sha256', JWT_SECRET).update(message).digest('base64')
+    const sig     = crypto.createHmac('sha256', JWT_SECRET).update(message).digest('base64')
         .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
     return `${message}.${sig}`;
 }
@@ -327,7 +317,7 @@ function verifyJWT(token) {
     const parts = token.split('.');
     if (parts.length !== 3) throw new Error('Invalid token');
     const [encodedHeader, encodedPayload, signature] = parts;
-    const message = `${encodedHeader}.${encodedPayload}`;
+    const message     = `${encodedHeader}.${encodedPayload}`;
     const expectedSig = crypto.createHmac('sha256', JWT_SECRET).update(message).digest('base64')
         .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
     if (signature !== expectedSig) throw new Error('Invalid signature');
@@ -364,7 +354,7 @@ const MODULOS_PERMISOS = {
     'hub.capacitacion':        'Tracker de Capacitación',
     'hub.asistencia':          'Asistencias',
     'hub.vacaciones':          'Vacaciones',
-    'hub.concentrado':         'Concentrado RH',
+    'hub.concentrado':         'Concentrado de Asistencia',   // FIX v3.5: descripción más clara
     'formatos.generar':        'Generar formatos de activación',
     'rh.movimientos.crear':    'Crear solicitudes RH',
     'rh.movimientos.ver':      'Ver movimientos RH',
@@ -379,6 +369,7 @@ const MODULOS_PERMISOS = {
     'admin.formularios':       'Ver entradas de formularios',
 };
 
+// FIX v3.5 — Añadido 'hub.concentrado' a SISTEMAS
 const ROL_PERMISOS_DEFAULT = {
     ADMIN: ['*'],
     SISTEMAS: [
@@ -386,6 +377,7 @@ const ROL_PERMISOS_DEFAULT = {
         'hub.acceso', 'hub.mensajes', 'hub.reuniones', 'hub.minutas',
         'hub.tareas', 'hub.anuncios', 'hub.recursos', 'hub.guias',
         'hub.plantillas', 'hub.capacitacion', 'hub.asistencia', 'hub.vacaciones',
+        'hub.concentrado',          // ← FIX: faltaba en v3.4
         'formatos.generar',
         'rh.movimientos.ver', 'rh.movimientos.gestionar',
         'activos.ver', 'activos.registrar',
@@ -452,7 +444,7 @@ async function connectDB() {
         serverSelectionTimeoutMS: 5000, socketTimeoutMS: 45000,
     });
     await client.connect();
-    const db    = client.db(DB_NAME);
+    const db     = client.db(DB_NAME);
     cachedClient = client;
     cachedDb     = db;
     logger.info('✅ Connected to MongoDB Atlas');
@@ -470,11 +462,11 @@ async function getCollection(collectionName) {
 
 async function downloadTemplateFromDrive(driveId, filename) {
     try {
-        const url = `https://drive.google.com/uc?export=download&id=${driveId}`;
+        const url      = `https://drive.google.com/uc?export=download&id=${driveId}`;
         logger.info(`📥 Downloading from Drive: ${filename}`);
         const response = await fetch(url, {
             headers: { 'User-Agent': 'Mozilla/5.0' },
-            signal: AbortSignal.timeout(30000)
+            signal:  AbortSignal.timeout(30000)
         });
         if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
         const buffer = Buffer.from(await response.arrayBuffer());
@@ -499,7 +491,7 @@ async function loadTemplateFromFilesystem(templatePath, filename) {
 }
 
 async function loadTemplate(sistema, config) {
-    const cacheKey    = `template_${sistema}`;
+    const cacheKey     = `template_${sistema}`;
     const templatePath = path.join(TEMPLATES_DIR, config.file);
 
     if (!IS_CLOUD) {
@@ -567,6 +559,18 @@ function generateSafeFilename(sistema, nombre) {
 }
 
 // ============================================================
+// HELPERS — FIX v3.5
+// ============================================================
+
+/** Valida que un string sea una fecha YYYY-MM-DD válida */
+function esDateValido(str) {
+    if (!str || typeof str !== 'string') return false;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(str)) return false;
+    const d = new Date(str + 'T12:00:00');
+    return !isNaN(d.getTime());
+}
+
+// ============================================================
 // INICIALIZACIÓN
 // ============================================================
 
@@ -580,9 +584,9 @@ async function initializeDB() {
                 username: 'admin', password: passwordHash,
                 nombre: 'Administrador', email: 'admin@mygtelecom.mx',
                 rol: 'ADMIN', activo: true, permisos: ['*'],
-                creadoEn: new Date().toISOString(),
+                creadoEn:      new Date().toISOString(),
                 actualizadoEn: new Date().toISOString(),
-                ultimoAcceso: null
+                ultimoAcceso:  null
             });
             logger.info('✅ Admin user created');
         }
@@ -629,6 +633,11 @@ async function initializeDB() {
         const hubAsistencia = await getCollection(COLLECTIONS.HUB_ASISTENCIA);
         await hubAsistencia.createIndex({ username: 1, fecha: -1 });
         await hubAsistencia.createIndex({ fecha: -1 });
+        // Índice único: un registro por usuario por día
+        await hubAsistencia.createIndex(
+            { username: 1, fecha: 1 },
+            { unique: true, name: 'unique_user_date' }
+        );
 
         const hubVacaciones = await getCollection(COLLECTIONS.HUB_VACACIONES);
         await hubVacaciones.createIndex({ username: 1, creadoEn: -1 });
@@ -641,18 +650,31 @@ async function initializeDB() {
         await adminLogs.createIndex({ username: 1, timestamp: -1 });
         await adminLogs.createIndex({ resultado: 1 });
 
-        const rolePermsCol = await getCollection(COLLECTIONS.ROLE_PERMISSIONS);
-        const existingPerms = await rolePermsCol.findOne({ type: 'role_defaults' });
+        const rolePermsCol    = await getCollection(COLLECTIONS.ROLE_PERMISSIONS);
+        const existingPerms   = await rolePermsCol.findOne({ type: 'role_defaults' });
         if (!existingPerms) {
             await rolePermsCol.insertOne({
-                type: 'role_defaults',
-                permisos: ROL_PERMISOS_DEFAULT,
-                modulos: MODULOS_PERMISOS,
-                version: '1.0',
+                type:          'role_defaults',
+                permisos:      ROL_PERMISOS_DEFAULT,
+                modulos:       MODULOS_PERMISOS,
+                version:       '1.1',
                 actualizadoEn: new Date().toISOString(),
                 actualizadoPor: 'system',
             });
-            logger.info('✅ Role permissions seeded');
+            logger.info('✅ Role permissions seeded (v1.1 — hub.concentrado para SISTEMAS)');
+        } else {
+            // FIX v3.5: asegurar que hub.concentrado esté en SISTEMAS aunque ya exista el doc
+            const sistemasPerms = existingPerms.permisos?.SISTEMAS || [];
+            if (!sistemasPerms.includes('hub.concentrado')) {
+                await rolePermsCol.updateOne(
+                    { type: 'role_defaults' },
+                    {
+                        $addToSet: { 'permisos.SISTEMAS': 'hub.concentrado' },
+                        $set:      { actualizadoEn: new Date().toISOString(), actualizadoPor: 'system-v3.5' }
+                    }
+                );
+                logger.info('✅ hub.concentrado migrado a permisos de SISTEMAS');
+            }
         }
 
         logger.info('✅ Database indexes created');
@@ -684,7 +706,7 @@ async function verificarPlantillas() {
         }
         if (!available && config.driveId) {
             status.googleDrive = true;
-            available = true;
+            available          = true;
             status.available.push({ sistema: key, source: 'drive' });
         }
         if (!available) {
@@ -702,10 +724,10 @@ async function verificarPlantillas() {
 
 app.get('/', (req, res) => {
     res.json({
-        name: 'MYG Telecom - Servidor Unificado',
-        version: '3.4.0',
-        mode: IS_CLOUD ? 'cloud (Render/Vercel)' : 'local',
-        status: 'running',
+        name:    'MYG Telecom - Servidor Unificado',
+        version: '3.5.0',
+        mode:    IS_CLOUD ? 'cloud (Render/Vercel)' : 'local',
+        status:  'running',
     });
 });
 
@@ -714,12 +736,12 @@ app.get('/health', async (req, res) => {
         await connectDB();
         const plantillasStatus = await verificarPlantillas();
         res.json({
-            status: 'ok',
+            status:    'ok',
             timestamp: new Date().toISOString(),
             environment: { mode: IS_CLOUD ? 'cloud' : 'local', nodeVersion: process.version },
-            database: { type: 'mongodb', status: 'connected' },
-            storage: { templates: plantillasStatus, cacheSize: templateCache.size },
-            version: '3.4.0',
+            database:    { type: 'mongodb', status: 'connected' },
+            storage:     { templates: plantillasStatus, cacheSize: templateCache.size },
+            version:     '3.5.0',
         });
     } catch (error) {
         logger.error('Health check failed:', error);
@@ -750,7 +772,7 @@ app.post('/api/auth/login', async (req, res) => {
                 const accessLogs = await getCollection(COLLECTIONS.ADMIN_ACCESS_LOGS);
                 await accessLogs.insertOne({
                     username, nombre: user?.nombre || null, rol: user?.rol || null,
-                    ip: req.ip || req.headers['x-forwarded-for'] || 'unknown',
+                    ip:        req.ip || req.headers['x-forwarded-for'] || 'unknown',
                     userAgent: req.get('user-agent') || 'unknown',
                     resultado: 'fallido', razon: 'password_incorrecto',
                     timestamp: new Date().toISOString(),
@@ -763,15 +785,15 @@ app.post('/api/auth/login', async (req, res) => {
 
         const token = createJWT({
             username: user.username, nombre: user.nombre,
-            rol: user.rol, email: user.email,
-            exp: Date.now() + (24 * 60 * 60 * 1000)
+            rol:      user.rol,      email:  user.email,
+            exp:      Date.now() + (24 * 60 * 60 * 1000)
         });
 
         try {
             const accessLogs = await getCollection(COLLECTIONS.ADMIN_ACCESS_LOGS);
             await accessLogs.insertOne({
                 username, nombre: user.nombre, rol: user.rol,
-                ip: req.ip || req.headers['x-forwarded-for'] || 'unknown',
+                ip:        req.ip || req.headers['x-forwarded-for'] || 'unknown',
                 userAgent: req.get('user-agent') || 'unknown',
                 resultado: 'exitoso', timestamp: new Date().toISOString(),
             });
@@ -795,7 +817,7 @@ app.post('/api/auth/login', async (req, res) => {
 app.get('/api/users', authMiddleware, async (req, res) => {
     try {
         const collection = await getCollection(COLLECTIONS.USERS);
-        const users = await collection.find({ activo: true }).project({ password: 0 }).toArray();
+        const users      = await collection.find({ activo: true }).project({ password: 0 }).toArray();
         res.json(users);
     } catch (error) {
         res.status(500).json({ error: error.message });
@@ -865,7 +887,7 @@ app.delete('/api/users/:username', authMiddleware, requireAdmin, async (req, res
             return res.status(403).json({ error: 'No se puede eliminar el usuario admin' });
         }
         const collection = await getCollection(COLLECTIONS.USERS);
-        const result = await collection.updateOne(
+        const result     = await collection.updateOne(
             { username: req.params.username },
             { $set: { activo: false, eliminadoEn: new Date().toISOString() } }
         );
@@ -914,7 +936,7 @@ app.patch('/api/users/:username/profile', authMiddleware, async (req, res) => {
 
 app.patch('/api/users/:username/password', authMiddleware, async (req, res) => {
     try {
-        const { username } = req.params;
+        const { username }                     = req.params;
         const { passwordActual, passwordNueva } = req.body;
 
         if (req.usuario.username !== username && req.usuario.rol !== 'ADMIN') {
@@ -958,14 +980,20 @@ app.get('/api/formatos/sistemas', authMiddleware, async (req, res) => {
             const missingItem   = plantillasStatus.missing.find(i => i.sistema === key);
             return {
                 id: key, label: config.label, description: config.description, file: config.file,
-                status: availableItem ? 'available' : 'unavailable',
-                source: availableItem?.source || null,
+                status:         availableItem ? 'available' : 'unavailable',
+                source:         availableItem?.source || null,
                 driveConfigured: !!config.driveId,
-                missingEnvVar: missingItem?.needsDriveId || null
+                missingEnvVar:  missingItem?.needsDriveId || null
             };
         }).sort((a, b) => a.label.localeCompare(b.label));
 
-        res.json({ total: sistemas.length, available: sistemas.filter(s => s.status === 'available').length, mode: IS_CLOUD ? 'cloud' : 'local', storage: plantillasStatus, sistemas });
+        res.json({
+            total:     sistemas.length,
+            available: sistemas.filter(s => s.status === 'available').length,
+            mode:      IS_CLOUD ? 'cloud' : 'local',
+            storage:   plantillasStatus,
+            sistemas
+        });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -1006,7 +1034,7 @@ app.post('/api/formatos/generar', authMiddleware, async (req, res) => {
                 usuario: req.usuario.username, nombre_empleado: fieldData.nombre,
                 filename, size_bytes: buffer.length, duracion_ms: elapsed,
                 environment: IS_CLOUD ? 'cloud' : 'local',
-                timestamp: new Date().toISOString()
+                timestamp:   new Date().toISOString()
             });
         } catch {}
 
@@ -1032,12 +1060,12 @@ app.post('/api/formatos/clear-cache', authMiddleware, requireAdmin, (req, res) =
 
 app.get('/api/devices', async (req, res) => {
     try {
-        const devices = await getCollection(COLLECTIONS.DEVICES);
-        const { location, status, search } = req.query;
-        const filter = {};
-        if (location) filter.location = location;
-        if (status)   filter.status   = status;
-        if (search)   filter.$or = [
+        const devices                        = await getCollection(COLLECTIONS.DEVICES);
+        const { location, status, search }   = req.query;
+        const filter                         = {};
+        if (location) filter.location        = location;
+        if (status)   filter.status          = status;
+        if (search)   filter.$or             = [
             { hostname:    { $regex: search, $options: 'i' } },
             { logged_user: { $regex: search, $options: 'i' } },
             { ip_address:  { $regex: search, $options: 'i' } }
@@ -1091,7 +1119,7 @@ app.post('/api/rh/movimientos', authMiddleware, async (req, res) => {
         const movimientos = await getCollection(COLLECTIONS.RH_MOVIMIENTOS);
         const movimiento  = {
             ...req.body,
-            _id: new ObjectId(),
+            _id:     new ObjectId(),
             creado_por: { username: req.usuario.username, nombre: req.usuario.nombre, email: req.usuario.email },
             estado: 'PENDIENTE',
             fecha_creacion:     new Date().toISOString(),
@@ -1107,7 +1135,7 @@ app.post('/api/rh/movimientos', authMiddleware, async (req, res) => {
 
 app.get('/api/rh/movimientos', authMiddleware, async (req, res) => {
     try {
-        const movimientos = await getCollection(COLLECTIONS.RH_MOVIMIENTOS);
+        const movimientos                   = await getCollection(COLLECTIONS.RH_MOVIMIENTOS);
         const { tipo, estado, usuario, fecha_desde, fecha_hasta } = req.query;
         const filter = {};
         if (tipo   && tipo   !== 'todos') filter.tipo   = tipo;
@@ -1133,7 +1161,7 @@ app.patch('/api/rh/movimientos/:id/estado', authMiddleware, requireSistemas, asy
     try {
         const movimientos = await getCollection(COLLECTIONS.RH_MOVIMIENTOS);
         const { estado, comentario, correo_creado, procesado_por } = req.body;
-        const estadosValidos = ['PENDIENTE', 'EN_PROCESO', 'COMPLETADO', 'RECHAZADO'];
+        const estadosValidos = ['PENDIENTE','EN_PROCESO','COMPLETADO','RECHAZADO'];
         if (!estadosValidos.includes(estado)) return res.status(400).json({ error: 'Estado inválido' });
 
         const updates = { estado, fecha_modificacion: new Date().toISOString() };
@@ -1145,7 +1173,10 @@ app.patch('/api/rh/movimientos/:id/estado', authMiddleware, requireSistemas, asy
 
         await movimientos.updateOne(
             { _id: new ObjectId(req.params.id) },
-            { $set: updates, $push: { historial: { estado, fecha: new Date().toISOString(), usuario: req.usuario.username, comentario: comentario || `Estado cambiado a ${estado}` } } }
+            {
+                $set:  updates,
+                $push: { historial: { estado, fecha: new Date().toISOString(), usuario: req.usuario.username, comentario: comentario || `Estado cambiado a ${estado}` } }
+            }
         );
 
         const movimiento = await movimientos.findOne({ _id: new ObjectId(req.params.id) });
@@ -1172,9 +1203,9 @@ app.post('/api/chat', authMiddleware, async (req, res) => {
         }
 
         const anthropicRes = await fetch('https://api.anthropic.com/v1/messages', {
-            method: 'POST',
+            method:  'POST',
             headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
-            body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens, temperature, messages, ...(system && { system }) }),
+            body:    JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens, temperature, messages, ...(system && { system }) }),
         });
 
         const data = await anthropicRes.json();
@@ -1199,10 +1230,10 @@ app.get('/api/notificaciones/sse', async (req, res) => {
     try { usuario = verifyJWT(token); }
     catch { return res.status(401).end(); }
 
-    res.setHeader('Content-Type',  'text/event-stream; charset=utf-8');
-    res.setHeader('Cache-Control', 'no-cache, no-transform');
-    res.setHeader('Connection',    'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no');
+    res.setHeader('Content-Type',          'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control',         'no-cache, no-transform');
+    res.setHeader('Connection',            'keep-alive');
+    res.setHeader('X-Accel-Buffering',     'no');
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.flushHeaders();
 
@@ -1225,12 +1256,11 @@ app.get('/api/notificaciones', authMiddleware, async (req, res) => {
     try {
         const notificaciones = await getCollection(COLLECTIONS.NOTIFICACIONES);
         const { soloNoLeidas } = req.query;
-        const filter = { usuario_destino: req.usuario.username };
+        const filter           = { usuario_destino: req.usuario.username };
         if (soloNoLeidas === 'true') filter.leida = false;
 
         const notificacionesList = await notificaciones.find(filter).sort({ fecha_creacion: -1 }).limit(50).toArray();
-        const total_no_leidas   = await notificaciones.countDocuments({ usuario_destino: req.usuario.username, leida: false });
-
+        const total_no_leidas    = await notificaciones.countDocuments({ usuario_destino: req.usuario.username, leida: false });
         res.json({ notificaciones: notificacionesList, total_no_leidas });
     } catch (error) {
         res.status(500).json({ error: error.message });
@@ -1259,11 +1289,11 @@ app.post('/api/notificaciones', authMiddleware, async (req, res) => {
             return res.status(403).json({ error: 'Solo ADMIN o SISTEMAS pueden enviar notificaciones globales' });
         }
 
-        const col = await getCollection(COLLECTIONS.NOTIFICACIONES);
+        const col      = await getCollection(COLLECTIONS.NOTIFICACIONES);
         let destinos;
         if (usuario_destino === '*') {
             const users = await getCollection(COLLECTIONS.USERS);
-            destinos = await users.distinct('username', { activo: true });
+            destinos    = await users.distinct('username', { activo: true });
         } else {
             destinos = [usuario_destino || req.usuario.username];
         }
@@ -1271,7 +1301,7 @@ app.post('/api/notificaciones', authMiddleware, async (req, res) => {
         const now  = new Date().toISOString();
         const docs = destinos.map(dest => ({
             titulo: titulo.trim(), mensaje: mensaje.trim(),
-            tipo: tipo || 'info', icono: icono || null,
+            tipo:   tipo  || 'info', icono: icono || null,
             tab_destino: tab_destino || null, subtab: subtab || null,
             usuario_destino: dest, autor: req.usuario.username,
             leida: false, fecha_creacion: now, fecha_lectura: null
@@ -1344,8 +1374,8 @@ const HUB_CANALES = [
 
 app.get('/api/hub/mensajes/:canal', authMiddleware, requireHubAccess, async (req, res) => {
     try {
-        const limit   = parseInt(req.query.limit) || 100;
-        const col     = await getCollection(COLLECTIONS.HUB_MENSAJES);
+        const limit    = parseInt(req.query.limit) || 100;
+        const col      = await getCollection(COLLECTIONS.HUB_MENSAJES);
         const mensajes = await col.find({ canal: req.params.canal }).sort({ createdAt: 1 }).limit(limit).toArray();
         res.json({ canal: req.params.canal, mensajes, canales: HUB_CANALES });
     } catch (e) { res.status(500).json({ error: e.message }); }
@@ -1358,10 +1388,10 @@ app.post('/api/hub/mensajes/:canal', authMiddleware, requireHubAccess, async (re
 
         const col     = await getCollection(COLLECTIONS.HUB_MENSAJES);
         const mensaje = {
-            _id: new ObjectId(), canal: req.params.canal,
-            userId: req.usuario.username, userName: req.usuario.nombre,
-            avatar: req.usuario.nombre?.charAt(0).toUpperCase() || '?',
-            content: content.trim(), reactions: {}, edited: false, createdAt: new Date(),
+            _id:       new ObjectId(), canal: req.params.canal,
+            userId:    req.usuario.username, userName: req.usuario.nombre,
+            avatar:    req.usuario.nombre?.charAt(0).toUpperCase() || '?',
+            content:   content.trim(), reactions: {}, edited: false, createdAt: new Date(),
         };
         await col.insertOne(mensaje);
         res.status(201).json(mensaje);
@@ -1398,11 +1428,13 @@ app.patch('/api/hub/mensajes/:id/reaction', authMiddleware, requireHubAccess, as
     try {
         const { emoji } = req.body;
         if (!emoji) return res.status(400).json({ error: 'Emoji requerido' });
-        const col = await getCollection(COLLECTIONS.HUB_MENSAJES);
-        const msg = await col.findOne({ _id: new ObjectId(req.params.id) });
-        if (!msg) return res.status(404).json({ error: 'Mensaje no encontrado' });
+        const col     = await getCollection(COLLECTIONS.HUB_MENSAJES);
+        const msg     = await col.findOne({ _id: new ObjectId(req.params.id) });
+        if (!msg)     return res.status(404).json({ error: 'Mensaje no encontrado' });
         const current = msg.reactions?.[emoji] || [];
-        const updated = current.includes(req.usuario.username) ? current.filter(u => u !== req.usuario.username) : [...current, req.usuario.username];
+        const updated = current.includes(req.usuario.username)
+            ? current.filter(u => u !== req.usuario.username)
+            : [...current, req.usuario.username];
         await col.updateOne({ _id: new ObjectId(req.params.id) }, { $set: { [`reactions.${emoji}`]: updated } });
         res.json(await col.findOne({ _id: new ObjectId(req.params.id) }));
     } catch (e) { res.status(500).json({ error: e.message }); }
@@ -1424,10 +1456,10 @@ app.post('/api/hub/reuniones', authMiddleware, requireHubAccess, async (req, res
         const col     = await getCollection(COLLECTIONS.HUB_REUNIONES);
         const reunion = {
             _id: new ObjectId(), title: title.trim(), desc: desc || '', date, time,
-            duration: duration || 60, location: location || '',
-            attendees: Array.isArray(attendees) ? attendees : (attendees || '').split(',').map(a => a.trim()).filter(Boolean),
-            agenda: agenda || '', organizer: req.usuario.nombre, organizerUsername: req.usuario.username,
-            status: 'scheduled', createdAt: new Date(),
+            duration:   duration || 60, location: location || '',
+            attendees:  Array.isArray(attendees) ? attendees : (attendees || '').split(',').map(a => a.trim()).filter(Boolean),
+            agenda:     agenda || '', organizer: req.usuario.nombre, organizerUsername: req.usuario.username,
+            status:     'scheduled', createdAt: new Date(),
         };
         await col.insertOne(reunion);
         res.status(201).json(reunion);
@@ -1475,10 +1507,10 @@ app.post('/api/hub/minutas', authMiddleware, requireHubAccess, async (req, res) 
 
         const col    = await getCollection(COLLECTIONS.HUB_MINUTAS);
         const minuta = {
-            _id: new ObjectId(), meetingId: meetingId || null,
-            title: title.trim(), date: date || '', summary: summary.trim(),
+            _id:     new ObjectId(), meetingId: meetingId || null,
+            title:   title.trim(), date: date || '', summary: summary.trim(),
             decisions: decisions || '', actionItems: parsedActions, attendees: attendees || '',
-            author: req.usuario.nombre, authorUsername: req.usuario.username,
+            author:  req.usuario.nombre, authorUsername: req.usuario.username,
             comments: [], createdAt: new Date(),
         };
         await col.insertOne(minuta);
@@ -1553,10 +1585,10 @@ app.post('/api/hub/tareas', authMiddleware, requireHubAccess, async (req, res) =
         if (!title?.trim()) return res.status(400).json({ error: 'El título es requerido' });
         const col   = await getCollection(COLLECTIONS.HUB_TAREAS);
         const tarea = {
-            _id: new ObjectId(), title: title.trim(), desc: desc || '',
+            _id:     new ObjectId(), title: title.trim(), desc: desc || '',
             priority: priority || 'media', assignee: assignee || '', dueDate: dueDate || null,
-            tags: Array.isArray(tags) ? tags : (tags || '').split(',').map(t => t.trim()).filter(Boolean),
-            status: 'todo', orden: Date.now(),
+            tags:    Array.isArray(tags) ? tags : (tags || '').split(',').map(t => t.trim()).filter(Boolean),
+            status:  'todo', orden: Date.now(),
             creadoPor: req.usuario.nombre, creadoPorUsername: req.usuario.username, createdAt: new Date(),
         };
         await col.insertOne(tarea);
@@ -1600,9 +1632,9 @@ app.post('/api/hub/anuncios', authMiddleware, requireHubAccess, async (req, res)
         if (!title?.trim() || !content?.trim()) return res.status(400).json({ error: 'Título y contenido son requeridos' });
         const col     = await getCollection(COLLECTIONS.HUB_ANUNCIOS);
         const anuncio = {
-            _id: new ObjectId(), title: title.trim(), content: content.trim(),
+            _id:      new ObjectId(), title: title.trim(), content: content.trim(),
             priority: priority || 'normal', pinned: !!pinned,
-            author: req.usuario.nombre, authorUsername: req.usuario.username, createdAt: new Date(),
+            author:   req.usuario.nombre, authorUsername: req.usuario.username, createdAt: new Date(),
         };
         await col.insertOne(anuncio);
         res.status(201).json(anuncio);
@@ -1638,9 +1670,9 @@ app.post('/api/hub/recursos', authMiddleware, requireHubAccess, async (req, res)
         const categoriasValidas = ['documentos','presentaciones','hojas','manuales','otros'];
         const col     = await getCollection(COLLECTIONS.HUB_RECURSOS);
         const recurso = {
-            _id: new ObjectId(), nombre: nombre.trim(), descripcion: descripcion?.trim() || '',
-            url: url.trim(), categoria: categoriasValidas.includes(categoria) ? categoria : 'otros',
-            tipo: tipo || 'enlace', uploadedBy: req.usuario.nombre, uploadedByUsername: req.usuario.username, createdAt: new Date(),
+            _id:         new ObjectId(), nombre: nombre.trim(), descripcion: descripcion?.trim() || '',
+            url:         url.trim(), categoria: categoriasValidas.includes(categoria) ? categoria : 'otros',
+            tipo:        tipo || 'enlace', uploadedBy: req.usuario.nombre, uploadedByUsername: req.usuario.username, createdAt: new Date(),
         };
         await col.insertOne(recurso);
         res.status(201).json(recurso);
@@ -1661,7 +1693,7 @@ app.delete('/api/hub/recursos/:id', authMiddleware, requireHubAccess, async (req
 app.get('/api/hub/guias', authMiddleware, requireHubAccess, async (req, res) => {
     try {
         const { categoria, q } = req.query;
-        const filter = {};
+        const filter           = {};
         if (categoria) filter.categoria = categoria;
         if (q?.trim()) { const r = new RegExp(q.trim(), 'i'); filter.$or = [{ titulo: r }, { descripcion: r }, { contenido: r }]; }
         const col = await getCollection(COLLECTIONS.HUB_GUIAS);
@@ -1678,10 +1710,10 @@ app.post('/api/hub/guias', authMiddleware, requireHubAccess, async (req, res) =>
         const categoriasValidas = ['accesos','hardware','correos','sistemas','soporte','procesos','otros'];
         const col  = await getCollection(COLLECTIONS.HUB_GUIAS);
         const guia = {
-            _id: new ObjectId(), titulo: titulo.trim(), descripcion: descripcion?.trim() || '',
-            categoria: categoriasValidas.includes(categoria) ? categoria : 'otros',
-            url: url?.trim() || '', contenido: contenido?.trim() || '',
-            version: version?.trim() || '1.0', autor: autor?.trim() || req.usuario.nombre,
+            _id:           new ObjectId(), titulo: titulo.trim(), descripcion: descripcion?.trim() || '',
+            categoria:     categoriasValidas.includes(categoria) ? categoria : 'otros',
+            url:           url?.trim() || '', contenido: contenido?.trim() || '',
+            version:       version?.trim() || '1.0', autor: autor?.trim() || req.usuario.nombre,
             autorUsername: req.usuario.username, createdAt: new Date(), updatedAt: new Date(),
         };
         await col.insertOne(guia);
@@ -1730,10 +1762,10 @@ app.post('/api/hub/plantillas', authMiddleware, requireHubAccess, async (req, re
         const tiposValidos = ['responsiva','alta_baja','inventario','incidencias','formatos','otros'];
         const col       = await getCollection(COLLECTIONS.HUB_PLANTILLAS);
         const plantilla = {
-            _id: new ObjectId(), nombre: nombre.trim(), descripcion: descripcion?.trim() || '',
-            tipo: tiposValidos.includes(tipo) ? tipo : 'otros', url: url.trim(),
+            _id:          new ObjectId(), nombre: nombre.trim(), descripcion: descripcion?.trim() || '',
+            tipo:         tiposValidos.includes(tipo) ? tipo : 'otros', url: url.trim(),
             instrucciones: instrucciones?.trim() || '',
-            uploadedBy: req.usuario.nombre, uploadedByUsername: req.usuario.username, createdAt: new Date(),
+            uploadedBy:   req.usuario.nombre, uploadedByUsername: req.usuario.username, createdAt: new Date(),
         };
         await col.insertOne(plantilla);
         res.status(201).json(plantilla);
@@ -1770,15 +1802,15 @@ app.post('/api/hub/capacitacion', authMiddleware, requireHubAccess, async (req, 
         const lastTask = await col.findOne({}, { sort: { orden: -1 } });
 
         const tarea = {
-            _id: new ObjectId(), orden: (lastTask?.orden || 0) + 1,
-            funcion: funcion.trim(), frecuencia: frecuencia?.trim() || 'Según necesidad',
+            _id:        new ObjectId(), orden: (lastTask?.orden || 0) + 1,
+            funcion:    funcion.trim(), frecuencia: frecuencia?.trim() || 'Según necesidad',
             herramienta: herramienta?.trim() || '',
-            progreso: progresoValidos.includes(progreso) ? progreso : 'sin_asignar',
-            fecha: fecha || null, notas: notas?.trim() || '',
+            progreso:   progresoValidos.includes(progreso) ? progreso : 'sin_asignar',
+            fecha:      fecha || null, notas: notas?.trim() || '',
             confAnalista: !!confAnalista,
             confSupervisor: supervisorValidos.includes(confSupervisor) ? confSupervisor : null,
-            creadoPor: req.usuario.nombre, creadoPorUsername: req.usuario.username,
-            createdAt: new Date(), updatedAt: new Date(),
+            creadoPor:  req.usuario.nombre, creadoPorUsername: req.usuario.username,
+            createdAt:  new Date(), updatedAt: new Date(),
         };
         await col.insertOne(tarea);
         res.status(201).json(tarea);
@@ -1815,88 +1847,128 @@ app.delete('/api/hub/capacitacion/:id', authMiddleware, requireHubAccess, async 
 });
 
 // ════════════════════════════════════════════════════════════════
-// HUB ASISTENCIA v1.0
+// HUB ASISTENCIA v1.1 (FIX v3.5)
 // ════════════════════════════════════════════════════════════════
 
-/** Verifica si el usuario puede acceder al concentrado */
-async function canViewConcentrado(req) {
-    if (req.usuario.rol === 'ADMIN') return true;
-    try {
-        const col = await getCollection(COLLECTIONS.HUB_CONCENTRADO_CONFIG);
-        const cfg = await col.findOne({ _id: 'config' });
-        if (!cfg) return false;
-        const roles = cfg.allowedRoles || [];
-        const users = cfg.allowedUsers || [];
-        return roles.includes(req.usuario.rol) || users.includes(req.usuario.username);
-    } catch { return false; }
-}
+const TIPOS_ASISTENCIA = ['asistencia','falta','retardo','incapacidad','permiso','homeoffice'];
 
+// ─────────────────────────────────────────────────────────────
 // GET /api/hub/asistencia
+// FIX v3.5: SISTEMAS puede ver todos los registros del mes
+// (necesario para el concentrado del frontend).
+// La restricción de solo ver los propios aplica cuando el
+// query param ?username= es el propio username,
+// o cuando el rol no tiene acceso al hub (ya bloqueado por requireHubAccess).
+// ─────────────────────────────────────────────────────────────
 app.get('/api/hub/asistencia', authMiddleware, requireHubAccess, async (req, res) => {
     try {
         const col   = await getCollection(COLLECTIONS.HUB_ASISTENCIA);
         const query = {};
-        if (req.usuario.rol !== 'ADMIN') {
-            query.username = req.usuario.username;
-        } else if (req.query.username) {
+
+        // Si se especifica un username concreto, filtrar por él
+        if (req.query.username) {
+            // Usuario no-ADMIN solo puede consultar sus propios datos
+            if (req.usuario.rol !== 'ADMIN' && req.usuario.rol !== 'SISTEMAS') {
+                if (req.query.username !== req.usuario.username) {
+                    return res.status(403).json({ error: 'Solo puedes consultar tu propia asistencia' });
+                }
+            }
             query.username = req.query.username;
+        } else if (req.usuario.rol !== 'ADMIN' && req.usuario.rol !== 'SISTEMAS') {
+            // Rol sin privilegios → solo sus datos (fallback de seguridad,
+            // requireHubAccess ya bloquea este caso, pero es defensa en profundidad)
+            query.username = req.usuario.username;
         }
+        // ADMIN y SISTEMAS sin ?username → ven todos los registros (para concentrado)
+
         if (req.query.mes)  query.fecha = { $regex: `^${req.query.mes}` };
         if (req.query.tipo) query.tipo  = req.query.tipo;
-        const docs = await col.find(query).sort({ fecha: -1 }).toArray();
+
+        const docs = await col.find(query).sort({ fecha: -1, username: 1 }).toArray();
         res.json(docs);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ─────────────────────────────────────────────────────────────
 // POST /api/hub/asistencia
+// FIX v3.5: valida formato YYYY-MM-DD antes de insertar
+// ─────────────────────────────────────────────────────────────
 app.post('/api/hub/asistencia', authMiddleware, requireHubAccess, async (req, res) => {
     try {
-        const col = await getCollection(COLLECTIONS.HUB_ASISTENCIA);
+        const col                         = await getCollection(COLLECTIONS.HUB_ASISTENCIA);
         const { fecha, tipo, horaEntrada, horaSalida, notas } = req.body;
-        if (!fecha || !tipo) return res.status(400).json({ error: 'fecha y tipo son requeridos' });
 
-        const TIPOS = ['asistencia','falta','retardo','incapacidad','permiso','homeoffice'];
-        if (!TIPOS.includes(tipo)) return res.status(400).json({ error: 'Tipo de asistencia inválido' });
+        if (!fecha || !tipo) {
+            return res.status(400).json({ error: 'fecha y tipo son requeridos' });
+        }
+        // FIX v3.5: validar formato de fecha
+        if (!esDateValido(fecha)) {
+            return res.status(400).json({ error: 'fecha debe tener formato YYYY-MM-DD válido' });
+        }
+        if (!TIPOS_ASISTENCIA.includes(tipo)) {
+            return res.status(400).json({ error: `Tipo inválido. Valores permitidos: ${TIPOS_ASISTENCIA.join(', ')}` });
+        }
 
         // Un registro por día por usuario
         const existe = await col.findOne({ username: req.usuario.username, fecha });
-        if (existe) return res.status(409).json({ error: 'Ya existe un registro para este día' });
+        if (existe) {
+            return res.status(409).json({ error: 'Ya existe un registro para este día', existingId: existe._id });
+        }
 
         const doc = {
-            _id: new ObjectId(),
+            _id:         new ObjectId(),
             username:    req.usuario.username,
             nombre:      req.usuario.nombre || req.usuario.username,
             fecha, tipo,
             horaEntrada: horaEntrada || null,
             horaSalida:  horaSalida  || null,
-            notas:       notas       || '',
+            notas:       (notas || '').trim(),
             creadoEn:    new Date().toISOString(),
         };
         await col.insertOne(doc);
         logger.info(`Asistencia registrada: ${req.usuario.username} — ${fecha} (${tipo})`);
         res.status(201).json(doc);
-    } catch (e) { res.status(500).json({ error: e.message }); }
+    } catch (e) {
+        // Manejar error de índice único (race condition)
+        if (e.code === 11000) {
+            return res.status(409).json({ error: 'Ya existe un registro para este día (conflicto de índice)' });
+        }
+        res.status(500).json({ error: e.message });
+    }
 });
 
+// ─────────────────────────────────────────────────────────────
 // PATCH /api/hub/asistencia/:id
+// FIX v3.5: re-fetch del documento tras el update (no merge manual)
+// ─────────────────────────────────────────────────────────────
 app.patch('/api/hub/asistencia/:id', authMiddleware, requireHubAccess, async (req, res) => {
     try {
         const col = await getCollection(COLLECTIONS.HUB_ASISTENCIA);
         const doc = await col.findOne({ _id: new ObjectId(req.params.id) });
         if (!doc) return res.status(404).json({ error: 'Registro no encontrado' });
-        if (doc.username !== req.usuario.username && req.usuario.rol !== 'ADMIN')
+        if (doc.username !== req.usuario.username && req.usuario.rol !== 'ADMIN') {
             return res.status(403).json({ error: 'Sin permiso para editar este registro' });
+        }
 
         const { tipo, horaEntrada, horaSalida, notas, fecha } = req.body;
         const upd = { actualizadoEn: new Date().toISOString() };
-        if (tipo                  !== undefined) upd.tipo        = tipo;
-        if (fecha                 !== undefined) upd.fecha       = fecha;
-        if (horaEntrada           !== undefined) upd.horaEntrada = horaEntrada;
-        if (horaSalida            !== undefined) upd.horaSalida  = horaSalida;
-        if (notas                 !== undefined) upd.notas       = notas;
+
+        if (tipo        !== undefined) {
+            if (!TIPOS_ASISTENCIA.includes(tipo)) return res.status(400).json({ error: 'Tipo inválido' });
+            upd.tipo = tipo;
+        }
+        if (fecha       !== undefined) {
+            if (!esDateValido(fecha)) return res.status(400).json({ error: 'fecha debe tener formato YYYY-MM-DD válido' });
+            upd.fecha = fecha;
+        }
+        if (horaEntrada !== undefined) upd.horaEntrada = horaEntrada;
+        if (horaSalida  !== undefined) upd.horaSalida  = horaSalida;
+        if (notas       !== undefined) upd.notas       = (notas || '').trim();
 
         await col.updateOne({ _id: new ObjectId(req.params.id) }, { $set: upd });
-        res.json({ ...doc, ...upd });
+        // FIX v3.5: retornar documento fresco desde MongoDB
+        const updated = await col.findOne({ _id: new ObjectId(req.params.id) });
+        res.json(updated);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1906,14 +1978,17 @@ app.delete('/api/hub/asistencia/:id', authMiddleware, requireHubAccess, async (r
         const col = await getCollection(COLLECTIONS.HUB_ASISTENCIA);
         const doc = await col.findOne({ _id: new ObjectId(req.params.id) });
         if (!doc) return res.status(404).json({ error: 'Registro no encontrado' });
-        if (doc.username !== req.usuario.username && req.usuario.rol !== 'ADMIN')
+        if (doc.username !== req.usuario.username && req.usuario.rol !== 'ADMIN') {
             return res.status(403).json({ error: 'Sin permiso' });
+        }
         await col.deleteOne({ _id: new ObjectId(req.params.id) });
         res.json({ ok: true });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ─────────────────────────────────────────────────────────────
 // GET /api/hub/vacaciones
+// ─────────────────────────────────────────────────────────────
 app.get('/api/hub/vacaciones', authMiddleware, requireHubAccess, async (req, res) => {
     try {
         const col   = await getCollection(COLLECTIONS.HUB_VACACIONES);
@@ -1934,16 +2009,27 @@ app.post('/api/hub/vacaciones', authMiddleware, requireHubAccess, async (req, re
     try {
         const col = await getCollection(COLLECTIONS.HUB_VACACIONES);
         const { fechaInicio, fechaFin, notas } = req.body;
-        if (!fechaInicio || !fechaFin) return res.status(400).json({ error: 'fechaInicio y fechaFin requeridos' });
-        if (fechaInicio > fechaFin)    return res.status(400).json({ error: 'fechaInicio debe ser anterior a fechaFin' });
 
-        const dias = Math.round((new Date(fechaFin + 'T12:00:00') - new Date(fechaInicio + 'T12:00:00')) / 86400000) + 1;
-        const doc  = {
-            _id: new ObjectId(),
+        if (!fechaInicio || !fechaFin) {
+            return res.status(400).json({ error: 'fechaInicio y fechaFin son requeridos' });
+        }
+        if (!esDateValido(fechaInicio) || !esDateValido(fechaFin)) {
+            return res.status(400).json({ error: 'Las fechas deben tener formato YYYY-MM-DD válido' });
+        }
+        if (fechaInicio > fechaFin) {
+            return res.status(400).json({ error: 'fechaInicio debe ser anterior o igual a fechaFin' });
+        }
+
+        const dias = Math.round(
+            (new Date(fechaFin + 'T12:00:00') - new Date(fechaInicio + 'T12:00:00')) / 86400000
+        ) + 1;
+
+        const doc = {
+            _id:             new ObjectId(),
             username:        req.usuario.username,
             nombre:          req.usuario.nombre || req.usuario.username,
             fechaInicio, fechaFin, dias,
-            notas:           notas || '',
+            notas:           (notas || '').trim(),
             status:          'pendiente',
             comentarioAdmin: null,
             creadoEn:        new Date().toISOString(),
@@ -1954,7 +2040,10 @@ app.post('/api/hub/vacaciones', authMiddleware, requireHubAccess, async (req, re
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ─────────────────────────────────────────────────────────────
 // PATCH /api/hub/vacaciones/:id
+// FIX v3.5: re-fetch tras el update (no merge manual)
+// ─────────────────────────────────────────────────────────────
 app.patch('/api/hub/vacaciones/:id', authMiddleware, requireHubAccess, async (req, res) => {
     try {
         const col = await getCollection(COLLECTIONS.HUB_VACACIONES);
@@ -1962,18 +2051,27 @@ app.patch('/api/hub/vacaciones/:id', authMiddleware, requireHubAccess, async (re
         if (!doc) return res.status(404).json({ error: 'Solicitud no encontrada' });
 
         const upd = { actualizadoEn: new Date().toISOString() };
+
         if (req.usuario.rol === 'ADMIN') {
-            if (req.body.status          !== undefined) upd.status          = req.body.status;
+            const statusValidos = ['pendiente','aprobada','rechazada'];
+            if (req.body.status !== undefined) {
+                if (!statusValidos.includes(req.body.status))
+                    return res.status(400).json({ error: `Status inválido. Valores: ${statusValidos.join(', ')}` });
+                upd.status = req.body.status;
+            }
             if (req.body.comentarioAdmin !== undefined) upd.comentarioAdmin = req.body.comentarioAdmin;
         } else if (doc.username === req.usuario.username) {
-            if (doc.status !== 'pendiente') return res.status(403).json({ error: 'No puedes editar una solicitud ya procesada' });
-            if (req.body.notas !== undefined) upd.notas = req.body.notas;
+            if (doc.status !== 'pendiente')
+                return res.status(403).json({ error: 'No puedes editar una solicitud ya procesada' });
+            if (req.body.notas !== undefined) upd.notas = (req.body.notas || '').trim();
         } else {
-            return res.status(403).json({ error: 'Sin permiso' });
+            return res.status(403).json({ error: 'Sin permiso para modificar esta solicitud' });
         }
 
         await col.updateOne({ _id: new ObjectId(req.params.id) }, { $set: upd });
-        res.json({ ...doc, ...upd });
+        // FIX v3.5: retornar documento fresco desde MongoDB
+        const updated = await col.findOne({ _id: new ObjectId(req.params.id) });
+        res.json(updated);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1992,17 +2090,42 @@ app.delete('/api/hub/vacaciones/:id', authMiddleware, requireHubAccess, async (r
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ─────────────────────────────────────────────────────────────
 // GET /api/hub/concentrado
+// FIX v3.5: canViewConcentrado incluye SISTEMAS por defecto
+// ─────────────────────────────────────────────────────────────
+
+/** Verifica si el usuario puede acceder al concentrado.
+ *  FIX v3.5: SISTEMAS tiene acceso por defecto (no solo ADMIN).
+ */
+async function canViewConcentrado(req) {
+    // ADMIN y SISTEMAS tienen acceso siempre
+    if (['ADMIN', 'SISTEMAS'].includes(req.usuario.rol)) return true;
+    // Otros roles: verificar configuración personalizada
+    try {
+        const col = await getCollection(COLLECTIONS.HUB_CONCENTRADO_CONFIG);
+        const cfg = await col.findOne({ _id: 'config' });
+        if (!cfg) return false;
+        const roles = cfg.allowedRoles || [];
+        const users = cfg.allowedUsers || [];
+        return roles.includes(req.usuario.rol) || users.includes(req.usuario.username);
+    } catch { return false; }
+}
+
 app.get('/api/hub/concentrado', authMiddleware, async (req, res) => {
     try {
-        if (!(await canViewConcentrado(req))) return res.status(403).json({ error: 'Sin acceso al concentrado' });
+        if (!(await canViewConcentrado(req))) {
+            return res.status(403).json({ error: 'Sin acceso al concentrado' });
+        }
 
         const asistCol = await getCollection(COLLECTIONS.HUB_ASISTENCIA);
         const vacCol   = await getCollection(COLLECTIONS.HUB_VACACIONES);
-        const asistQ   = {};
+
+        const asistQ = {};
         if (req.query.mes)      asistQ.fecha    = { $regex: `^${req.query.mes}` };
         if (req.query.username) asistQ.username = req.query.username;
         if (req.query.tipo)     asistQ.tipo     = req.query.tipo;
+
         const vacQ = {};
         if (req.query.username) vacQ.username = req.query.username;
 
@@ -2010,6 +2133,7 @@ app.get('/api/hub/concentrado', authMiddleware, async (req, res) => {
             asistCol.find(asistQ).sort({ fecha: -1, username: 1 }).toArray(),
             vacCol.find(vacQ).sort({ creadoEn: -1 }).toArray(),
         ]);
+
         res.json({ asistencias, vacaciones });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -2159,7 +2283,7 @@ app.get('/api/admin/permissions/roles', authMiddleware, requireAdmin, async (req
         res.json({
             permisos:       doc?.permisos       || ROL_PERMISOS_DEFAULT,
             modulos:        MODULOS_PERMISOS,
-            version:        doc?.version        || '1.0',
+            version:        doc?.version        || '1.1',
             actualizadoEn:  doc?.actualizadoEn,
             actualizadoPor: doc?.actualizadoPor,
         });
@@ -2170,7 +2294,7 @@ app.get('/api/admin/permissions/roles', authMiddleware, requireAdmin, async (req
 
 app.put('/api/admin/permissions/roles/:rol', authMiddleware, requireAdmin, async (req, res) => {
     try {
-        const { rol } = req.params;
+        const { rol }      = req.params;
         const rolesValidos = ['ADMIN','RH','SISTEMAS','GERENTE','USUARIO'];
         if (!rolesValidos.includes(rol)) return res.status(400).json({ error: `Rol inválido: ${rol}` });
         if (rol === 'ADMIN') return res.status(403).json({ error: 'Los permisos de ADMIN no se pueden modificar' });
@@ -2197,9 +2321,9 @@ app.get('/api/admin/permissions/users/:username', authMiddleware, requireAdmin, 
         const user  = await colU.findOne({ username: req.params.username }, { projection: { password: 0 } });
         if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
 
-        const col2     = await getCollection(COLLECTIONS.ROLE_PERMISSIONS);
-        const roleDoc  = await col2.findOne({ type: 'role_defaults' });
-        const rolPerms = roleDoc?.permisos?.[user.rol] || ROL_PERMISOS_DEFAULT[user.rol] || [];
+        const col2      = await getCollection(COLLECTIONS.ROLE_PERMISSIONS);
+        const roleDoc   = await col2.findOne({ type: 'role_defaults' });
+        const rolPerms  = roleDoc?.permisos?.[user.rol] || ROL_PERMISOS_DEFAULT[user.rol] || [];
         const overrides = user.permisosOverride || { added: [], removed: [] };
 
         const efectivos = user.rol === 'ADMIN'
@@ -2221,7 +2345,9 @@ app.put('/api/admin/permissions/users/:username', authMiddleware, requireAdmin, 
         if (username === 'admin') return res.status(403).json({ error: 'Los permisos del admin no se pueden modificar' });
 
         const { added = [], removed = [] } = req.body;
-        if (!Array.isArray(added) || !Array.isArray(removed)) return res.status(400).json({ error: 'added y removed deben ser arrays' });
+        if (!Array.isArray(added) || !Array.isArray(removed)) {
+            return res.status(400).json({ error: 'added y removed deben ser arrays' });
+        }
 
         const validos      = Object.keys(MODULOS_PERMISOS);
         const addedFinal   = added.filter(p => validos.includes(p) && !removed.includes(p));
@@ -2271,12 +2397,12 @@ async function startServer() {
 
         app.listen(PORT, () => {
             console.log('\n' + '='.repeat(60));
-            console.log('🚀 SERVIDOR UNIFICADO v3.4 - MYG TELECOM');
+            console.log('🚀 SERVIDOR UNIFICADO v3.5 - MYG TELECOM');
             console.log('='.repeat(60));
             console.log(`✅ Estado: ACTIVO`);
             console.log(`🌐 Puerto: ${PORT}`);
             console.log(`📦 Modo: ${IS_CLOUD ? 'CLOUD (Render)' : 'LOCAL'}`);
-            console.log('\n📦 Módulos v3.4:');
+            console.log('\n📦 Módulos v3.5:');
             console.log('   ✅ MongoDB + Auth + Users');
             console.log('   ✅ RH Movimientos + Notificaciones SSE');
             console.log('   ✅ Formatos de Activación (híbrido Drive/filesystem)');
@@ -2284,6 +2410,12 @@ async function startServer() {
             console.log('   ✅ Hub de Sistemas completo (v3.0)');
             console.log('   ✅ Hub Asistencia + Vacaciones + Concentrado RH (v4.0)');
             console.log('   ✅ Admin Panel (usuarios, roles, permisos, logs)');
+            console.log('\n🔧 FIX v3.5:');
+            console.log('   ✅ Concentrado accesible a SISTEMAS sin config extra');
+            console.log('   ✅ hub.concentrado en permisos default de SISTEMAS');
+            console.log('   ✅ Validación YYYY-MM-DD en POST/PATCH asistencia');
+            console.log('   ✅ PATCH asistencia/vacaciones retorna doc fresco');
+            console.log('   ✅ Índice único username+fecha en hub_asistencia');
             console.log('\n💾 Storage:');
             if (!IS_CLOUD) console.log(`   📂 Filesystem: ${plantillasStatus.filesystem ? '✅' : '❌'}`);
             console.log(`   ☁️  Google Drive: ${plantillasStatus.googleDrive ? '✅' : '❌'}`);
