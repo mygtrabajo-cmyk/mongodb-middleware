@@ -1,7 +1,6 @@
-
 {
   "name": "myg-servidor-unificado",
-  "version": "3.1.0",
+  "version": "3.6.1",
   "description": "Servidor unificado MYG Telecom con Google Drive",
   "type": "module",
   "main": "server.js",  
@@ -14,7 +13,8 @@
     "exceljs": "^4.4.0",
     "cors": "^2.8.5",
     "joi": "^17.13.3",
-    "winston": "^3.13.1"
+    "winston": "^3.13.1",
+    "nodemailer": "^6.9.0"
   },
   "engines": {
     "node": ">=18.0.0"
