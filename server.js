@@ -19,7 +19,16 @@ import winston    from 'winston';
 import path       from 'path';
 import { fileURLToPath } from 'url';
 import fs         from 'fs/promises';
-import nodemailer from 'nodemailer'; // ← v3.6.1: npm install nodemailer
+// nodemailer se importa dinámicamente — no crashea si no está en package.json
+// Para activar correos: npm install nodemailer  y agregar SMTP_* en Render
+let nodemailer = null;
+(async () => {
+    try {
+        nodemailer = (await import('nodemailer')).default;
+    } catch {
+        // silencioso — correos desactivados hasta que se instale el paquete
+    }
+})();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
@@ -130,6 +139,10 @@ let _mailTransporter = null;
 
 function getMailTransporter() {
     if (_mailTransporter) return _mailTransporter;
+    if (!nodemailer) {
+        // nodemailer no instalado — silencioso, no bloquea el servidor
+        return null;
+    }
     const smtpUser = process.env.SMTP_USER || process.env.SMTP_EMAIL;
     const smtpPass = process.env.SMTP_PASS;
     const smtpHost = process.env.SMTP_HOST || 'smtp.gmail.com';
