@@ -1,15 +1,15 @@
 /* ============================================================
    CONFIGURACIÓN GLOBAL - MYG TELECOM DASHBOARD
-   
-   Versión: 3.3.0
-   Cambios:
-   - Fix: hostname check corregido (includes en lugar de ===)
-   - Fix: baseURL apunta al Worker para TODO entorno no-localhost
-   - Add: endpoints del Admin Panel v1.0
+   Versión: 4.0.0
+   Cambios v4.0:
+   - Nueva estructura de 7 roles: ADMIN, GERENTE_OPERACIONES,
+     COORDINADOR(+area), ANALISTA(+area), GERENTE_COMERCIAL,
+     EJECUTIVO_COMERCIAL, USUARIO
+   - Configuración de 4 áreas: Sistemas, Mantenimiento, Crédito, Logística
+   - Tabs anclados persistentes en MongoDB (preferencias.tabsPinned)
+   - Panel Admin unificado (fusiona admin-panel + admin-usuarios)
    ============================================================ */
 
-// IMPORTANTE: Usar 'var' (no const/let) para que CONFIG sea accesible
-// como window.CONFIG desde otros scripts cargados en el HTML
 var CONFIG = {
     // Auto-actualización de datos
     autoUpdateMinutes: 5,
@@ -30,59 +30,171 @@ var CONFIG = {
         rhHistorico:       '14ei47FFgK5ZRgCHEtZ_eMToKZqZ6XZZtr8U6PGlJsY8'
     },
 
-    // ========== API Backend Unificado v3.3 ==========
+    // ========== API Backend Unificado v4.0 ==========
     api: {
-        // ── FIX: antes usaba === 'Netlify' (nunca era true porque hostname
-        //    devuelve el dominio real, ej. "mygtelecom.netlify.app").
-        //    Ahora: localhost → Render directo; todo lo demás → Worker.
-        //    El Worker es la única entrada a producción; Render no es público.
         baseURL: window.location.hostname === 'localhost'
             ? 'http://localhost:5500'
             : 'https://dashboard-myg-api.mygtrabajo.workers.dev',
 
-        // URL directa a Render para SSE — NO pasa por Cloudflare Worker.
-        // Workers tiene límite ~30s por request; SSE dura horas → Worker lo corta.
         sseBaseURL: window.location.hostname === 'localhost'
             ? 'http://localhost:5500'
             : 'https://myg-mongodb-api.onrender.com',
 
-        // Endpoints disponibles
         endpoints: {
-            // ── Autenticación ─────────────────────────────────────
             login:              '/api/auth/login',
-
-            // ── Usuarios ──────────────────────────────────────────
             users:              '/api/users',
-
-            // ── Dispositivos IQU ──────────────────────────────────
             devices:            '/api/devices',
-
-            // ── RH y Movimientos ──────────────────────────────────
             rhMovimientos:      '/api/rh/movimientos',
             notificaciones:     '/api/notificaciones',
-
-            // ── Formatos de Activación ────────────────────────────
             formatosSistemas:   '/api/formatos/sistemas',
             formatosGenerar:    '/api/formatos/generar',
             formatosClearCache: '/api/formatos/clear-cache',
-
-            // ── Activos ───────────────────────────────────────────
             activosMovimientos: '/api/activos/movimientos',
-
-            // ── Admin Panel v1.0 (solo rol ADMIN) ─────────────────
             adminStats:         '/api/admin/stats',
             adminAccessLogs:    '/api/admin/access-logs',
             adminSubmissions:   '/api/admin/form-submissions',
             adminRolePerms:     '/api/admin/permissions/roles',
-            adminUserPerms:     '/api/admin/permissions/users', // + /:username
+            adminUserPerms:     '/api/admin/permissions/users',
         },
 
-        // Timeout para requests (ms)
         timeout: 30000,
-
-        // Reintentos en caso de error
         retries: 2
-    }
+    },
+
+    // ========== ESTRUCTURA DE ROLES v4.0 ==========
+    // nivel: jerarquía (menor número = más privilegios)
+    // tieneArea: si el rol requiere campo 'area' adicional
+    roles: {
+        ADMIN: {
+            nombre:      'Administrador',
+            nivel:       1,
+            tieneArea:   false,
+            color:       'red',
+            colorHex:    '#EF4444',
+            badge:       '🔴',
+            descripcion: 'Acceso completo al sistema y gestión total de usuarios'
+        },
+        GERENTE_OPERACIONES: {
+            nombre:      'Gerente Operaciones',
+            nivel:       2,
+            tieneArea:   false,
+            color:       'purple',
+            colorHex:    '#8B5CF6',
+            badge:       '🟣',
+            descripcion: 'Visibilidad completa de todas las áreas operativas'
+        },
+        COORDINADOR: {
+            nombre:      'Coordinador/a',
+            nivel:       3,
+            tieneArea:   true,
+            color:       'blue',
+            colorHex:    '#3B82F6',
+            badge:       '🔵',
+            descripcion: 'Gestión y coordinación de su área asignada'
+        },
+        ANALISTA: {
+            nombre:      'Analista',
+            nivel:       4,
+            tieneArea:   true,
+            color:       'cyan',
+            colorHex:    '#06B6D4',
+            badge:       '🩵',
+            descripcion: 'Análisis y consulta de datos en su área asignada'
+        },
+        GERENTE_COMERCIAL: {
+            nombre:      'Gerente Comercial',
+            nivel:       5,
+            tieneArea:   false,
+            color:       'green',
+            colorHex:    '#10B981',
+            badge:       '🟢',
+            descripcion: 'Acceso definido por el Administrador'
+        },
+        EJECUTIVO_COMERCIAL: {
+            nombre:      'Ejecutivo Comercial',
+            nivel:       6,
+            tieneArea:   false,
+            color:       'teal',
+            colorHex:    '#14B8A6',
+            badge:       '🩵',
+            descripcion: 'Acceso definido por el Administrador'
+        },
+        GERENTE_RH: {
+            nombre:      'Gerente RH',
+            nivel:       7,
+            tieneArea:   true,            // Requiere campo 'area' (ej: 'RH Corporativo')
+            color:       'rose',
+            colorHex:    '#F43F5E',
+            badge:       '🌹',
+            descripcion: 'Gestión y aprobación de movimientos de Recursos Humanos'
+        },
+        ANALISTA_RH: {
+            nombre:      'Analista RH',
+            nivel:       8,
+            tieneArea:   true,            // Requiere campo 'area' (ej: 'RH Corporativo')
+            color:       'pink',
+            colorHex:    '#EC4899',
+            badge:       '🩷',
+            descripcion: 'Consulta y registro de movimientos de Recursos Humanos'
+        },
+        USUARIO: {
+            nombre:      'Usuario',
+            nivel:       9,
+            tieneArea:   false,
+            color:       'gray',
+            colorHex:    '#6B7280',
+            badge:       '⚪',
+            descripcion: 'Acceso básico al sistema'
+        }
+    },
+
+    // ========== ÁREAS OPERATIVAS ==========
+    // tabs: IDs de pestañas disponibles en esa área
+    // Las áreas sin tabs están reservadas para desarrollo futuro
+    areas: {
+        Sistemas: {
+            emoji:      '💻',
+            color:      'blue',
+            colorHex:   '#3B82F6',
+            label:      'Sistemas',
+            descripcion:'Infraestructura, Tecnología y Herramientas IT',
+            tabs: [
+                'kpi', 'overview', 'tickets', 'rh',
+                'monitoreo', 'headcount', 'activos',
+                'reposiciones', 'equipos', 'contactos', 'hub'
+            ]
+        },
+        Mantenimiento: {
+            emoji:      '🔧',
+            color:      'yellow',
+            colorHex:   '#F59E0B',
+            label:      'Mantenimiento',
+            descripcion:'Mantenimiento Preventivo y Correctivo',
+            tabs:       [] // Próximamente
+        },
+        Credito: {
+            emoji:      '💳',
+            color:      'green',
+            colorHex:   '#10B981',
+            label:      'Crédito',
+            descripcion:'Crédito, Cobranza y Gestión Financiera',
+            tabs:       [] // Próximamente
+        },
+        Logistica: {
+            emoji:      '🚚',
+            color:      'orange',
+            colorHex:   '#F97316',
+            label:      'Logística',
+            descripcion:'Logística, Distribución y Cadena de Suministro',
+            tabs:       [] // Próximamente
+        }
+    },
+
+    // Áreas que tienen 'area' como campo requerido
+    rolesConArea: ['COORDINADOR', 'ANALISTA', 'GERENTE_RH', 'ANALISTA_RH'], // v4.1
+
+    // Roles que ven el selector de áreas al iniciar
+    rolesConAreaSelector: ['ADMIN', 'GERENTE_OPERACIONES'],
 };
 
 // Paginación global
@@ -91,11 +203,10 @@ const ITEMS_POR_PAGINA = 30;
 // Validación de configuración al cargar
 (() => {
     const esLocal = window.location.hostname === 'localhost';
-    console.log('📋 Config MYG v3.3 cargada:');
-    console.log('   Entorno:', esLocal ? '🛠️  Local (Render directo)' : '🌐 Producción (Cloudflare Worker)');
-    console.log('   API Base URL:', CONFIG.api.baseURL);
-    console.log('   SSE URL:', CONFIG.api.sseBaseURL);
-    console.log('   Sheets configuradas:', Object.keys(CONFIG.sheetsPublicUrls).length);
-    console.log('   Endpoints API:', Object.keys(CONFIG.api.endpoints).length);
+    console.log('📋 Config MYG v4.1 cargada:');
+    console.log('   Entorno:',  esLocal ? '🛠️  Local' : '🌐 Producción');
+    console.log('   API Base:', CONFIG.api.baseURL);
+    console.log('   Roles:',    Object.keys(CONFIG.roles).length);
+    console.log('   Áreas:',    Object.keys(CONFIG.areas).length);
+    console.log('   Sheets:',   Object.keys(CONFIG.sheetsPublicUrls).length);
 })();
-
