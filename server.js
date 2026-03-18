@@ -855,6 +855,232 @@ app.get('/api/formatos/sistemas', requireAuth, requirePermiso('formatos.generar'
     }
 });
 
+
+// ============================================================
+// HUB SISTEMAS — Endpoints completos
+// Colecciones: hub_reuniones, hub_tareas, hub_minutas,
+//   hub_anuncios, hub_recursos, hub_guias, hub_plantillas,
+//   hub_capacitacion, hub_asistencia, hub_vacaciones
+// ============================================================
+
+// Helper genérico: evita repetir try/catch en cada endpoint
+function hubGet(col, perm) {
+    return [requireAuth, requirePermiso(perm), async (req, res) => {
+        try {
+            const limit  = Math.min(parseInt(req.query.limit) || 100, 500);
+            const filter = {};
+            if (req.query.username) filter.username = req.query.username;
+            if (req.query.mes)      filter.mes      = req.query.mes;
+            if (req.query.estado)   filter.estado   = req.query.estado;
+            const docs = await db.collection(col).find(filter).sort({ createdAt: -1 }).limit(limit).toArray();
+            res.json(docs);
+        } catch (e) { res.status(500).json({ error: `Error obteniendo ${col}` }); }
+    }];
+}
+
+function hubPost(col, perm) {
+    return [requireAuth, requirePermiso(perm), async (req, res) => {
+        try {
+            const doc = { ...req.body, creadoPor: req.user.username, createdAt: new Date() };
+            const result = await db.collection(col).insertOne(doc);
+            res.status(201).json({ success: true, id: result.insertedId, doc });
+        } catch (e) { res.status(500).json({ error: `Error creando en ${col}` }); }
+    }];
+}
+
+function hubPatch(col, perm) {
+    return [requireAuth, requirePermiso(perm), async (req, res) => {
+        try {
+            const result = await db.collection(col).updateOne(
+                { _id: new ObjectId(req.params.id) },
+                { $set: { ...req.body, updatedAt: new Date(), updatedBy: req.user.username } }
+            );
+            if (result.matchedCount === 0) return res.status(404).json({ error: 'No encontrado' });
+            res.json({ success: true });
+        } catch (e) { res.status(500).json({ error: `Error actualizando ${col}` }); }
+    }];
+}
+
+function hubDelete(col, perm) {
+    return [requireAuth, requirePermiso(perm), async (req, res) => {
+        try {
+            await db.collection(col).deleteOne({ _id: new ObjectId(req.params.id) });
+            res.json({ success: true });
+        } catch (e) { res.status(500).json({ error: `Error eliminando en ${col}` }); }
+    }];
+}
+
+// ── /api/hub/general — conteos + anuncios recientes ────────
+app.get('/api/hub/general', requireAuth, requirePermiso('hub.acceso'), async (req, res) => {
+    try {
+        const limit = Math.min(parseInt(req.query.limit) || 100, 500);
+        const [reuniones, tareas, minutas, anuncios, recursos, guias, plantillas, capacitacion] =
+            await Promise.all([
+                db.collection('hub_reuniones').countDocuments(),
+                db.collection('hub_tareas').countDocuments(),
+                db.collection('hub_minutas').countDocuments(),
+                db.collection('hub_anuncios').countDocuments(),
+                db.collection('hub_recursos').countDocuments(),
+                db.collection('hub_guias').countDocuments(),
+                db.collection('hub_plantillas').countDocuments(),
+                db.collection('hub_capacitacion').countDocuments(),
+            ]);
+        const anunciosRecientes = await db.collection('hub_anuncios')
+            .find({}).sort({ createdAt: -1 }).limit(limit).toArray();
+        res.json({
+            conteos: { reuniones, tareas, minutas, anuncios, recursos, guias, plantillas, capacitacion },
+            anunciosRecientes,
+        });
+    } catch (e) { res.status(500).json({ error: 'Error obteniendo resumen hub' }); }
+});
+
+// ── Reuniones ──────────────────────────────────────────────
+app.get('/api/hub/reuniones',        ...hubGet   ('hub_reuniones',   'hub.reuniones'));
+app.post('/api/hub/reuniones',       ...hubPost  ('hub_reuniones',   'hub.reuniones'));
+app.patch('/api/hub/reuniones/:id',  ...hubPatch ('hub_reuniones',   'hub.reuniones'));
+app.delete('/api/hub/reuniones/:id', ...hubDelete('hub_reuniones',   'hub.reuniones'));
+
+// ── Tareas ─────────────────────────────────────────────────
+app.get('/api/hub/tareas',           ...hubGet   ('hub_tareas',      'hub.tareas'));
+app.post('/api/hub/tareas',          ...hubPost  ('hub_tareas',      'hub.tareas'));
+app.patch('/api/hub/tareas/:id',     ...hubPatch ('hub_tareas',      'hub.tareas'));
+app.delete('/api/hub/tareas/:id',    ...hubDelete('hub_tareas',      'hub.tareas'));
+
+// ── Minutas ────────────────────────────────────────────────
+app.get('/api/hub/minutas',          ...hubGet   ('hub_minutas',     'hub.minutas'));
+app.post('/api/hub/minutas',         ...hubPost  ('hub_minutas',     'hub.minutas'));
+app.patch('/api/hub/minutas/:id',    ...hubPatch ('hub_minutas',     'hub.minutas'));
+app.delete('/api/hub/minutas/:id',   ...hubDelete('hub_minutas',     'hub.minutas'));
+
+// ── Anuncios ───────────────────────────────────────────────
+app.get('/api/hub/anuncios',         ...hubGet   ('hub_anuncios',    'hub.anuncios'));
+app.post('/api/hub/anuncios',        ...hubPost  ('hub_anuncios',    'hub.anuncios'));
+app.patch('/api/hub/anuncios/:id',   ...hubPatch ('hub_anuncios',    'hub.anuncios'));
+app.delete('/api/hub/anuncios/:id',  ...hubDelete('hub_anuncios',    'hub.anuncios'));
+
+// ── Recursos ───────────────────────────────────────────────
+app.get('/api/hub/recursos',         ...hubGet   ('hub_recursos',    'hub.recursos'));
+app.post('/api/hub/recursos',        ...hubPost  ('hub_recursos',    'hub.recursos'));
+app.patch('/api/hub/recursos/:id',   ...hubPatch ('hub_recursos',    'hub.recursos'));
+app.delete('/api/hub/recursos/:id',  ...hubDelete('hub_recursos',    'hub.recursos'));
+
+// ── Guías ──────────────────────────────────────────────────
+app.get('/api/hub/guias',            ...hubGet   ('hub_guias',       'hub.guias'));
+app.post('/api/hub/guias',           ...hubPost  ('hub_guias',       'hub.guias'));
+app.patch('/api/hub/guias/:id',      ...hubPatch ('hub_guias',       'hub.guias'));
+app.delete('/api/hub/guias/:id',     ...hubDelete('hub_guias',       'hub.guias'));
+
+// ── Plantillas ─────────────────────────────────────────────
+app.get('/api/hub/plantillas',           ...hubGet   ('hub_plantillas',  'hub.plantillas'));
+app.post('/api/hub/plantillas',          ...hubPost  ('hub_plantillas',  'hub.plantillas'));
+app.patch('/api/hub/plantillas/:id',     ...hubPatch ('hub_plantillas',  'hub.plantillas'));
+app.delete('/api/hub/plantillas/:id',    ...hubDelete('hub_plantillas',  'hub.plantillas'));
+
+// ── Capacitación ───────────────────────────────────────────
+app.get('/api/hub/capacitacion',         ...hubGet   ('hub_capacitacion','hub.capacitacion'));
+app.post('/api/hub/capacitacion',        ...hubPost  ('hub_capacitacion','hub.capacitacion'));
+app.patch('/api/hub/capacitacion/:id',   ...hubPatch ('hub_capacitacion','hub.capacitacion'));
+app.delete('/api/hub/capacitacion/:id',  ...hubDelete('hub_capacitacion','hub.capacitacion'));
+
+// ── Mensajes ───────────────────────────────────────────────
+app.get('/api/hub/mensajes',         ...hubGet ('hub_mensajes', 'hub.mensajes'));
+app.post('/api/hub/mensajes',        ...hubPost('hub_mensajes', 'hub.mensajes'));
+
+// ── Asistencia ─────────────────────────────────────────────
+app.get('/api/hub/asistencia', requireAuth, requirePermiso('hub.asistencia'), async (req, res) => {
+    try {
+        const filter = {};
+        if (req.query.username) filter.username = req.query.username;
+        if (req.query.mes)      filter.mes      = req.query.mes;
+        const docs = await db.collection('hub_asistencia')
+            .find(filter).sort({ fecha: -1 }).limit(200).toArray();
+        res.json(docs);
+    } catch (e) { res.status(500).json({ error: 'Error obteniendo asistencia' }); }
+});
+
+app.post('/api/hub/asistencia', requireAuth, requirePermiso('hub.asistencia.registrar'), async (req, res) => {
+    try {
+        const hoy = new Date().toISOString().split('T')[0];
+        const existe = await db.collection('hub_asistencia').findOne({
+            username: req.user.username, fecha: hoy
+        });
+        if (existe) return res.status(409).json({ error: 'Ya registraste asistencia hoy' });
+        const doc = { ...req.body, username: req.user.username, fecha: hoy, createdAt: new Date() };
+        await db.collection('hub_asistencia').insertOne(doc);
+        res.status(201).json({ success: true, doc });
+    } catch (e) { res.status(500).json({ error: 'Error registrando asistencia' }); }
+});
+
+// ── Vacaciones ─────────────────────────────────────────────
+app.get('/api/hub/vacaciones', requireAuth, requirePermiso('hub.vacaciones'), async (req, res) => {
+    try {
+        const filter = {};
+        if (req.query.username) filter.username = req.query.username;
+        if (req.query.estado)   filter.estado   = req.query.estado;
+        const docs = await db.collection('hub_vacaciones')
+            .find(filter).sort({ createdAt: -1 }).limit(200).toArray();
+        res.json(docs);
+    } catch (e) { res.status(500).json({ error: 'Error obteniendo vacaciones' }); }
+});
+
+app.post('/api/hub/vacaciones', requireAuth, requirePermiso('hub.peticiones.crear'), async (req, res) => {
+    try {
+        const doc = { ...req.body, username: req.user.username, estado: 'pendiente', createdAt: new Date() };
+        await db.collection('hub_vacaciones').insertOne(doc);
+        res.status(201).json({ success: true, doc });
+    } catch (e) { res.status(500).json({ error: 'Error registrando vacaciones' }); }
+});
+
+app.patch('/api/hub/vacaciones/:id', requireAuth, requirePermiso('hub.peticiones.aprobar'), async (req, res) => {
+    try {
+        await db.collection('hub_vacaciones').updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $set: { ...req.body, updatedAt: new Date(), aprobadoPor: req.user.username } }
+        );
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: 'Error actualizando vacaciones' }); }
+});
+
+// ── Peticiones ─────────────────────────────────────────────
+app.get('/api/hub/peticiones', requireAuth, requirePermiso('hub.peticiones.ver_todas'), async (req, res) => {
+    try {
+        const filter = {};
+        if (req.query.estado) filter.estado = req.query.estado;
+        const docs = await db.collection('hub_peticiones')
+            .find(filter).sort({ createdAt: -1 }).limit(200).toArray();
+        res.json(docs);
+    } catch (e) { res.status(500).json({ error: 'Error obteniendo peticiones' }); }
+});
+
+app.post('/api/hub/peticiones', requireAuth, requirePermiso('hub.peticiones.crear'), async (req, res) => {
+    try {
+        const doc = { ...req.body, username: req.user.username, estado: 'pendiente', createdAt: new Date() };
+        await db.collection('hub_peticiones').insertOne(doc);
+        res.status(201).json({ success: true, doc });
+    } catch (e) { res.status(500).json({ error: 'Error creando petición' }); }
+});
+
+app.patch('/api/hub/peticiones/:id', requireAuth, requirePermiso('hub.peticiones.aprobar'), async (req, res) => {
+    try {
+        await db.collection('hub_peticiones').updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $set: { ...req.body, updatedAt: new Date(), aprobadoPor: req.user.username } }
+        );
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: 'Error actualizando petición' }); }
+});
+
+// ── Concentrado ────────────────────────────────────────────
+app.get('/api/hub/concentrado', requireAuth, requirePermiso('hub.concentrado.ver'), async (req, res) => {
+    try {
+        const filter = {};
+        if (req.query.mes) filter.mes = req.query.mes;
+        const docs = await db.collection('hub_concentrado')
+            .find(filter).sort({ createdAt: -1 }).limit(200).toArray();
+        res.json(docs);
+    } catch (e) { res.status(500).json({ error: 'Error obteniendo concentrado' }); }
+});
+
 // ── 404 Handler ────────────────────────────────────────────
 app.use('*', (req, res) => {
     res.status(404).json({ error: `Endpoint no encontrado: ${req.originalUrl}` });
