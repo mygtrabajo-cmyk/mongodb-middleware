@@ -74,13 +74,32 @@ async function connectDB() {
         db = client.db(DB_NAME);
         console.log(`✅ MongoDB conectado: ${DB_NAME}`);
 
-        // Crear índices
-        await db.collection('users').createIndex({ username: 1 }, { unique: true });
-        await db.collection('access_logs').createIndex({ timestamp: 1 }, { expireAfterSeconds: 30 * 24 * 3600 });
-        await db.collection('notificaciones').createIndex({ username: 1, leida: 1 });
-        await db.collection('notificaciones').createIndex({ usuario_destino: 1, leida: 1 });
-        // Índice compuesto para asistencia: queries por username+fecha son los más frecuentes
-        await db.collection('hub_asistencia').createIndex({ username: 1, fecha: 1 }, { unique: true });
+        // ── Crear índices — cada uno en su propio try/catch ────────
+        // Si un índice ya existe con otro nombre, MongoDB lanza error pero
+        // el servidor DEBE seguir funcionando sin crashear.
+        const crearIndice = async (col, spec, opts = {}) => {
+            try {
+                await db.collection(col).createIndex(spec, opts);
+            } catch (e) {
+                // Índice ya existe con otro nombre → OK, no es fatal
+                if (e.codeName === 'IndexKeySpecsConflict' ||
+                    e.codeName === 'IndexOptionsConflict' ||
+                    e.message?.includes('already exists')) {
+                    console.warn(`⚠️  Índice ya existe en ${col}: ${e.message.split('\n')[0]}`);
+                } else {
+                    // Error real — loggear pero no crashear
+                    console.error(`❌ Error creando índice en ${col}:`, e.message);
+                }
+            }
+        };
+
+        await crearIndice('users',            { username: 1 },                     { unique: true, name: 'username_unique' });
+        await crearIndice('access_logs',      { timestamp: 1 },                    { expireAfterSeconds: 30 * 24 * 3600, name: 'ttl_30d' });
+        await crearIndice('notificaciones',   { username: 1, leida: 1 },           { name: 'notif_username_leida' });
+        await crearIndice('notificaciones',   { usuario_destino: 1, leida: 1 },    { name: 'notif_destino_leida' });
+        await crearIndice('hub_asistencia',   { username: 1, fecha: 1 },           { unique: true, name: 'asistencia_user_fecha_unique' });
+        await crearIndice('hub_asistencia',   { fecha: 1 },                        { name: 'asistencia_fecha' });
+        await crearIndice('hub_mensajes',     { canal: 1, createdAt: -1 },         { name: 'mensajes_canal_fecha' });
         await db.collection('hub_asistencia').createIndex({ fecha: 1 });
         // Índice para mensajes del hub por canal
         await db.collection('hub_mensajes').createIndex({ canal: 1, createdAt: -1 });
