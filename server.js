@@ -1,7 +1,7 @@
 // ============================================================
 // MYG TELECOM — API SERVER v4.0.0
 // Render (Node.js) + MongoDB Atlas
-// 
+//
 // Cambios v4.0:
 // - 7 roles: ADMIN, GERENTE_OPERACIONES, COORDINADOR, ANALISTA,
 //            GERENTE_COMERCIAL, EJECUTIVO_COMERCIAL, USUARIO
@@ -75,7 +75,7 @@ async function connectDB() {
         console.log(`✅ MongoDB conectado: ${DB_NAME}`);
 
         // Crear índices
-        await db.collection('usuarios').createIndex({ username: 1 }, { unique: true });
+        await db.collection('users').createIndex({ username: 1 }, { unique: true });
         await db.collection('access_logs').createIndex({ timestamp: 1 }, { expireAfterSeconds: 30 * 24 * 3600 });
         await db.collection('notificaciones').createIndex({ username: 1, leida: 1 });
 
@@ -329,7 +329,7 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
             return res.status(400).json({ error: 'Usuario y contraseña requeridos' });
         }
 
-        const usuarioDoc = await db.collection('usuarios').findOne({ username: username.toLowerCase().trim() });
+        const usuarioDoc = await db.collection('users').findOne({ username: username.toLowerCase().trim() });
 
         if (!usuarioDoc) {
             await logAccess(username, 'LOGIN_FAILED', { reason: 'user_not_found', ip: req.ip });
@@ -365,7 +365,7 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
         const token = jwt.sign(tokenPayload, process.env.JWT_SECRET, { expiresIn: '8h' });
 
         // Actualizar último login
-        await db.collection('usuarios').updateOne(
+        await db.collection('users').updateOne(
             { username: usuarioDoc.username },
             { $set: { ultimoLogin: new Date(), rol: rolNormalizado } }
         );
@@ -395,7 +395,7 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
 // ── USUARIOS — CRUD (solo ADMIN) ───────────────────────────
 app.get('/api/users', requireAuth, requireAdmin, async (req, res) => {
     try {
-        const usuarios = await db.collection('usuarios')
+        const usuarios = await db.collection('users')
             .find({}, { projection: { password: 0 } })
             .toArray();
         // Normalizar roles en la respuesta
@@ -419,7 +419,7 @@ app.post('/api/users', requireAuth, requireAdmin, async (req, res) => {
             return res.status(400).json({ error: 'El rol secundario no puede ser igual al rol principal' });
         }
 
-        const existente = await db.collection('usuarios').findOne({ username: value.username.toLowerCase() });
+        const existente = await db.collection('users').findOne({ username: value.username.toLowerCase() });
         if (existente) return res.status(409).json({ error: 'El usuario ya existe' });
 
         const hashedPassword = await bcrypt.hash(value.password, 12);
@@ -439,7 +439,7 @@ app.post('/api/users', requireAuth, requireAdmin, async (req, res) => {
             createdBy:        req.user.username,
         };
 
-        await db.collection('usuarios').insertOne(nuevoUsuario);
+        await db.collection('users').insertOne(nuevoUsuario);
         await logAccess(req.user.username, 'USER_CREATED', { targetUser: nuevoUsuario.username });
 
         const { password: _, ...sinPassword } = nuevoUsuario;
@@ -470,7 +470,7 @@ app.put('/api/users/:username', requireAuth, requireAdmin, async (req, res) => {
         // Validar área si el rol la requiere
         if (value.rol && ROLES_CON_AREA.includes(value.rol) && !value.area) {
             // Obtener el área actual del usuario si no viene en el body
-            const usuarioActual = await db.collection('usuarios').findOne({ username });
+            const usuarioActual = await db.collection('users').findOne({ username });
             if (!usuarioActual?.area) {
                 return res.status(400).json({ error: `El rol ${value.rol} requiere campo 'area'` });
             }
@@ -491,7 +491,7 @@ app.put('/api/users/:username', requireAuth, requireAdmin, async (req, res) => {
             updates.password = await bcrypt.hash(value.password, 12);
         }
 
-        const result = await db.collection('usuarios').updateOne({ username }, { $set: updates });
+        const result = await db.collection('users').updateOne({ username }, { $set: updates });
 
         if (result.matchedCount === 0) {
             return res.status(404).json({ error: 'Usuario no encontrado' });
@@ -511,7 +511,7 @@ app.delete('/api/users/:username', requireAuth, requireAdmin, async (req, res) =
         if (username === 'admin') return res.status(403).json({ error: 'No se puede eliminar el administrador principal' });
         if (username === req.user.username) return res.status(403).json({ error: 'No puedes eliminarte a ti mismo' });
 
-        const result = await db.collection('usuarios').deleteOne({ username });
+        const result = await db.collection('users').deleteOne({ username });
         if (result.deletedCount === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
 
         await logAccess(req.user.username, 'USER_DELETED', { targetUser: username });
@@ -548,7 +548,7 @@ app.patch('/api/users/:username/profile', requireAuth, async (req, res) => {
             }
         }
 
-        const result = await db.collection('usuarios').updateOne(
+        const result = await db.collection('users').updateOne(
             { username },
             { $set: updates }
         );
@@ -556,7 +556,7 @@ app.patch('/api/users/:username/profile', requireAuth, async (req, res) => {
         if (result.matchedCount === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
 
         // Retornar preferencias actualizadas
-        const usuarioActualizado = await db.collection('usuarios').findOne(
+        const usuarioActualizado = await db.collection('users').findOne(
             { username },
             { projection: { password: 0 } }
         );
@@ -583,7 +583,7 @@ app.patch('/api/users/:username/password', requireAuth, async (req, res) => {
         const { error, value } = schemaCambiarPassword.validate(req.body);
         if (error) return res.status(400).json({ error: error.details[0].message });
 
-        const usuario = await db.collection('usuarios').findOne({ username });
+        const usuario = await db.collection('users').findOne({ username });
         if (!usuario) return res.status(404).json({ error: 'Usuario no encontrado' });
 
         // Si no es admin, verificar contraseña actual
@@ -593,7 +593,7 @@ app.patch('/api/users/:username/password', requireAuth, async (req, res) => {
         }
 
         const hashedNueva = await bcrypt.hash(value.passwordNueva, 12);
-        await db.collection('usuarios').updateOne({ username }, {
+        await db.collection('users').updateOne({ username }, {
             $set: { password: hashedNueva, passwordChangedAt: new Date() }
         });
 
@@ -608,9 +608,9 @@ app.patch('/api/users/:username/password', requireAuth, async (req, res) => {
 app.get('/api/admin/stats', requireAuth, requireAdmin, async (req, res) => {
     try {
         const [totalUsuarios, usuariosActivos, registrosPorRol, ultimosLogins, formSubmissions] = await Promise.all([
-            db.collection('usuarios').countDocuments(),
-            db.collection('usuarios').countDocuments({ activo: true }),
-            db.collection('usuarios').aggregate([
+            db.collection('users').countDocuments(),
+            db.collection('users').countDocuments({ activo: true }),
+            db.collection('users').aggregate([
                 { $group: { _id: '$rol', count: { $sum: 1 } } },
                 { $sort: { count: -1 } }
             ]).toArray(),
@@ -624,7 +624,7 @@ app.get('/api/admin/stats', requireAuth, requireAdmin, async (req, res) => {
         ]);
 
         // Estadísticas de áreas
-        const porArea = await db.collection('usuarios').aggregate([
+        const porArea = await db.collection('users').aggregate([
             { $match: { area: { $ne: null } } },
             { $group: { _id: '$area', count: { $sum: 1 } } }
         ]).toArray();
@@ -687,7 +687,7 @@ app.patch('/api/admin/permissions/users/:username', requireAuth, requireAdmin, a
         if (invalidosExtra.length > 0) return res.status(400).json({ error: `Permisos extra inválidos: ${invalidosExtra.join(', ')}` });
         if (invalidosRevocados.length > 0) return res.status(400).json({ error: `Permisos revocados inválidos: ${invalidosRevocados.join(', ')}` });
 
-        await db.collection('usuarios').updateOne(
+        await db.collection('users').updateOne(
             { username },
             { $set: { permisosExtra, permisosRevocados, updatedAt: new Date(), updatedBy: req.user.username } }
         );
@@ -703,7 +703,7 @@ app.patch('/api/admin/permissions/users/:username', requireAuth, requireAdmin, a
 app.get('/api/admin/permissions/users/:username', requireAuth, requireAdmin, async (req, res) => {
     try {
         const { username } = req.params;
-        const usuario = await db.collection('usuarios').findOne(
+        const usuario = await db.collection('users').findOne(
             { username },
             { projection: { rol: 1, area: 1, permisosExtra: 1, permisosRevocados: 1 } }
         );
