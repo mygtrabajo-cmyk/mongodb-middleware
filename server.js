@@ -1,18 +1,11 @@
 // ============================================================
-// MYG TELECOM — API SERVER v4.0.0
+// MYG TELECOM — API SERVER v4.1.0
 // Render (Node.js) + MongoDB Atlas
 //
-// Cambios v4.0:
-// - 7 roles: ADMIN, GERENTE_OPERACIONES, COORDINADOR, ANALISTA,
-//            GERENTE_COMERCIAL, EJECUTIVO_COMERCIAL, USUARIO
-// - Campo 'area' requerido para COORDINADOR y ANALISTA
-// - Campo 'rolSecundario' opcional (hasta 2 roles por usuario)
-// - Campo 'preferencias' (tabsPinned persistente en MongoDB)
-// - GERENTE_COMERCIAL / EJECUTIVO_COMERCIAL: permisos vacíos por defecto
-//   (solo lo que Admin asigne explícitamente vía admin.permisos)
-// - Panel Admin: exclusivo de ADMIN
-// - PATCH /api/users/:username/profile → guarda preferencias
-// - Backward compatibility: roles legacy remapeados automáticamente
+// Cambios v4.1.1 (sobre v4.0):
+// - POST /api/hub/reuniones/:id/generar-minuta
+//   Genera minuta con IA: Groq (Llama 3.3) → Gemini 2.0 → reglas locales
+//   ENV: GROQ_API_KEY (requerida), GEMINI_API_KEY (opcional, fallback)
 // ============================================================
 
 require('dotenv').config();
@@ -25,6 +18,12 @@ const bcrypt    = require('bcryptjs');
 const Joi       = require('joi');
 const rateLimit = require('express-rate-limit');
 const morgan    = require('morgan');
+
+// ── IA — Generación de Minutas (Groq → Gemini → Reglas locales) ──
+// npm install groq-sdk @google/generative-ai
+let Groq, GoogleGenerativeAI;
+try { Groq = require('groq-sdk'); } catch (_) { console.warn('⚠️  groq-sdk no instalado. Ejecuta: npm install groq-sdk'); }
+try { ({ GoogleGenerativeAI } = require('@google/generative-ai')); } catch (_) { console.warn('⚠️  @google/generative-ai no instalado.'); }
 
 const app  = express();
 const PORT = process.env.PORT || 5500;
@@ -74,17 +73,10 @@ async function connectDB() {
         db = client.db(DB_NAME);
         console.log(`✅ MongoDB conectado: ${DB_NAME}`);
 
-        // ── Crear índices — cada uno en su propio try/catch ────────
-        // Si un índice ya existe con otro nombre, MongoDB lanza error pero
-        // el servidor DEBE seguir funcionando sin crashear.
-        // crearIndice: captura CUALQUIER error de MongoDB —
-        // nunca relanza, nunca crashea el servidor
         const crearIndice = async (col, spec, opts = {}) => {
             try {
                 await db.collection(col).createIndex(spec, opts);
             } catch (e) {
-                // Los errores de índices (conflicto de nombre, ya existe, duplicados)
-                // son advertencias, NO deben matar el servidor
                 console.warn(`⚠️  Índice en '${col}': ${(e.message || e).toString().split('\n')[0]}`);
             }
         };
@@ -93,7 +85,7 @@ async function connectDB() {
         await crearIndice('access_logs',      { timestamp: 1 },                    { expireAfterSeconds: 30 * 24 * 3600, name: 'ttl_30d' });
         await crearIndice('notificaciones',   { username: 1, leida: 1 },           { name: 'notif_username_leida' });
         await crearIndice('notificaciones',   { usuario_destino: 1, leida: 1 },    { name: 'notif_destino_leida' });
-        await crearIndice('hub_asistencia',   { username: 1, fecha: 1 },           { name: 'asistencia_user_fecha' }); // sin unique — el POST handler previene duplicados
+        await crearIndice('hub_asistencia',   { username: 1, fecha: 1 },           { name: 'asistencia_user_fecha' });
         await crearIndice('hub_asistencia',   { fecha: 1 },                        { name: 'asistencia_fecha' });
         await crearIndice('hub_mensajes',     { canal: 1, createdAt: -1 },         { name: 'mensajes_canal_fecha' });
 
@@ -108,25 +100,21 @@ async function connectDB() {
 const ROLES_VALIDOS = [
     'ADMIN', 'GERENTE_OPERACIONES', 'COORDINADOR', 'ANALISTA',
     'GERENTE_COMERCIAL', 'EJECUTIVO_COMERCIAL',
-    'GERENTE_RH', 'ANALISTA_RH',          // v4.1 — área RH implícita
+    'GERENTE_RH', 'ANALISTA_RH',
     'USUARIO'
 ];
 
 const AREAS_VALIDAS = ['Sistemas', 'Mantenimiento', 'Credito', 'Logistica'];
+const ROLES_CON_AREA = ['COORDINADOR', 'ANALISTA', 'GERENTE_RH', 'ANALISTA_RH'];
 
-// Roles que requieren campo 'area'
-const ROLES_CON_AREA = ['COORDINADOR', 'ANALISTA', 'GERENTE_RH', 'ANALISTA_RH']; // v4.1
-
-// Mapa de roles legacy → nuevos roles
 const LEGACY_ROLE_MAP = {
-    'RH':       'ANALISTA_RH',  // v4.1: legacy RH → ANALISTA_RH (area pendiente de asignar)
-    'SISTEMAS': 'COORDINADOR',  // area='Sistemas'
+    'RH':       'ANALISTA_RH',
+    'SISTEMAS': 'COORDINADOR',
     'GERENTE':  'GERENTE_OPERACIONES',
     'USUARIO':  'USUARIO',
     'ADMIN':    'ADMIN',
 };
 
-// ── Módulos de permisos disponibles ───────────────────────
 const MODULOS_PERMISOS = [
     'dashboard.ver', 'dashboard.rh', 'dashboard.headcount', 'dashboard.activos',
     'dashboard.tickets', 'dashboard.dispositivos', 'dashboard.kpi_sistemas',
@@ -142,8 +130,6 @@ const MODULOS_PERMISOS = [
     'admin.permisos', 'admin.logs', 'admin.formularios',
 ];
 
-// ── Permisos por defecto para cada rol ────────────────────
-// GERENTE_COMERCIAL y EJECUTIVO_COMERCIAL: vacíos — Admin asigna manualmente
 const ROL_PERMISOS_DEFAULT = {
     ADMIN: ['*'],
 
@@ -158,8 +144,6 @@ const ROL_PERMISOS_DEFAULT = {
         'exportar_datos', 'chatbot.usar',
     ],
 
-    // COORDINADOR: permisos completos del área Sistemas (base)
-    // Para otras áreas el admin puede agregar/quitar vía admin.permisos
     COORDINADOR: [
         'dashboard.ver', 'dashboard.rh', 'dashboard.headcount', 'dashboard.activos',
         'dashboard.tickets', 'dashboard.dispositivos', 'dashboard.kpi_sistemas',
@@ -181,79 +165,43 @@ const ROL_PERMISOS_DEFAULT = {
         'rh.movimientos.ver', 'activos.ver', 'exportar_datos', 'chatbot.usar',
     ],
 
-    // Permisos base mínimos — Admin asigna lo demás manualmente vía permisosExtra
-    // Si están vacíos el usuario ve pantalla en blanco; 'dashboard.ver' les da al menos el resumen
     GERENTE_COMERCIAL:    ['dashboard.ver', 'chatbot.usar'],
     EJECUTIVO_COMERCIAL:  ['dashboard.ver', 'chatbot.usar'],
 
-    // GERENTE_RH: RH, Headcount + gestión de movimientos + Hub (asistencia propia)
     GERENTE_RH: [
-        'dashboard.ver',
-        'dashboard.rh',
-        'dashboard.headcount',
-        'rh.movimientos.crear',
-        'rh.movimientos.ver',
-        'rh.movimientos.gestionar',
-        'hub.acceso',
-        'hub.asistencia',
-        'hub.asistencia.registrar',
-        'hub.vacaciones',
-        'hub.peticiones.crear',
-        'exportar_datos',
-        'chatbot.usar',
+        'dashboard.ver', 'dashboard.rh', 'dashboard.headcount',
+        'rh.movimientos.crear', 'rh.movimientos.ver', 'rh.movimientos.gestionar',
+        'hub.acceso', 'hub.asistencia', 'hub.asistencia.registrar',
+        'hub.vacaciones', 'hub.peticiones.crear',
+        'exportar_datos', 'chatbot.usar',
     ],
 
-    // ANALISTA_RH: RH, Headcount + crea movimientos + Hub (asistencia propia)
     ANALISTA_RH: [
-        'dashboard.ver',
-        'dashboard.rh',
-        'dashboard.headcount',
-        'rh.movimientos.crear',
-        'rh.movimientos.ver',
-        'hub.acceso',
-        'hub.asistencia',
-        'hub.asistencia.registrar',
-        'hub.peticiones.crear',
-        'exportar_datos',
-        'chatbot.usar',
+        'dashboard.ver', 'dashboard.rh', 'dashboard.headcount',
+        'rh.movimientos.crear', 'rh.movimientos.ver',
+        'hub.acceso', 'hub.asistencia', 'hub.asistencia.registrar',
+        'hub.peticiones.crear', 'exportar_datos', 'chatbot.usar',
     ],
 
     USUARIO: ['dashboard.ver', 'chatbot.usar'],
 };
 
-// ── Helpers de normalización ───────────────────────────────
-/**
- * Remapea un rol legacy al nuevo esquema si aplica.
- * Preserva roles v4.0 sin cambio.
- */
 function normalizarRol(rol) {
     if (ROLES_VALIDOS.includes(rol)) return rol;
     return LEGACY_ROLE_MAP[rol] || 'USUARIO';
 }
 
-/**
- * Calcula permisos efectivos del usuario:
- * permisos del rol base + overrides del admin (permisosExtra) - permisosRevocados
- */
 function calcularPermisos(usuario) {
     const rol = normalizarRol(usuario.rol);
-
-    // Admin siempre tiene wildcard
     if (rol === 'ADMIN') return ['*'];
-
     const base    = ROL_PERMISOS_DEFAULT[rol] || [];
-    const extra   = usuario.permisosExtra   || [];
+    const extra   = usuario.permisosExtra    || [];
     const revoked = usuario.permisosRevocados || [];
-
     const set = new Set([...base, ...extra]);
     revoked.forEach(p => set.delete(p));
     return Array.from(set);
 }
 
-/**
- * Verifica si un usuario (req.user del JWT) tiene un permiso específico.
- * Usado en handlers que necesitan lógica condicional de permisos.
- */
 function tienePermiso(user, permiso) {
     if (!user) return false;
     const permisos = user.permisos || [];
@@ -262,15 +210,14 @@ function tienePermiso(user, permiso) {
     return permisos.includes(permiso);
 }
 
-// ── Schemas Joi v4.0 ───────────────────────────────────────
+// ── Schemas Joi ────────────────────────────────────────────
 const schemaCrearUsuario = Joi.object({
     username:     Joi.string().min(3).max(50).required(),
     password:     Joi.string().min(6).required(),
     nombre:       Joi.string().min(2).max(100).required(),
     email:        Joi.string().email().optional().allow(''),
-    rol:          Joi.string().valid(...ROLES_VALIDOS).required(), // v4.1: incluye GERENTE_RH, ANALISTA_RH
+    rol:          Joi.string().valid(...ROLES_VALIDOS).required(),
     area:         Joi.string().valid(...AREAS_VALIDAS).when('rol', {
-                      // ROLES_CON_AREA incluye COORDINADOR, ANALISTA, GERENTE_RH, ANALISTA_RH
                       is: Joi.valid(...ROLES_CON_AREA),
                       then: Joi.required(),
                       otherwise: Joi.optional().allow(null, '')
@@ -280,14 +227,14 @@ const schemaCrearUsuario = Joi.object({
 });
 
 const schemaActualizarUsuario = Joi.object({
-    nombre:           Joi.string().min(2).max(100).optional(),
-    email:            Joi.string().email().optional().allow(''),
-    rol:              Joi.string().valid(...ROLES_VALIDOS).optional(),
-    area:             Joi.string().valid(...AREAS_VALIDAS).optional().allow(null, ''),
-    rolSecundario:    Joi.string().valid(...ROLES_VALIDOS).optional().allow(null, ''),
-    password:         Joi.string().min(6).optional(),
-    activo:           Joi.boolean().optional(),
-    permisosExtra:    Joi.array().items(Joi.string()).optional(),
+    nombre:            Joi.string().min(2).max(100).optional(),
+    email:             Joi.string().email().optional().allow(''),
+    rol:               Joi.string().valid(...ROLES_VALIDOS).optional(),
+    area:              Joi.string().valid(...AREAS_VALIDAS).optional().allow(null, ''),
+    rolSecundario:     Joi.string().valid(...ROLES_VALIDOS).optional().allow(null, ''),
+    password:          Joi.string().min(6).optional(),
+    activo:            Joi.boolean().optional(),
+    permisosExtra:     Joi.array().items(Joi.string()).optional(),
     permisosRevocados: Joi.array().items(Joi.string()).optional(),
 });
 
@@ -314,8 +261,6 @@ function requireAuth(req, res, next) {
         }
         const token = header.slice(7);
         const payload = jwt.verify(token, process.env.JWT_SECRET);
-
-        // Normalizar rol por si viene de JWT legacy
         payload.rol = normalizarRol(payload.rol);
         req.user = payload;
         next();
@@ -342,7 +287,6 @@ function requirePermiso(permiso) {
     };
 }
 
-// ── Logging de accesos ─────────────────────────────────────
 async function logAccess(username, action, details = {}) {
     try {
         if (!db) return;
@@ -360,7 +304,7 @@ async function logAccess(username, action, details = {}) {
 app.get('/health', (req, res) => {
     res.json({
         status: 'ok',
-        version: '4.0.0',
+        version: '4.1.1',
         timestamp: new Date().toISOString(),
         db: db ? 'connected' : 'disconnected'
     });
@@ -392,7 +336,6 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
             return res.status(401).json({ error: 'Credenciales inválidas' });
         }
 
-        // Normalizar rol si viene de esquema legacy
         const rolNormalizado = normalizarRol(usuarioDoc.rol);
         const permisos = calcularPermisos({ ...usuarioDoc, rol: rolNormalizado });
 
@@ -401,15 +344,14 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
             nombre:        usuarioDoc.nombre,
             email:         usuarioDoc.email || '',
             rol:           rolNormalizado,
-            area:          usuarioDoc.area || null,          // v4.0
-            rolSecundario: usuarioDoc.rolSecundario || null, // v4.0
+            area:          usuarioDoc.area || null,
+            rolSecundario: usuarioDoc.rolSecundario || null,
             permisos,
-            preferencias:  usuarioDoc.preferencias || {},   // v4.0
+            preferencias:  usuarioDoc.preferencias || {},
         };
 
         const token = jwt.sign(tokenPayload, process.env.JWT_SECRET, { expiresIn: '8h' });
 
-        // Actualizar último login
         await db.collection('users').updateOne(
             { username: usuarioDoc.username },
             { $set: { ultimoLogin: new Date(), rol: rolNormalizado } }
@@ -443,11 +385,7 @@ app.get('/api/users', requireAuth, requireAdmin, async (req, res) => {
         const usuarios = await db.collection('users')
             .find({}, { projection: { password: 0 } })
             .toArray();
-        // Normalizar roles en la respuesta
-        const normalizados = usuarios.map(u => ({
-            ...u,
-            rol: normalizarRol(u.rol)
-        }));
+        const normalizados = usuarios.map(u => ({ ...u, rol: normalizarRol(u.rol) }));
         res.json(normalizados);
     } catch (error) {
         res.status(500).json({ error: 'Error obteniendo usuarios' });
@@ -459,7 +397,6 @@ app.post('/api/users', requireAuth, requireAdmin, async (req, res) => {
         const { error, value } = schemaCrearUsuario.validate(req.body);
         if (error) return res.status(400).json({ error: error.details[0].message });
 
-        // Validar que rolSecundario no sea igual al rol principal
         if (value.rolSecundario && value.rolSecundario === value.rol) {
             return res.status(400).json({ error: 'El rol secundario no puede ser igual al rol principal' });
         }
@@ -469,19 +406,19 @@ app.post('/api/users', requireAuth, requireAdmin, async (req, res) => {
 
         const hashedPassword = await bcrypt.hash(value.password, 12);
         const nuevoUsuario = {
-            username:         value.username.toLowerCase().trim(),
-            password:         hashedPassword,
-            nombre:           value.nombre.trim(),
-            email:            value.email || '',
-            rol:              value.rol,
-            area:             value.area || null,
-            rolSecundario:    value.rolSecundario || null,
-            activo:           value.activo !== false,
-            permisosExtra:    [],
+            username:          value.username.toLowerCase().trim(),
+            password:          hashedPassword,
+            nombre:            value.nombre.trim(),
+            email:             value.email || '',
+            rol:               value.rol,
+            area:              value.area || null,
+            rolSecundario:     value.rolSecundario || null,
+            activo:            value.activo !== false,
+            permisosExtra:     [],
             permisosRevocados: [],
-            preferencias:     { tabsPinned: [] },
-            createdAt:        new Date(),
-            createdBy:        req.user.username,
+            preferencias:      { tabsPinned: [] },
+            createdAt:         new Date(),
+            createdBy:         req.user.username,
         };
 
         await db.collection('users').insertOne(nuevoUsuario);
@@ -499,7 +436,6 @@ app.put('/api/users/:username', requireAuth, requireAdmin, async (req, res) => {
     try {
         const { username } = req.params;
 
-        // Proteger usuario admin principal
         if (username === 'admin' && req.body.rol && req.body.rol !== 'ADMIN') {
             return res.status(403).json({ error: 'No se puede cambiar el rol del administrador principal' });
         }
@@ -507,14 +443,11 @@ app.put('/api/users/:username', requireAuth, requireAdmin, async (req, res) => {
         const { error, value } = schemaActualizarUsuario.validate(req.body);
         if (error) return res.status(400).json({ error: error.details[0].message });
 
-        // Validar que rolSecundario != rol
         if (value.rolSecundario && value.rol && value.rolSecundario === value.rol) {
             return res.status(400).json({ error: 'El rol secundario no puede ser igual al rol principal' });
         }
 
-        // Validar área si el rol la requiere
         if (value.rol && ROLES_CON_AREA.includes(value.rol) && !value.area) {
-            // Obtener el área actual del usuario si no viene en el body
             const usuarioActual = await db.collection('users').findOne({ username });
             if (!usuarioActual?.area) {
                 return res.status(400).json({ error: `El rol ${value.rol} requiere campo 'area'` });
@@ -522,25 +455,18 @@ app.put('/api/users/:username', requireAuth, requireAdmin, async (req, res) => {
         }
 
         const updates = { updatedAt: new Date(), updatedBy: req.user.username };
-
-        if (value.nombre)           updates.nombre           = value.nombre.trim();
-        if (value.email !== undefined) updates.email         = value.email || '';
-        if (value.rol)              updates.rol              = value.rol;
-        if (value.area !== undefined)  updates.area          = value.area || null;
+        if (value.nombre)                updates.nombre            = value.nombre.trim();
+        if (value.email !== undefined)   updates.email             = value.email || '';
+        if (value.rol)                   updates.rol               = value.rol;
+        if (value.area !== undefined)    updates.area              = value.area || null;
         if (value.rolSecundario !== undefined) updates.rolSecundario = value.rolSecundario || null;
-        if (value.activo !== undefined) updates.activo       = value.activo;
-        if (value.permisosExtra)    updates.permisosExtra    = value.permisosExtra;
-        if (value.permisosRevocados) updates.permisosRevocados = value.permisosRevocados;
-
-        if (value.password) {
-            updates.password = await bcrypt.hash(value.password, 12);
-        }
+        if (value.activo !== undefined)  updates.activo            = value.activo;
+        if (value.permisosExtra)         updates.permisosExtra     = value.permisosExtra;
+        if (value.permisosRevocados)     updates.permisosRevocados = value.permisosRevocados;
+        if (value.password)              updates.password          = await bcrypt.hash(value.password, 12);
 
         const result = await db.collection('users').updateOne({ username }, { $set: updates });
-
-        if (result.matchedCount === 0) {
-            return res.status(404).json({ error: 'Usuario no encontrado' });
-        }
+        if (result.matchedCount === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
 
         await logAccess(req.user.username, 'USER_UPDATED', { targetUser: username, changes: Object.keys(updates) });
         res.json({ success: true, message: 'Usuario actualizado correctamente' });
@@ -566,13 +492,10 @@ app.delete('/api/users/:username', requireAuth, requireAdmin, async (req, res) =
     }
 });
 
-// ── PERFIL DE USUARIO (cualquier usuario autenticado) ──────
-// PATCH: actualiza perfil + preferencias (tabsPinned)
+// ── PERFIL ─────────────────────────────────────────────────
 app.patch('/api/users/:username/profile', requireAuth, async (req, res) => {
     try {
         const { username } = req.params;
-
-        // Solo el propio usuario o ADMIN pueden actualizar el perfil
         if (req.user.username !== username && req.user.rol !== 'ADMIN') {
             return res.status(403).json({ error: 'No tienes permiso para modificar este perfil' });
         }
@@ -581,31 +504,20 @@ app.patch('/api/users/:username/profile', requireAuth, async (req, res) => {
         if (error) return res.status(400).json({ error: error.details[0].message });
 
         const updates = { updatedAt: new Date() };
-
-        if (value.nombre)   updates.nombre  = value.nombre.trim();
-        if (value.email !== undefined) updates.email = value.email || '';
+        if (value.nombre)              updates.nombre  = value.nombre.trim();
+        if (value.email !== undefined) updates.email   = value.email || '';
         if (value.avatar !== undefined) updates.avatar = value.avatar;
-
-        // Guardar preferencias con merge (no reemplazar todo el objeto)
-        if (value.preferencias) {
-            if (value.preferencias.tabsPinned !== undefined) {
-                updates['preferencias.tabsPinned'] = value.preferencias.tabsPinned;
-            }
+        if (value.preferencias?.tabsPinned !== undefined) {
+            updates['preferencias.tabsPinned'] = value.preferencias.tabsPinned;
         }
 
-        const result = await db.collection('users').updateOne(
-            { username },
-            { $set: updates }
-        );
-
+        const result = await db.collection('users').updateOne({ username }, { $set: updates });
         if (result.matchedCount === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
 
-        // Retornar preferencias actualizadas
         const usuarioActualizado = await db.collection('users').findOne(
             { username },
             { projection: { password: 0 } }
         );
-
         res.json({
             success: true,
             message: 'Perfil actualizado correctamente',
@@ -617,7 +529,6 @@ app.patch('/api/users/:username/profile', requireAuth, async (req, res) => {
     }
 });
 
-// PATCH: cambiar contraseña propia
 app.patch('/api/users/:username/password', requireAuth, async (req, res) => {
     try {
         const { username } = req.params;
@@ -631,7 +542,6 @@ app.patch('/api/users/:username/password', requireAuth, async (req, res) => {
         const usuario = await db.collection('users').findOne({ username });
         if (!usuario) return res.status(404).json({ error: 'Usuario no encontrado' });
 
-        // Si no es admin, verificar contraseña actual
         if (req.user.rol !== 'ADMIN') {
             const valid = await bcrypt.compare(value.passwordActual, usuario.password);
             if (!valid) return res.status(400).json({ error: 'Contraseña actual incorrecta' });
@@ -649,7 +559,7 @@ app.patch('/api/users/:username/password', requireAuth, async (req, res) => {
     }
 });
 
-// ── ADMIN — Estadísticas del sistema ──────────────────────
+// ── ADMIN — Stats ──────────────────────────────────────────
 app.get('/api/admin/stats', requireAuth, requireAdmin, async (req, res) => {
     try {
         const [totalUsuarios, usuariosActivos, registrosPorRol, ultimosLogins, formSubmissions] = await Promise.all([
@@ -668,19 +578,14 @@ app.get('/api/admin/stats', requireAuth, requireAdmin, async (req, res) => {
                 .catch(() => 0)
         ]);
 
-        // Estadísticas de áreas
         const porArea = await db.collection('users').aggregate([
             { $match: { area: { $ne: null } } },
             { $group: { _id: '$area', count: { $sum: 1 } } }
         ]).toArray();
 
         res.json({
-            resumen: {
-                totalUsuarios,
-                usuariosActivos,
-                formSubmissionsUltima7Dias: formSubmissions,
-            },
-            porRol: registrosPorRol.reduce((acc, r) => {
+            resumen: { totalUsuarios, usuariosActivos, formSubmissionsUltima7Dias: formSubmissions },
+            porRol:  registrosPorRol.reduce((acc, r) => {
                 acc[normalizarRol(r._id)] = (acc[normalizarRol(r._id)] || 0) + r.count;
                 return acc;
             }, {}),
@@ -693,31 +598,24 @@ app.get('/api/admin/stats', requireAuth, requireAdmin, async (req, res) => {
     }
 });
 
-// ── ADMIN — Logs de acceso ─────────────────────────────────
 app.get('/api/admin/access-logs', requireAuth, requireAdmin, async (req, res) => {
     try {
         const limit = Math.min(parseInt(req.query.limit) || 50, 500);
-        const page  = Math.max(parseInt(req.query.page) || 1, 1);
+        const page  = Math.max(parseInt(req.query.page)  || 1, 1);
         const skip  = (page - 1) * limit;
-
         const filter = {};
         if (req.query.username) filter.username = req.query.username;
         if (req.query.action)   filter.action   = req.query.action;
-
         const [logs, total] = await Promise.all([
             db.collection('access_logs').find(filter).sort({ timestamp: -1 }).skip(skip).limit(limit).toArray(),
             db.collection('access_logs').countDocuments(filter)
         ]);
-
         res.json({ logs, total, page, totalPages: Math.ceil(total / limit) });
     } catch (error) {
         res.status(500).json({ error: 'Error obteniendo logs' });
     }
 });
 
-// ── ADMIN — Gestión de permisos de usuario ─────────────────
-// Permite al ADMIN asignar permisos extra o revocar permisos del rol base
-// Esto es el mecanismo para GERENTE_COMERCIAL / EJECUTIVO_COMERCIAL
 app.patch('/api/admin/permissions/users/:username', requireAuth, requireAdmin, async (req, res) => {
     try {
         const { username } = req.params;
@@ -727,16 +625,15 @@ app.patch('/api/admin/permissions/users/:username', requireAuth, requireAdmin, a
             return res.status(400).json({ error: 'permisosExtra y permisosRevocados deben ser arrays' });
         }
 
-        const invalidosExtra   = permisosExtra.filter(p => !MODULOS_PERMISOS.includes(p));
+        const invalidosExtra    = permisosExtra.filter(p => !MODULOS_PERMISOS.includes(p));
         const invalidosRevocados = permisosRevocados.filter(p => !MODULOS_PERMISOS.includes(p));
-        if (invalidosExtra.length > 0) return res.status(400).json({ error: `Permisos extra inválidos: ${invalidosExtra.join(', ')}` });
+        if (invalidosExtra.length > 0)    return res.status(400).json({ error: `Permisos extra inválidos: ${invalidosExtra.join(', ')}` });
         if (invalidosRevocados.length > 0) return res.status(400).json({ error: `Permisos revocados inválidos: ${invalidosRevocados.join(', ')}` });
 
         await db.collection('users').updateOne(
             { username },
             { $set: { permisosExtra, permisosRevocados, updatedAt: new Date(), updatedBy: req.user.username } }
         );
-
         await logAccess(req.user.username, 'PERMISSIONS_UPDATED', { targetUser: username });
         res.json({ success: true, message: `Permisos actualizados para ${username}` });
     } catch (error) {
@@ -744,7 +641,6 @@ app.patch('/api/admin/permissions/users/:username', requireAuth, requireAdmin, a
     }
 });
 
-// GET permisos actuales de un usuario
 app.get('/api/admin/permissions/users/:username', requireAuth, requireAdmin, async (req, res) => {
     try {
         const { username } = req.params;
@@ -756,11 +652,8 @@ app.get('/api/admin/permissions/users/:username', requireAuth, requireAdmin, asy
 
         const rolNorm = normalizarRol(usuario.rol);
         const base    = ROL_PERMISOS_DEFAULT[rolNorm] || [];
-
         res.json({
-            username,
-            rol:               rolNorm,
-            area:              usuario.area || null,
+            username, rol: rolNorm, area: usuario.area || null,
             permisosBase:      base,
             permisosExtra:     usuario.permisosExtra || [],
             permisosRevocados: usuario.permisosRevocados || [],
@@ -772,170 +665,71 @@ app.get('/api/admin/permissions/users/:username', requireAuth, requireAdmin, asy
     }
 });
 
-// ── ADMIN — Form submissions ────────────────────────────────
 app.get('/api/admin/form-submissions', requireAuth, requireAdmin, async (req, res) => {
     try {
         const limit = Math.min(parseInt(req.query.limit) || 50, 500);
         const submissions = await db.collection('form_submissions')
-            .find({})
-            .sort({ createdAt: -1 })
-            .limit(limit)
-            .toArray();
+            .find({}).sort({ createdAt: -1 }).limit(limit).toArray();
         res.json(submissions);
     } catch (error) {
         res.status(500).json({ error: 'Error obteniendo formularios' });
     }
 });
 
-
-// ============================================================
-// NOTIFICACIONES — CRUD COMPLETO + SSE (Server-Sent Events)
-// ============================================================
-
-// Mapa de clientes SSE activos: username → Set<res>
-const sseClients = new Map();
-
-function sseAdd(username, res) {
-    if (!sseClients.has(username)) sseClients.set(username, new Set());
-    sseClients.get(username).add(res);
-}
-
-function sseRemove(username, res) {
-    sseClients.get(username)?.delete(res);
-}
-
-function ssePush(username, evento, datos) {
-    const targets = new Set();
-    if (username === '*') {
-        // Broadcast a todos los conectados
-        sseClients.forEach(set => set.forEach(r => targets.add(r)));
-    } else {
-        sseClients.get(username)?.forEach(r => targets.add(r));
-        sseClients.get('*')?.forEach(r => targets.add(r)); // canales globales
-    }
-    const payload = `event: notificacion
-data: ${JSON.stringify({ ...datos, _ts: Date.now() })}
-
-`;
-    targets.forEach(r => {
-        try { r.write(payload); } catch { /* cliente desconectado */ }
-    });
-}
-
-// ── GET /api/notificaciones/sse — conexión SSE tiempo real ──
-// IMPORTANTE: va ANTES de GET /api/notificaciones para evitar conflicto de rutas
-app.get('/api/notificaciones/sse', requireAuth, (req, res) => {
-    res.setHeader('Content-Type',  'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection',    'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no'); // Nginx / Render: deshabilitar buffering
-    res.flushHeaders();
-
-    const username = req.user.username;
-    sseAdd(username, res);
-
-    // Enviar evento de conexión inicial
-    res.write(`event: connected
-data: ${JSON.stringify({ status: 'ok', username })}
-
-`);
-
-    // Heartbeat cada 25s para que Render / CF no cierre la conexión idle
-    const heartbeat = setInterval(() => {
-        try { res.write(`: heartbeat
-
-`); } catch { clearInterval(heartbeat); }
-    }, 25000);
-
-    req.on('close', () => {
-        clearInterval(heartbeat);
-        sseRemove(username, res);
-    });
-});
-
-// ── GET /api/notificaciones ────────────────────────────────
-// (ya existía, pero se reutiliza el handler con respuesta normalizada)
-
-// ── POST /api/notificaciones — crear y hacer push SSE ─────
-app.post('/api/notificaciones', requireAuth, async (req, res) => {
-    try {
-        const { titulo, mensaje, tipo = 'info', icono, tab_destino,
-                subtab, usuario_destino } = req.body;
-
-        if (!titulo || !mensaje)
-            return res.status(400).json({ error: 'titulo y mensaje son requeridos' });
-
-        const notif = {
-            titulo,
-            mensaje,
-            tipo,
-            icono:           icono       || null,
-            tab_destino:     tab_destino || null,
-            subtab:          subtab      || null,
-            usuario_destino: usuario_destino || req.user.username,
-            creadaPor:       req.user.username,
-            leida:           false,
-            createdAt:       new Date(),
-        };
-
-        const result = await db.collection('notificaciones').insertOne(notif);
-        notif._id = result.insertedId;
-
-        // Push SSE instantáneo
-        ssePush(notif.usuario_destino, 'notificacion', notif);
-
-        res.status(201).json({ success: true, notificacion: notif });
-    } catch (e) {
-        res.status(500).json({ error: 'Error creando notificación' });
-    }
-});
-
-// ── PATCH /api/notificaciones/leer-todas ──────────────────
-// IMPORTANTE: va ANTES de /:id/leer para evitar que 'leer-todas' se interprete como :id
-app.patch('/api/notificaciones/leer-todas', requireAuth, async (req, res) => {
-    try {
-        await db.collection('notificaciones').updateMany(
-            { $or: [{ username: req.user.username }, { usuario_destino: req.user.username }], leida: false },
-            { $set: { leida: true, leidaEn: new Date() } }
-        );
-        res.json({ success: true });
-    } catch (e) {
-        res.status(500).json({ error: 'Error marcando notificaciones' });
-    }
-});
-
-// ── DELETE /api/notificaciones — limpiar leídas del usuario ─
-app.delete('/api/notificaciones', requireAuth, async (req, res) => {
-    try {
-        const result = await db.collection('notificaciones').deleteMany({
-            $or: [
-                { username:         req.user.username },
-                { usuario_destino:  req.user.username },
-            ],
-            leida: true,
-        });
-        res.json({ success: true, eliminadas: result.deletedCount });
-    } catch (e) {
-        res.status(500).json({ error: 'Error eliminando notificaciones' });
-    }
-});
-
-// ── GET /api/admin/permissions/roles — permisos base por rol ──
 app.get('/api/admin/permissions/roles', requireAuth, requireAdmin, async (req, res) => {
     try {
         res.json({
-            roles:             ROLES_VALIDOS,
-            areasValidas:      AREAS_VALIDAS,
-            rolesConArea:      ROLES_CON_AREA,
+            roles:              ROLES_VALIDOS,
+            areasValidas:       AREAS_VALIDAS,
+            rolesConArea:       ROLES_CON_AREA,
             modulosDisponibles: MODULOS_PERMISOS,
-            permisosDefault:   ROL_PERMISOS_DEFAULT,
+            permisosDefault:    ROL_PERMISOS_DEFAULT,
         });
     } catch (e) {
         res.status(500).json({ error: 'Error obteniendo permisos por rol' });
     }
 });
 
-// ── NOTIFICACIONES — GET (reemplazado por bloque completo arriba) ──
+// ============================================================
+// NOTIFICACIONES — SSE + CRUD
+// ============================================================
+
+const sseClients = new Map();
+
+function sseAdd(username, res) {
+    if (!sseClients.has(username)) sseClients.set(username, new Set());
+    sseClients.get(username).add(res);
+}
+function sseRemove(username, res) {
+    sseClients.get(username)?.delete(res);
+}
+function ssePush(username, evento, datos) {
+    const targets = new Set();
+    if (username === '*') {
+        sseClients.forEach(set => set.forEach(r => targets.add(r)));
+    } else {
+        sseClients.get(username)?.forEach(r => targets.add(r));
+        sseClients.get('*')?.forEach(r => targets.add(r));
+    }
+    const payload = `event: notificacion\ndata: ${JSON.stringify({ ...datos, _ts: Date.now() })}\n\n`;
+    targets.forEach(r => { try { r.write(payload); } catch { /* cliente desconectado */ } });
+}
+
+app.get('/api/notificaciones/sse', requireAuth, (req, res) => {
+    res.setHeader('Content-Type',  'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection',    'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders();
+    const username = req.user.username;
+    sseAdd(username, res);
+    res.write(`event: connected\ndata: ${JSON.stringify({ status: 'ok', username })}\n\n`);
+    const heartbeat = setInterval(() => {
+        try { res.write(`: heartbeat\n\n`); } catch { clearInterval(heartbeat); }
+    }, 25000);
+    req.on('close', () => { clearInterval(heartbeat); sseRemove(username, res); });
+});
+
 app.get('/api/notificaciones', requireAuth, async (req, res) => {
     try {
         const { username } = req.user;
@@ -944,10 +738,42 @@ app.get('/api/notificaciones', requireAuth, async (req, res) => {
             .sort({ createdAt: -1 })
             .limit(50)
             .toArray();
-        // components.js L419 espera { notificaciones: [], total_no_leidas: N }
         const total_no_leidas = notifs.filter(n => !n.leida).length;
         res.json({ notificaciones: notifs, total_no_leidas });
     } catch (e) { res.status(500).json({ error: 'Error obteniendo notificaciones' }); }
+});
+
+app.post('/api/notificaciones', requireAuth, async (req, res) => {
+    try {
+        const { titulo, mensaje, tipo = 'info', icono, tab_destino, subtab, usuario_destino } = req.body;
+        if (!titulo || !mensaje) return res.status(400).json({ error: 'titulo y mensaje son requeridos' });
+        const notif = {
+            titulo, mensaje, tipo,
+            icono:           icono        || null,
+            tab_destino:     tab_destino  || null,
+            subtab:          subtab       || null,
+            usuario_destino: usuario_destino || req.user.username,
+            creadaPor:       req.user.username,
+            leida:           false,
+            createdAt:       new Date(),
+        };
+        const result = await db.collection('notificaciones').insertOne(notif);
+        notif._id = result.insertedId;
+        ssePush(notif.usuario_destino, 'notificacion', notif);
+        res.status(201).json({ success: true, notificacion: notif });
+    } catch (e) {
+        res.status(500).json({ error: 'Error creando notificación' });
+    }
+});
+
+app.patch('/api/notificaciones/leer-todas', requireAuth, async (req, res) => {
+    try {
+        await db.collection('notificaciones').updateMany(
+            { $or: [{ username: req.user.username }, { usuario_destino: req.user.username }], leida: false },
+            { $set: { leida: true, leidaEn: new Date() } }
+        );
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: 'Error marcando notificaciones' }); }
 });
 
 app.patch('/api/notificaciones/:id/leer', requireAuth, async (req, res) => {
@@ -960,6 +786,16 @@ app.patch('/api/notificaciones/:id/leer', requireAuth, async (req, res) => {
     } catch (e) { res.status(500).json({ error: 'Error marcando notificación' }); }
 });
 
+app.delete('/api/notificaciones', requireAuth, async (req, res) => {
+    try {
+        const result = await db.collection('notificaciones').deleteMany({
+            $or: [{ username: req.user.username }, { usuario_destino: req.user.username }],
+            leida: true,
+        });
+        res.json({ success: true, eliminadas: result.deletedCount });
+    } catch (e) { res.status(500).json({ error: 'Error eliminando notificaciones' }); }
+});
+
 // ── RH MOVIMIENTOS ─────────────────────────────────────────
 app.get('/api/rh/movimientos', requireAuth, requirePermiso('rh.movimientos.ver'), async (req, res) => {
     try {
@@ -968,24 +804,26 @@ app.get('/api/rh/movimientos', requireAuth, requirePermiso('rh.movimientos.ver')
         const movimientos = await db.collection('rh_movimientos')
             .find(query).sort({ createdAt: -1 }).limit(200).toArray();
         res.json(movimientos);
-    } catch (error) {
-        res.status(500).json({ error: 'Error obteniendo movimientos RH' });
-    }
+    } catch (error) { res.status(500).json({ error: 'Error obteniendo movimientos RH' }); }
 });
 
 app.post('/api/rh/movimientos', requireAuth, requirePermiso('rh.movimientos.crear'), async (req, res) => {
     try {
-        const movimiento = {
-            ...req.body,
-            creadoPor:  req.user.username,
-            createdAt:  new Date(),
-            estado:     'pendiente',
-        };
+        const movimiento = { ...req.body, creadoPor: req.user.username, createdAt: new Date(), estado: 'pendiente' };
         await db.collection('rh_movimientos').insertOne(movimiento);
         res.status(201).json({ success: true, movimiento });
-    } catch (error) {
-        res.status(500).json({ error: 'Error creando movimiento RH' });
-    }
+    } catch (error) { res.status(500).json({ error: 'Error creando movimiento RH' }); }
+});
+
+app.put('/api/rh/movimientos/:id', requireAuth, requirePermiso('rh.movimientos.gestionar'), async (req, res) => {
+    try {
+        const result = await db.collection('rh_movimientos').updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $set: { ...req.body, updatedAt: new Date(), updatedBy: req.user.username } }
+        );
+        if (result.matchedCount === 0) return res.status(404).json({ error: 'Movimiento no encontrado' });
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: 'Error editando movimiento RH' }); }
 });
 
 app.patch('/api/rh/movimientos/:id/estado', requireAuth, requirePermiso('rh.movimientos.gestionar'), async (req, res) => {
@@ -996,34 +834,24 @@ app.patch('/api/rh/movimientos/:id/estado', requireAuth, requirePermiso('rh.movi
             { $set: { estado, comentario, updatedAt: new Date(), updatedBy: req.user.username } }
         );
         res.json({ success: true });
-    } catch (error) {
-        res.status(500).json({ error: 'Error actualizando movimiento RH' });
-    }
+    } catch (error) { res.status(500).json({ error: 'Error actualizando movimiento RH' }); }
 });
 
-// ── ACTIVOS MOVIMIENTOS ────────────────────────────────────
+// ── ACTIVOS ────────────────────────────────────────────────
 app.get('/api/activos/movimientos', requireAuth, requirePermiso('activos.ver'), async (req, res) => {
     try {
         const movimientos = await db.collection('activos_movimientos')
             .find({}).sort({ createdAt: -1 }).limit(500).toArray();
         res.json(movimientos);
-    } catch (error) {
-        res.status(500).json({ error: 'Error obteniendo activos' });
-    }
+    } catch (error) { res.status(500).json({ error: 'Error obteniendo activos' }); }
 });
 
 app.post('/api/activos/movimientos', requireAuth, requirePermiso('activos.registrar'), async (req, res) => {
     try {
-        const movimiento = {
-            ...req.body,
-            creadoPor:  req.user.username,
-            createdAt:  new Date(),
-        };
+        const movimiento = { ...req.body, creadoPor: req.user.username, createdAt: new Date() };
         await db.collection('activos_movimientos').insertOne(movimiento);
         res.status(201).json({ success: true, movimiento });
-    } catch (error) {
-        res.status(500).json({ error: 'Error registrando activo' });
-    }
+    } catch (error) { res.status(500).json({ error: 'Error registrando activo' }); }
 });
 
 // ── DISPOSITIVOS ────────────────────────────────────────────
@@ -1031,30 +859,81 @@ app.get('/api/devices', requireAuth, requirePermiso('dashboard.dispositivos'), a
     try {
         const devices = await db.collection('dispositivos').find({}).toArray();
         res.json(devices);
-    } catch (error) {
-        res.status(500).json({ error: 'Error obteniendo dispositivos' });
-    }
+    } catch (error) { res.status(500).json({ error: 'Error obteniendo dispositivos' }); }
 });
 
-// ── FORMATOS (ACTIVACIÓN) ──────────────────────────────────
+// ── FORMATOS ───────────────────────────────────────────────
 app.get('/api/formatos/sistemas', requireAuth, requirePermiso('formatos.generar'), async (req, res) => {
     try {
         const sistemas = await db.collection('formatos_sistemas').find({ activo: true }).toArray();
         res.json(sistemas);
-    } catch (error) {
-        res.status(500).json({ error: 'Error obteniendo sistemas' });
+    } catch (error) { res.status(500).json({ error: 'Error obteniendo sistemas' }); }
+});
+
+app.post('/api/formatos/generar', requireAuth, requirePermiso('formatos.generar'), async (req, res) => {
+    try {
+        const { sistema, userData } = req.body;
+        if (!sistema) return res.status(400).json({ error: 'Sistema requerido' });
+        const sistemaDoc = await db.collection('formatos_sistemas').findOne({ nombre: sistema, activo: true });
+        if (!sistemaDoc) return res.status(404).json({ error: `Sistema '${sistema}' no encontrado o inactivo` });
+        await db.collection('formatos_log').insertOne({
+            sistema, userData, solicitadoPor: req.user.username, createdAt: new Date(), estado: 'generado'
+        });
+        res.json({ success: true, sistema: sistemaDoc, userData });
+    } catch (e) { res.status(500).json({ error: 'Error generando formato' }); }
+});
+
+app.post('/api/formatos/clear-cache', requireAuth, requirePermiso('formatos.generar'), async (req, res) => {
+    res.json({ success: true, message: 'Caché de formatos limpiada' });
+});
+
+// ── CHAT (Proxy Anthropic) ──────────────────────────────────
+app.post('/api/chat', requireAuth, requirePermiso('chatbot.usar'), async (req, res) => {
+    try {
+        const { messages, system, max_tokens = 1000, temperature = 0.7 } = req.body;
+        if (!messages || !Array.isArray(messages) || messages.length === 0)
+            return res.status(400).json({ error: 'messages[] requerido' });
+
+        db.collection('chat_logs').insertOne({
+            username: req.user.username, messages: messages.slice(-3), createdAt: new Date()
+        }).catch(() => {});
+
+        const anthropicKey = process.env.ANTHROPIC_API_KEY;
+        if (anthropicKey) {
+            try {
+                const anthropicRes = await fetch('https://api.anthropic.com/v1/messages', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type':      'application/json',
+                        'x-api-key':         anthropicKey,
+                        'anthropic-version': '2023-06-01',
+                    },
+                    body: JSON.stringify({
+                        model:      'claude-3-haiku-20240307',
+                        max_tokens,
+                        system:     system || 'Eres un asistente del dashboard MYG Telecom. Responde en español de forma concisa y útil.',
+                        messages:   messages.map(m => ({ role: m.role, content: m.content })),
+                    }),
+                });
+                if (anthropicRes.ok) {
+                    const data = await anthropicRes.json();
+                    return res.json({ ...data, _provider: 'anthropic' });
+                }
+            } catch (aiErr) {
+                console.error('Anthropic error:', aiErr.message);
+            }
+        }
+        res.status(503).json({ error: 'IA no configurada. Configura ANTHROPIC_API_KEY en variables de entorno.' });
+    } catch (e) {
+        console.error('Error en /api/chat:', e);
+        res.status(500).json({ error: 'Error interno del chat' });
     }
 });
 
-
 // ============================================================
-// HUB SISTEMAS — Endpoints completos
-// Colecciones: hub_reuniones, hub_tareas, hub_minutas,
-//   hub_anuncios, hub_recursos, hub_guias, hub_plantillas,
-//   hub_capacitacion, hub_asistencia, hub_vacaciones
+// HUB SISTEMAS — Helpers genéricos CRUD
 // ============================================================
 
-// Helper genérico: evita repetir try/catch en cada endpoint
 function hubGet(col, perm) {
     return [requireAuth, requirePermiso(perm), async (req, res) => {
         try {
@@ -1101,21 +980,20 @@ function hubDelete(col, perm) {
     }];
 }
 
-// ── /api/hub/general — conteos + anuncios recientes ────────
+// ── Hub general ────────────────────────────────────────────
 app.get('/api/hub/general', requireAuth, requirePermiso('hub.acceso'), async (req, res) => {
     try {
         const limit = Math.min(parseInt(req.query.limit) || 100, 500);
-        const [reuniones, tareas, minutas, anuncios, recursos, guias, plantillas, capacitacion] =
-            await Promise.all([
-                db.collection('hub_reuniones').countDocuments(),
-                db.collection('hub_tareas').countDocuments(),
-                db.collection('hub_minutas').countDocuments(),
-                db.collection('hub_anuncios').countDocuments(),
-                db.collection('hub_recursos').countDocuments(),
-                db.collection('hub_guias').countDocuments(),
-                db.collection('hub_plantillas').countDocuments(),
-                db.collection('hub_capacitacion').countDocuments(),
-            ]);
+        const [reuniones, tareas, minutas, anuncios, recursos, guias, plantillas, capacitacion] = await Promise.all([
+            db.collection('hub_reuniones').countDocuments(),
+            db.collection('hub_tareas').countDocuments(),
+            db.collection('hub_minutas').countDocuments(),
+            db.collection('hub_anuncios').countDocuments(),
+            db.collection('hub_recursos').countDocuments(),
+            db.collection('hub_guias').countDocuments(),
+            db.collection('hub_plantillas').countDocuments(),
+            db.collection('hub_capacitacion').countDocuments(),
+        ]);
         const anunciosRecientes = await db.collection('hub_anuncios')
             .find({}).sort({ createdAt: -1 }).limit(limit).toArray();
         res.json({
@@ -1126,80 +1004,386 @@ app.get('/api/hub/general', requireAuth, requirePermiso('hub.acceso'), async (re
 });
 
 // ── Reuniones ──────────────────────────────────────────────
-app.get('/api/hub/reuniones',        ...hubGet   ('hub_reuniones',   'hub.reuniones'));
-app.post('/api/hub/reuniones',       ...hubPost  ('hub_reuniones',   'hub.reuniones'));
-app.patch('/api/hub/reuniones/:id',  ...hubPatch ('hub_reuniones',   'hub.reuniones'));
-app.delete('/api/hub/reuniones/:id', ...hubDelete('hub_reuniones',   'hub.reuniones'));
+app.get('/api/hub/reuniones',        ...hubGet   ('hub_reuniones', 'hub.reuniones'));
+app.post('/api/hub/reuniones',       ...hubPost  ('hub_reuniones', 'hub.reuniones'));
+app.patch('/api/hub/reuniones/:id',  ...hubPatch ('hub_reuniones', 'hub.reuniones'));
+app.delete('/api/hub/reuniones/:id', ...hubDelete('hub_reuniones', 'hub.reuniones'));
 
-// ── Tareas ─────────────────────────────────────────────────
-app.get('/api/hub/tareas',           ...hubGet   ('hub_tareas',      'hub.tareas'));
-app.post('/api/hub/tareas',          ...hubPost  ('hub_tareas',      'hub.tareas'));
-app.patch('/api/hub/tareas/:id',     ...hubPatch ('hub_tareas',      'hub.tareas'));
-app.delete('/api/hub/tareas/:id',    ...hubDelete('hub_tareas',      'hub.tareas'));
+// ============================================================
+// GENERAR MINUTA CON IA — POST /api/hub/reuniones/:id/generar-minuta
+// Cadena: Groq (Llama 3.3 70B) → Gemini 2.0 Flash → Reglas locales
+// ENV requerida: GROQ_API_KEY
+// ENV opcional:  GEMINI_API_KEY, AI_PROVIDER (forzar proveedor)
+// ============================================================
 
-// ── Minutas ────────────────────────────────────────────────
-app.get('/api/hub/minutas',          ...hubGet   ('hub_minutas',     'hub.minutas'));
-app.post('/api/hub/minutas',         ...hubPost  ('hub_minutas',     'hub.minutas'));
-app.patch('/api/hub/minutas/:id',    ...hubPatch ('hub_minutas',     'hub.minutas'));
-app.delete('/api/hub/minutas/:id',   ...hubDelete('hub_minutas',     'hub.minutas'));
+// ── Prompt compartido (mismo para todos los proveedores) ───
+const buildMinutaPrompt = ({ transcript, meetingTitle, meetingDate, meetingTime, attendees, agenda, duracion }) => {
+    const durMin      = Math.ceil((duracion || 0) / 60);
+    const asistentes  = Array.isArray(attendees) ? attendees.join(', ') : (attendees || 'No especificados');
+    const hasTranscript = transcript && transcript.trim().length > 30;
 
-// ── Anuncios ───────────────────────────────────────────────
-app.get('/api/hub/anuncios',         ...hubGet   ('hub_anuncios',    'hub.anuncios'));
-app.post('/api/hub/anuncios',        ...hubPost  ('hub_anuncios',    'hub.anuncios'));
-app.patch('/api/hub/anuncios/:id',   ...hubPatch ('hub_anuncios',    'hub.anuncios'));
-app.delete('/api/hub/anuncios/:id',  ...hubDelete('hub_anuncios',    'hub.anuncios'));
+    return {
+        system: `Eres un asistente corporativo de MYG Telecom especializado en redacción de minutas formales en español mexicano. Responde ÚNICAMENTE con JSON válido, sin backticks, sin texto previo ni posterior. Nunca inventes información que no esté en la transcripción.`,
 
-// ── Recursos ───────────────────────────────────────────────
-app.get('/api/hub/recursos',         ...hubGet   ('hub_recursos',    'hub.recursos'));
-app.post('/api/hub/recursos',        ...hubPost  ('hub_recursos',    'hub.recursos'));
-app.patch('/api/hub/recursos/:id',   ...hubPatch ('hub_recursos',    'hub.recursos'));
-app.delete('/api/hub/recursos/:id',  ...hubDelete('hub_recursos',    'hub.recursos'));
+        user: `Genera una minuta corporativa formal con estos datos:
 
-// ── Guías ──────────────────────────────────────────────────
-app.get('/api/hub/guias',            ...hubGet   ('hub_guias',       'hub.guias'));
-app.post('/api/hub/guias',           ...hubPost  ('hub_guias',       'hub.guias'));
-app.patch('/api/hub/guias/:id',      ...hubPatch ('hub_guias',       'hub.guias'));
-app.delete('/api/hub/guias/:id',     ...hubDelete('hub_guias',       'hub.guias'));
+REUNIÓN: ${meetingTitle || 'Reunión MYG Telecom'}
+FECHA: ${meetingDate || 'No especificada'} ${meetingTime ? 'a las ' + meetingTime : ''}
+DURACIÓN GRABADA: ${durMin} minuto(s)
+ASISTENTES: ${asistentes}
+AGENDA: ${agenda || 'No especificada'}
 
-// ── Plantillas ─────────────────────────────────────────────
-app.get('/api/hub/plantillas',           ...hubGet   ('hub_plantillas',  'hub.plantillas'));
-app.post('/api/hub/plantillas',          ...hubPost  ('hub_plantillas',  'hub.plantillas'));
-app.patch('/api/hub/plantillas/:id',     ...hubPatch ('hub_plantillas',  'hub.plantillas'));
-app.delete('/api/hub/plantillas/:id',    ...hubDelete('hub_plantillas',  'hub.plantillas'));
+TRANSCRIPCIÓN:
+${hasTranscript ? transcript.trim() : '(Sin transcripción suficiente — generar minuta base con los datos disponibles)'}
 
-// ── Capacitación ───────────────────────────────────────────
-app.get('/api/hub/capacitacion',         ...hubGet   ('hub_capacitacion','hub.capacitacion'));
-app.post('/api/hub/capacitacion',        ...hubPost  ('hub_capacitacion','hub.capacitacion'));
-app.patch('/api/hub/capacitacion/:id',   ...hubPatch ('hub_capacitacion','hub.capacitacion'));
-app.delete('/api/hub/capacitacion/:id',  ...hubDelete('hub_capacitacion','hub.capacitacion'));
+Responde con este JSON exacto (sin backticks ni texto adicional):
+{
+  "title": "Minuta: [título de la reunión]",
+  "resumen": "Párrafo de 3-5 oraciones resumiendo temas tratados y contexto.",
+  "decisions": "• Primera decisión\\n• Segunda decisión\\n(cadena vacía si no hay decisiones claras)",
+  "acciones": ["Responsable: descripción de acción", "Otro: descripción"],
+  "observaciones": "Notas adicionales, próxima reunión u observaciones. (cadena vacía si no aplica)"
+}`,
+    };
+};
 
-// ── Mensajes ───────────────────────────────────────────────
-// Mensajes genérico reemplazado por /:canal endpoints (ver abajo)
+// ── TIER 1: Groq (Llama 3.3 70B) ──────────────────────────
+const generarConGroq = async (promptData) => {
+    if (!Groq)                    throw new Error('groq-sdk no instalado');
+    if (!process.env.GROQ_API_KEY) throw new Error('GROQ_API_KEY no configurada');
+
+    const groq   = new Groq({ apiKey: process.env.GROQ_API_KEY });
+    const prompt = buildMinutaPrompt(promptData);
+
+    const completion = await groq.chat.completions.create({
+        model:       'llama-3.3-70b-versatile',
+        max_tokens:  1200,
+        temperature: 0.3,
+        messages: [
+            { role: 'system', content: prompt.system },
+            { role: 'user',   content: prompt.user   },
+        ],
+    });
+
+    const raw   = completion.choices[0]?.message?.content || '';
+    const clean = raw.replace(/```json\s*/gi, '').replace(/```\s*/gi, '').trim();
+    return JSON.parse(clean);
+};
+
+// ── TIER 2: Gemini 2.0 Flash ───────────────────────────────
+const generarConGemini = async (promptData) => {
+    if (!GoogleGenerativeAI)        throw new Error('@google/generative-ai no instalado');
+    if (!process.env.GEMINI_API_KEY) throw new Error('GEMINI_API_KEY no configurada');
+
+    // [FIX BUG-5] Cachear prompt para no construirlo dos veces
+    const prompt = buildMinutaPrompt(promptData);
+    const genAI  = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+    const model  = genAI.getGenerativeModel({
+        model: 'gemini-2.0-flash',
+        generationConfig: {
+            temperature:      0.3,
+            maxOutputTokens:  1200,
+            responseMimeType: 'application/json',
+        },
+        systemInstruction: prompt.system,
+    });
+
+    const result = await model.generateContent(prompt.user);
+    const raw    = result.response.text();
+    const clean  = raw.replace(/```json\s*/gi, '').replace(/```\s*/gi, '').trim();
+    return JSON.parse(clean);
+};
+
+// ── TIER 3: Reglas locales (NLP extractivo, sin dependencias) ─
+const generarConReglasLocales = (promptData) => {
+    const { transcript, meetingTitle, meetingDate, meetingTime, attendees, duracion } = promptData;
+    const durMin = Math.ceil((duracion || 0) / 60);
+
+    const oraciones = (transcript || '')
+        .split(/[.!?;]\s+/)
+        .map(s => s.trim())
+        .filter(s => s.length > 15);
+
+    // Detectar decisiones
+    const patronesDecision = [
+        /\bse (decide|acuerda|aprueba|resuelve|determina|establece)\b/i,
+        /\bqueda (aprobado|acordado|establecido|definido)\b/i,
+        /\b(aprobamos?|acordamos?|decidimos?)\b/i,
+        /\bla decisión es\b/i,
+    ];
+    const decisiones = oraciones
+        .filter(o => patronesDecision.some(p => p.test(o)))
+        .slice(0, 5)
+        .map(d => `• ${d.charAt(0).toUpperCase() + d.slice(1)}.`);
+
+    // Detectar acciones pendientes
+    const patronesAccion = [
+        /\b(va|vamos|tienen? que|necesita[mn]?|debe[n]?|hay que|se requiere)\b.*\b(hacer|entregar|revisar|actualizar|preparar|enviar|completar)\b/i,
+        /\b(entregar|mandar|enviar|revisar|actualizar|preparar|completar)\b/i,
+        /\b(pendiente|tarea|acción)\b/i,
+    ];
+    const acciones = oraciones
+        .filter(o => patronesAccion.some(p => p.test(o)))
+        .slice(0, 6)
+        .map(a => a.charAt(0).toUpperCase() + a.slice(1) + '.');
+
+    // Resumen extractivo: top 5 oraciones más informativas
+    const stopwords = new Set(['el','la','los','las','un','una','de','del','en','y','a','que','se','es','no','con','por','para','como','más','pero','ya','lo','le','su','sus','fue','han','hay','muy','también','si','me','te','mi','tu','al']);
+    const score = s => {
+        const words = s.toLowerCase().split(/\s+/);
+        return new Set(words.filter(w => !stopwords.has(w) && w.length > 3)).size + (s.length > 60 ? 1 : 0);
+    };
+    const resumenOraciones = oraciones
+        .map(o => ({ text: o, score: score(o) }))
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 5)
+        .map(o => o.text.charAt(0).toUpperCase() + o.text.slice(1) + '.');
+
+    const resumen = resumenOraciones.length > 0
+        ? resumenOraciones.join(' ')
+        : `Reunión "${meetingTitle}" celebrada el ${meetingDate || 'fecha no especificada'} a las ${meetingTime || 'hora no especificada'}. Duración: ${durMin} min. Completa los detalles manualmente.`;
+
+    const patronesProxima = [/próxima (reunión|sesión|junta)|siguiente (reunión|sesión)|nos vemos|agendamos/i];
+    const obsCandidate    = oraciones.find(o => patronesProxima.some(p => p.test(o)));
+    const attendeesArr    = Array.isArray(attendees) ? attendees : [];
+
+    return {
+        title:         `Minuta: ${meetingTitle || 'Reunión'}`,
+        resumen,
+        decisions:     decisiones.join('\n') || '',
+        acciones:      acciones.length > 0 ? acciones : [],
+        observaciones: obsCandidate
+            ? obsCandidate.charAt(0).toUpperCase() + obsCandidate.slice(1) + '.'
+            : `Reunión de ${durMin} min con ${attendeesArr.length} asistente(s). Revisa y completa esta minuta.`,
+    };
+};
+
+// ── Orquestador con fallback ───────────────────────────────
+const generarMinutaConFallback = async (promptData) => {
+    const forced = process.env.AI_PROVIDER; // groq | gemini | local (para debug)
+
+    const cadena = [
+        { nombre: 'groq',   fn: generarConGroq,           activo: !forced || forced === 'groq',   tiene_key: !!process.env.GROQ_API_KEY },
+        { nombre: 'gemini', fn: generarConGemini,         activo: !forced || forced === 'gemini', tiene_key: !!process.env.GEMINI_API_KEY },
+        { nombre: 'local',  fn: async d => generarConReglasLocales(d), activo: true, tiene_key: true },
+    ];
+
+    let ultimoError = null;
+
+    for (const proveedor of cadena) {
+        if (!proveedor.activo || !proveedor.tiene_key) {
+            console.log(`[MinutaIA] Saltando ${proveedor.nombre}: ${!proveedor.activo ? 'forzado otro' : 'sin API key'}`);
+            continue;
+        }
+        try {
+            console.log(`[MinutaIA] Intentando con: ${proveedor.nombre.toUpperCase()}`);
+            const t0     = Date.now();
+            const result = await proveedor.fn(promptData);
+            const ms     = Date.now() - t0;
+
+            if (!result || typeof result !== 'object') throw new Error('Respuesta inválida del proveedor');
+
+            console.log(`[MinutaIA] ✅ ${proveedor.nombre.toUpperCase()} respondió en ${ms}ms`);
+            result._proveedor = proveedor.nombre;
+            result._ms        = ms;
+            return result;
+
+        } catch (err) {
+            console.warn(`[MinutaIA] ❌ ${proveedor.nombre.toUpperCase()} falló: ${err.message}`);
+            ultimoError = err;
+            // Esperar 2s si es rate limit antes de intentar el siguiente
+            if (err.status === 429 || err.message?.includes('rate_limit')) {
+                await new Promise(r => setTimeout(r, 2000));
+            }
+        }
+    }
+
+    throw ultimoError || new Error('Todos los proveedores fallaron');
+};
+
+// ── ENDPOINT: POST /api/hub/reuniones/:id/generar-minuta ───
+app.post('/api/hub/reuniones/:id/generar-minuta',
+    requireAuth, requirePermiso('hub.reuniones'),
+    async (req, res) => {
+        try {
+            const { id } = req.params;
+            const { transcript, meetingTitle, meetingDate, meetingTime, attendees, agenda, duracion } = req.body;
+
+            console.log(`[MinutaIA] Solicitud reunión=${id}, transcript=${(transcript || '').length}chars, usuario=${req.user.username}`);
+
+            const transcriptUtil = (transcript || '').trim();
+            const promptData     = { transcript: transcriptUtil, meetingTitle, meetingDate, meetingTime, attendees, agenda, duracion };
+
+            // Transcript muy corto → reglas locales directamente (no gastar quota de API)
+            if (transcriptUtil.length < 30) {
+                console.log('[MinutaIA] Transcript insuficiente → reglas locales');
+                const resultado = generarConReglasLocales(promptData);
+                return res.json({
+                    ...resultado,
+                    _aviso: 'Generado con análisis local (transcript insuficiente). Completa manualmente.',
+                });
+            }
+
+            // Ejecutar cadena de fallback
+            const resultado = await generarMinutaConFallback(promptData);
+
+            // Limpiar campos internos de debug antes de responder
+            const { _proveedor, _ms, ...minutaLimpia } = resultado;
+            console.log(`[MinutaIA] Respuesta enviada (proveedor: ${_proveedor}, ${_ms}ms)`);
+
+            if (_proveedor === 'local') {
+                minutaLimpia._aviso = 'Generado con análisis local. Revisa y completa los campos.';
+            }
+
+            return res.json(minutaLimpia);
+
+        } catch (err) {
+            console.error('[MinutaIA] Error crítico:', err.message);
+            return res.status(500).json({ error: `Error al generar minuta: ${err.message}` });
+        }
+    }
+);
+
+// ── Resto de colecciones del Hub ───────────────────────────
+app.get('/api/hub/tareas',           ...hubGet   ('hub_tareas',       'hub.tareas'));
+app.post('/api/hub/tareas',          ...hubPost  ('hub_tareas',       'hub.tareas'));
+app.patch('/api/hub/tareas/:id',     ...hubPatch ('hub_tareas',       'hub.tareas'));
+app.delete('/api/hub/tareas/:id',    ...hubDelete('hub_tareas',       'hub.tareas'));
+
+app.get('/api/hub/minutas',          ...hubGet   ('hub_minutas',      'hub.minutas'));
+app.post('/api/hub/minutas',         ...hubPost  ('hub_minutas',      'hub.minutas'));
+app.patch('/api/hub/minutas/:id',    ...hubPatch ('hub_minutas',      'hub.minutas'));
+app.delete('/api/hub/minutas/:id',   ...hubDelete('hub_minutas',      'hub.minutas'));
+
+app.get('/api/hub/anuncios',         ...hubGet   ('hub_anuncios',     'hub.anuncios'));
+app.post('/api/hub/anuncios',        ...hubPost  ('hub_anuncios',     'hub.anuncios'));
+app.patch('/api/hub/anuncios/:id',   ...hubPatch ('hub_anuncios',     'hub.anuncios'));
+app.delete('/api/hub/anuncios/:id',  ...hubDelete('hub_anuncios',     'hub.anuncios'));
+
+app.get('/api/hub/recursos',         ...hubGet   ('hub_recursos',     'hub.recursos'));
+app.post('/api/hub/recursos',        ...hubPost  ('hub_recursos',     'hub.recursos'));
+app.patch('/api/hub/recursos/:id',   ...hubPatch ('hub_recursos',     'hub.recursos'));
+app.delete('/api/hub/recursos/:id',  ...hubDelete('hub_recursos',     'hub.recursos'));
+
+app.get('/api/hub/guias',            ...hubGet   ('hub_guias',        'hub.guias'));
+app.post('/api/hub/guias',           ...hubPost  ('hub_guias',        'hub.guias'));
+app.patch('/api/hub/guias/:id',      ...hubPatch ('hub_guias',        'hub.guias'));
+app.delete('/api/hub/guias/:id',     ...hubDelete('hub_guias',        'hub.guias'));
+
+app.get('/api/hub/plantillas',       ...hubGet   ('hub_plantillas',   'hub.plantillas'));
+app.post('/api/hub/plantillas',      ...hubPost  ('hub_plantillas',   'hub.plantillas'));
+app.patch('/api/hub/plantillas/:id', ...hubPatch ('hub_plantillas',   'hub.plantillas'));
+app.delete('/api/hub/plantillas/:id',...hubDelete('hub_plantillas',   'hub.plantillas'));
+
+app.get('/api/hub/capacitacion',         ...hubGet   ('hub_capacitacion', 'hub.capacitacion'));
+app.post('/api/hub/capacitacion',        ...hubPost  ('hub_capacitacion', 'hub.capacitacion'));
+app.patch('/api/hub/capacitacion/:id',   ...hubPatch ('hub_capacitacion', 'hub.capacitacion'));
+app.delete('/api/hub/capacitacion/:id',  ...hubDelete('hub_capacitacion', 'hub.capacitacion'));
+
+// ── Mensajes por canal ─────────────────────────────────────
+app.get('/api/hub/mensajes/:canal', requireAuth, requirePermiso('hub.mensajes'), async (req, res) => {
+    try {
+        const { canal } = req.params;
+        const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+        const docs = await db.collection('hub_mensajes')
+            .find({ canal })
+            .sort({ createdAt: -1 })
+            .limit(limit)
+            .toArray();
+        res.json({ mensajes: docs.reverse() });
+    } catch (e) { res.status(500).json({ error: 'Error obteniendo mensajes' }); }
+});
+
+app.post('/api/hub/mensajes/:canal', requireAuth, requirePermiso('hub.mensajes'), async (req, res) => {
+    try {
+        const doc = {
+            ...req.body,
+            canal:       req.params.canal,
+            autor:       req.user.username,
+            autorNombre: req.user.nombre || req.user.username,
+            reactions:   [],
+            createdAt:   new Date(),
+        };
+        const result = await db.collection('hub_mensajes').insertOne(doc);
+        res.status(201).json({ success: true, id: result.insertedId, doc });
+    } catch (e) { res.status(500).json({ error: 'Error enviando mensaje' }); }
+});
+
+app.patch('/api/hub/mensajes/:id', requireAuth, requirePermiso('hub.mensajes'), async (req, res) => {
+    try {
+        await db.collection('hub_mensajes').updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $set: { ...req.body, editadoEn: new Date() } }
+        );
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: 'Error editando mensaje' }); }
+});
+
+app.delete('/api/hub/mensajes/:id', requireAuth, requirePermiso('hub.mensajes'), async (req, res) => {
+    try {
+        await db.collection('hub_mensajes').deleteOne({ _id: new ObjectId(req.params.id) });
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: 'Error eliminando mensaje' }); }
+});
+
+app.patch('/api/hub/mensajes/:id/reaction', requireAuth, requirePermiso('hub.mensajes'), async (req, res) => {
+    try {
+        const { emoji } = req.body;
+        const username  = req.user.username;
+        const msg = await db.collection('hub_mensajes').findOne({ _id: new ObjectId(req.params.id) });
+        if (!msg) return res.status(404).json({ error: 'Mensaje no encontrado' });
+
+        const reactions = msg.reactions || [];
+        const idx = reactions.findIndex(r => r.emoji === emoji && r.username === username);
+        if (idx >= 0) reactions.splice(idx, 1);
+        else reactions.push({ emoji, username, createdAt: new Date() });
+
+        await db.collection('hub_mensajes').updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $set: { reactions } }
+        );
+        res.json({ success: true, reactions });
+    } catch (e) { res.status(500).json({ error: 'Error en reaction' }); }
+});
+
+// ── Minutas — comentarios y acciones ──────────────────────
+app.post('/api/hub/minutas/:minutaId/comentarios', requireAuth, requirePermiso('hub.minutas'), async (req, res) => {
+    try {
+        const comentario = { ...req.body, autor: req.user.username, createdAt: new Date() };
+        await db.collection('hub_minutas').updateOne(
+            { _id: new ObjectId(req.params.minutaId) },
+            { $push: { comentarios: comentario } }
+        );
+        res.status(201).json({ success: true, comentario });
+    } catch (e) { res.status(500).json({ error: 'Error agregando comentario' }); }
+});
+
+app.patch('/api/hub/minutas/:minutaId/acciones/:itemId', requireAuth, requirePermiso('hub.minutas'), async (req, res) => {
+    try {
+        const updateFields = {};
+        Object.entries(req.body).forEach(([k, v]) => { updateFields[`acciones.$.${k}`] = v; });
+        updateFields['acciones.$.updatedAt'] = new Date();
+        await db.collection('hub_minutas').updateOne(
+            { _id: new ObjectId(req.params.minutaId), 'acciones._id': req.params.itemId },
+            { $set: updateFields }
+        );
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: 'Error actualizando acción' }); }
+});
 
 // ── Asistencia ─────────────────────────────────────────────
 app.get('/api/hub/asistencia', requireAuth, requirePermiso('hub.asistencia'), async (req, res) => {
     try {
         const filter = {};
-
-        // ── username: si no viene, usar el propio (a menos que sea admin/coordinador) ──
         if (req.query.username) {
             filter.username = req.query.username;
         } else if (!tienePermiso(req.user, 'hub.concentrado.ver')) {
-            // Usuarios sin permiso de concentrado solo ven sus propios registros
             filter.username = req.user.username;
         }
-
-        // ── mes: el frontend envía YYYY-MM, los docs guardan fecha: YYYY-MM-DD ──
-        // Usar $regex sobre el campo 'fecha' para filtrar por mes
-        if (req.query.mes) {
-            filter.fecha = { $regex: `^${req.query.mes}` };
-        }
+        if (req.query.mes) filter.fecha = { $regex: `^${req.query.mes}` };
 
         const docs = await db.collection('hub_asistencia')
-            .find(filter)
-            .sort({ fecha: -1, username: 1 })
-            .limit(500)
-            .toArray();
+            .find(filter).sort({ fecha: -1, username: 1 }).limit(500).toArray();
         res.json(docs);
     } catch (e) {
         console.error('Error GET asistencia:', e);
@@ -1208,30 +1392,20 @@ app.get('/api/hub/asistencia', requireAuth, requirePermiso('hub.asistencia'), as
 });
 
 app.post('/api/hub/asistencia', requireAuth, async (req, res) => {
-    // Permiso: hub.asistencia.registrar para propio, hub.asistencia.admin_registro para otros
     const { targetUsername, fecha, tipo, horaEntrada, horaSalida, notas } = req.body;
-
-    // Determinar username destino
     const esAdminReg = targetUsername && targetUsername !== req.user.username;
-    if (esAdminReg && !tienePermiso(req.user, 'hub.asistencia.admin_registro')) {
-        return res.status(403).json({ error: 'Permiso insuficiente: hub.asistencia.admin_registro' });
-    }
-    if (!esAdminReg && !tienePermiso(req.user, 'hub.asistencia.registrar')) {
-        return res.status(403).json({ error: 'Permiso insuficiente: hub.asistencia.registrar' });
-    }
 
+    if (esAdminReg && !tienePermiso(req.user, 'hub.asistencia.admin_registro'))
+        return res.status(403).json({ error: 'Permiso insuficiente: hub.asistencia.admin_registro' });
+    if (!esAdminReg && !tienePermiso(req.user, 'hub.asistencia.registrar'))
+        return res.status(403).json({ error: 'Permiso insuficiente: hub.asistencia.registrar' });
     if (!tipo) return res.status(400).json({ error: 'El campo tipo es requerido' });
 
     try {
         const usernameDestino = esAdminReg ? targetUsername : req.user.username;
-        // Usar la fecha del body o la de hoy
-        const fechaRegistro = fecha || new Date().toISOString().split('T')[0];
+        const fechaRegistro   = fecha || new Date().toISOString().split('T')[0];
 
-        // Anti-duplicado: misma fecha + mismo usuario
-        const existe = await db.collection('hub_asistencia').findOne({
-            username: usernameDestino,
-            fecha:    fechaRegistro,
-        });
+        const existe = await db.collection('hub_asistencia').findOne({ username: usernameDestino, fecha: fechaRegistro });
         if (existe) {
             return res.status(409).json({
                 error: `Ya existe un registro para ${usernameDestino} el ${fechaRegistro}`,
@@ -1240,21 +1414,60 @@ app.post('/api/hub/asistencia', requireAuth, async (req, res) => {
         }
 
         const doc = {
-            username:     usernameDestino,
-            fecha:        fechaRegistro,
-            tipo:         tipo,
-            horaEntrada:  horaEntrada  || '',
-            horaSalida:   horaSalida   || '',
-            notas:        notas        || '',
-            registradoPor: req.user.username,
-            createdAt:    new Date(),
+            username: usernameDestino, fecha: fechaRegistro, tipo,
+            horaEntrada: horaEntrada || '', horaSalida: horaSalida || '',
+            notas: notas || '', registradoPor: req.user.username, createdAt: new Date(),
         };
-
         await db.collection('hub_asistencia').insertOne(doc);
         res.status(201).json({ success: true, doc });
     } catch (e) {
         console.error('Error POST asistencia:', e);
         res.status(500).json({ error: 'Error registrando asistencia' });
+    }
+});
+
+app.patch('/api/hub/asistencia/:id', requireAuth, async (req, res) => {
+    try {
+        const doc = await db.collection('hub_asistencia').findOne({ _id: new ObjectId(req.params.id) });
+        if (!doc) return res.status(404).json({ error: 'Registro no encontrado' });
+
+        const esPropioUsuario = doc.username === req.user.username;
+        const tieneAdmin      = tienePermiso(req.user, 'hub.asistencia.admin_registro');
+        const tieneRegistrar  = tienePermiso(req.user, 'hub.asistencia.registrar');
+
+        if (!tieneAdmin && !(esPropioUsuario && tieneRegistrar))
+            return res.status(403).json({ error: 'No tienes permiso para editar este registro' });
+
+        const updates = { ...req.body };
+        if (!tieneAdmin) delete updates.username;
+        updates.updatedAt = new Date();
+        updates.updatedBy = req.user.username;
+
+        await db.collection('hub_asistencia').updateOne({ _id: new ObjectId(req.params.id) }, { $set: updates });
+        res.json({ success: true });
+    } catch (e) {
+        console.error('Error PATCH asistencia:', e);
+        res.status(500).json({ error: 'Error actualizando asistencia' });
+    }
+});
+
+app.delete('/api/hub/asistencia/:id', requireAuth, async (req, res) => {
+    try {
+        const doc = await db.collection('hub_asistencia').findOne({ _id: new ObjectId(req.params.id) });
+        if (!doc) return res.status(404).json({ error: 'Registro no encontrado' });
+
+        const esPropioUsuario = doc.username === req.user.username;
+        const tieneAdmin      = tienePermiso(req.user, 'hub.asistencia.admin_registro');
+        const tieneRegistrar  = tienePermiso(req.user, 'hub.asistencia.registrar');
+
+        if (!tieneAdmin && !(esPropioUsuario && tieneRegistrar))
+            return res.status(403).json({ error: 'No tienes permiso para eliminar este registro' });
+
+        await db.collection('hub_asistencia').deleteOne({ _id: new ObjectId(req.params.id) });
+        res.json({ success: true });
+    } catch (e) {
+        console.error('Error DELETE asistencia:', e);
+        res.status(500).json({ error: 'Error eliminando asistencia' });
     }
 });
 
@@ -1288,6 +1501,13 @@ app.patch('/api/hub/vacaciones/:id', requireAuth, requirePermiso('hub.peticiones
     } catch (e) { res.status(500).json({ error: 'Error actualizando vacaciones' }); }
 });
 
+app.delete('/api/hub/vacaciones/:id', requireAuth, requirePermiso('hub.peticiones.aprobar'), async (req, res) => {
+    try {
+        await db.collection('hub_vacaciones').deleteOne({ _id: new ObjectId(req.params.id) });
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: 'Error eliminando vacación' }); }
+});
+
 // ── Peticiones ─────────────────────────────────────────────
 app.get('/api/hub/peticiones', requireAuth, requirePermiso('hub.peticiones.ver_todas'), async (req, res) => {
     try {
@@ -1317,6 +1537,13 @@ app.patch('/api/hub/peticiones/:id', requireAuth, requirePermiso('hub.peticiones
     } catch (e) { res.status(500).json({ error: 'Error actualizando petición' }); }
 });
 
+app.delete('/api/hub/peticiones/:id', requireAuth, requirePermiso('hub.peticiones.aprobar'), async (req, res) => {
+    try {
+        await db.collection('hub_peticiones').deleteOne({ _id: new ObjectId(req.params.id) });
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: 'Error eliminando petición' }); }
+});
+
 // ── Concentrado ────────────────────────────────────────────
 app.get('/api/hub/concentrado', requireAuth, requirePermiso('hub.concentrado.ver'), async (req, res) => {
     try {
@@ -1328,314 +1555,28 @@ app.get('/api/hub/concentrado', requireAuth, requirePermiso('hub.concentrado.ver
     } catch (e) { res.status(500).json({ error: 'Error obteniendo concentrado' }); }
 });
 
-
-// ============================================================
-// ENDPOINTS FALTANTES — detectados por auditoría de frontend
-// ============================================================
-
-// ── GET /api/users/:username — perfil individual (perfil-modal.jsx) ──
+// ── Usuario individual ─────────────────────────────────────
 app.get('/api/users/:username', requireAuth, async (req, res) => {
     try {
         const { username } = req.params;
-        // Solo el propio usuario o ADMIN pueden ver el perfil completo
-        if (req.user.username !== username && req.user.rol !== 'ADMIN') {
+        if (req.user.username !== username && req.user.rol !== 'ADMIN')
             return res.status(403).json({ error: 'Acceso denegado' });
-        }
+
         const usuario = await db.collection('users').findOne(
             { username },
             { projection: { password: 0 } }
         );
         if (!usuario) return res.status(404).json({ error: 'Usuario no encontrado' });
         res.json({ ...usuario, rol: normalizarRol(usuario.rol) });
-    } catch (e) {
-        res.status(500).json({ error: 'Error obteniendo usuario' });
-    }
+    } catch (e) { res.status(500).json({ error: 'Error obteniendo usuario' }); }
 });
 
-// ── PUT /api/rh/movimientos/:id — editar movimiento completo (rh-frontend-component.jsx) ──
-app.put('/api/rh/movimientos/:id', requireAuth, requirePermiso('rh.movimientos.gestionar'), async (req, res) => {
-    try {
-        const result = await db.collection('rh_movimientos').updateOne(
-            { _id: new ObjectId(req.params.id) },
-            { $set: { ...req.body, updatedAt: new Date(), updatedBy: req.user.username } }
-        );
-        if (result.matchedCount === 0) return res.status(404).json({ error: 'Movimiento no encontrado' });
-        res.json({ success: true });
-    } catch (e) {
-        res.status(500).json({ error: 'Error editando movimiento RH' });
-    }
-});
-
-// ── /api/formatos/generar — POST generar formato de activación ──
-app.post('/api/formatos/generar', requireAuth, requirePermiso('formatos.generar'), async (req, res) => {
-    try {
-        const { sistema, userData } = req.body;
-        if (!sistema) return res.status(400).json({ error: 'Sistema requerido' });
-
-        // Obtener configuración del sistema desde MongoDB
-        const sistemaDoc = await db.collection('formatos_sistemas').findOne({ nombre: sistema, activo: true });
-        if (!sistemaDoc) return res.status(404).json({ error: `Sistema '${sistema}' no encontrado o inactivo` });
-
-        // Registrar solicitud de formato
-        await db.collection('formatos_log').insertOne({
-            sistema, userData, solicitadoPor: req.user.username,
-            createdAt: new Date(), estado: 'generado'
-        });
-
-        // Responder con datos del sistema para que el frontend genere el Excel
-        res.json({ success: true, sistema: sistemaDoc, userData });
-    } catch (e) {
-        res.status(500).json({ error: 'Error generando formato' });
-    }
-});
-
-// ── /api/formatos/clear-cache — POST limpiar caché de formatos ──
-app.post('/api/formatos/clear-cache', requireAuth, requirePermiso('formatos.generar'), async (req, res) => {
-    try {
-        res.json({ success: true, message: 'Caché de formatos limpiada' });
-    } catch (e) {
-        res.status(500).json({ error: 'Error limpiando caché' });
-    }
-});
-
-// ── /api/chat — POST proxy a Anthropic Claude ──────────────
-// El chatbot (dashboard-chatbot.jsx) envía:
-//   { messages: [...], system: "...", max_tokens: 1000, temperature: 0.7 }
-// El frontend acepta:
-//   - JSON: { content: [{ type: 'text', text: '...' }], _provider: 'anthropic' }
-//   - Streaming: text/event-stream (Anthropic format)
-//   - Si no hay IA: 503 → frontend activa modo local
-app.post('/api/chat', requireAuth, requirePermiso('chatbot.usar'), async (req, res) => {
-    try {
-        const { messages, system, max_tokens = 1000, temperature = 0.7 } = req.body;
-
-        if (!messages || !Array.isArray(messages) || messages.length === 0)
-            return res.status(400).json({ error: 'messages[] requerido' });
-
-        // Log asíncrono — no bloquea la respuesta
-        db.collection('chat_logs').insertOne({
-            username:  req.user.username,
-            messages:  messages.slice(-3), // últimos 3 para no saturar
-            createdAt: new Date(),
-        }).catch(() => {});
-
-        // ── Intentar proxy a Anthropic si hay API key ──────
-        const anthropicKey = process.env.ANTHROPIC_API_KEY;
-        if (anthropicKey) {
-            try {
-                const anthropicRes = await fetch('https://api.anthropic.com/v1/messages', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type':      'application/json',
-                        'x-api-key':         anthropicKey,
-                        'anthropic-version': '2023-06-01',
-                    },
-                    body: JSON.stringify({
-                        model:      'claude-3-haiku-20240307',
-                        max_tokens,
-                        system:     system || 'Eres un asistente del dashboard MYG Telecom. Responde en español de forma concisa y útil.',
-                        messages:   messages.map(m => ({ role: m.role, content: m.content })),
-                    }),
-                });
-
-                if (anthropicRes.ok) {
-                    const data = await anthropicRes.json();
-                    return res.json({ ...data, _provider: 'anthropic' });
-                }
-            } catch (aiErr) {
-                console.error('Anthropic error:', aiErr.message);
-                // Cae al fallback
-            }
-        }
-
-        // ── Sin IA configurada → 503 para activar modo local ──
-        res.status(503).json({ error: 'IA no configurada. Configura ANTHROPIC_API_KEY en variables de entorno.' });
-
-    } catch (e) {
-        console.error('Error en /api/chat:', e);
-        res.status(500).json({ error: 'Error interno del chat' });
-    }
-});
-
-// ── Hub Mensajes por canal — sistemas-hub.jsx usa /api/hub/mensajes/:canal ──
-// (reemplaza el genérico que solo tenía GET /api/hub/mensajes)
-app.get('/api/hub/mensajes/:canal', requireAuth, requirePermiso('hub.mensajes'), async (req, res) => {
-    try {
-        const { canal } = req.params;
-        const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-        const docs = await db.collection('hub_mensajes')
-            .find({ canal })
-            .sort({ createdAt: -1 })
-            .limit(limit)
-            .toArray();
-        res.json({ mensajes: docs.reverse() }); // Más recientes al final
-    } catch (e) { res.status(500).json({ error: 'Error obteniendo mensajes' }); }
-});
-
-app.post('/api/hub/mensajes/:canal', requireAuth, requirePermiso('hub.mensajes'), async (req, res) => {
-    try {
-        const doc = {
-            ...req.body,
-            canal:     req.params.canal,
-            autor:     req.user.username,
-            autorNombre: req.user.nombre || req.user.username,
-            reactions: [],
-            createdAt: new Date(),
-        };
-        const result = await db.collection('hub_mensajes').insertOne(doc);
-        res.status(201).json({ success: true, id: result.insertedId, doc });
-    } catch (e) { res.status(500).json({ error: 'Error enviando mensaje' }); }
-});
-
-app.patch('/api/hub/mensajes/:id', requireAuth, requirePermiso('hub.mensajes'), async (req, res) => {
-    try {
-        await db.collection('hub_mensajes').updateOne(
-            { _id: new ObjectId(req.params.id) },
-            { $set: { ...req.body, editadoEn: new Date() } }
-        );
-        res.json({ success: true });
-    } catch (e) { res.status(500).json({ error: 'Error editando mensaje' }); }
-});
-
-app.delete('/api/hub/mensajes/:id', requireAuth, requirePermiso('hub.mensajes'), async (req, res) => {
-    try {
-        await db.collection('hub_mensajes').deleteOne({ _id: new ObjectId(req.params.id) });
-        res.json({ success: true });
-    } catch (e) { res.status(500).json({ error: 'Error eliminando mensaje' }); }
-});
-
-// ── Reaction a mensaje ──────────────────────────────────────
-app.patch('/api/hub/mensajes/:id/reaction', requireAuth, requirePermiso('hub.mensajes'), async (req, res) => {
-    try {
-        const { emoji } = req.body;
-        const username = req.user.username;
-        const msg = await db.collection('hub_mensajes').findOne({ _id: new ObjectId(req.params.id) });
-        if (!msg) return res.status(404).json({ error: 'Mensaje no encontrado' });
-
-        const reactions = msg.reactions || [];
-        const idx = reactions.findIndex(r => r.emoji === emoji && r.username === username);
-        if (idx >= 0) {
-            reactions.splice(idx, 1); // Toggle: quitar si ya existe
-        } else {
-            reactions.push({ emoji, username, createdAt: new Date() });
-        }
-        await db.collection('hub_mensajes').updateOne(
-            { _id: new ObjectId(req.params.id) },
-            { $set: { reactions } }
-        );
-        res.json({ success: true, reactions });
-    } catch (e) { res.status(500).json({ error: 'Error en reaction' }); }
-});
-
-// ── Minutas — comentarios y acciones ──────────────────────
-app.post('/api/hub/minutas/:minutaId/comentarios', requireAuth, requirePermiso('hub.minutas'), async (req, res) => {
-    try {
-        const comentario = {
-            ...req.body,
-            autor:     req.user.username,
-            createdAt: new Date(),
-        };
-        await db.collection('hub_minutas').updateOne(
-            { _id: new ObjectId(req.params.minutaId) },
-            { $push: { comentarios: comentario } }
-        );
-        res.status(201).json({ success: true, comentario });
-    } catch (e) { res.status(500).json({ error: 'Error agregando comentario' }); }
-});
-
-app.patch('/api/hub/minutas/:minutaId/acciones/:itemId', requireAuth, requirePermiso('hub.minutas'), async (req, res) => {
-    try {
-        // Actualiza un item de acción dentro del array 'acciones' de la minuta
-        const updateFields = {};
-        Object.entries(req.body).forEach(([k, v]) => {
-            updateFields[`acciones.$.${k}`] = v;
-        });
-        updateFields['acciones.$.updatedAt'] = new Date();
-
-        await db.collection('hub_minutas').updateOne(
-            { _id: new ObjectId(req.params.minutaId), 'acciones._id': req.params.itemId },
-            { $set: updateFields }
-        );
-        res.json({ success: true });
-    } catch (e) { res.status(500).json({ error: 'Error actualizando acción' }); }
-});
-
-// ── Asistencia PATCH y DELETE ──────────────────────────────
-app.patch('/api/hub/asistencia/:id', requireAuth, async (req, res) => {
-    try {
-        const doc = await db.collection('hub_asistencia').findOne({ _id: new ObjectId(req.params.id) });
-        if (!doc) return res.status(404).json({ error: 'Registro no encontrado' });
-
-        // Puede editar: el propio usuario (con hub.asistencia.registrar) o admin (con admin_registro)
-        const esPropioUsuario = doc.username === req.user.username;
-        const tieneAdmin      = tienePermiso(req.user, 'hub.asistencia.admin_registro');
-        const tieneRegistrar  = tienePermiso(req.user, 'hub.asistencia.registrar');
-
-        if (!tieneAdmin && !(esPropioUsuario && tieneRegistrar)) {
-            return res.status(403).json({ error: 'No tienes permiso para editar este registro' });
-        }
-
-        // Evitar que usuarios normales cambien el username del registro
-        const updates = { ...req.body };
-        if (!tieneAdmin) delete updates.username;
-        updates.updatedAt = new Date();
-        updates.updatedBy = req.user.username;
-
-        await db.collection('hub_asistencia').updateOne(
-            { _id: new ObjectId(req.params.id) },
-            { $set: updates }
-        );
-        res.json({ success: true });
-    } catch (e) {
-        console.error('Error PATCH asistencia:', e);
-        res.status(500).json({ error: 'Error actualizando asistencia' });
-    }
-});
-
-app.delete('/api/hub/asistencia/:id', requireAuth, async (req, res) => {
-    try {
-        const doc = await db.collection('hub_asistencia').findOne({ _id: new ObjectId(req.params.id) });
-        if (!doc) return res.status(404).json({ error: 'Registro no encontrado' });
-
-        // Puede borrar: el propio usuario (con hub.asistencia.registrar) o admin
-        const esPropioUsuario = doc.username === req.user.username;
-        const tieneAdmin      = tienePermiso(req.user, 'hub.asistencia.admin_registro');
-        const tieneRegistrar  = tienePermiso(req.user, 'hub.asistencia.registrar');
-
-        if (!tieneAdmin && !(esPropioUsuario && tieneRegistrar)) {
-            return res.status(403).json({ error: 'No tienes permiso para eliminar este registro' });
-        }
-
-        await db.collection('hub_asistencia').deleteOne({ _id: new ObjectId(req.params.id) });
-        res.json({ success: true });
-    } catch (e) {
-        console.error('Error DELETE asistencia:', e);
-        res.status(500).json({ error: 'Error eliminando asistencia' });
-    }
-});
-
-// ── Vacaciones DELETE ──────────────────────────────────────
-app.delete('/api/hub/vacaciones/:id', requireAuth, requirePermiso('hub.peticiones.aprobar'), async (req, res) => {
-    try {
-        await db.collection('hub_vacaciones').deleteOne({ _id: new ObjectId(req.params.id) });
-        res.json({ success: true });
-    } catch (e) { res.status(500).json({ error: 'Error eliminando vacación' }); }
-});
-
-// ── Peticiones DELETE ──────────────────────────────────────
-app.delete('/api/hub/peticiones/:id', requireAuth, requirePermiso('hub.peticiones.aprobar'), async (req, res) => {
-    try {
-        await db.collection('hub_peticiones').deleteOne({ _id: new ObjectId(req.params.id) });
-        res.json({ success: true });
-    } catch (e) { res.status(500).json({ error: 'Error eliminando petición' }); }
-});
-
-// ── 404 Handler ────────────────────────────────────────────
+// ── 404 ────────────────────────────────────────────────────
 app.use('*', (req, res) => {
     res.status(404).json({ error: `Endpoint no encontrado: ${req.originalUrl}` });
 });
 
-// ── Error Handler ──────────────────────────────────────────
+// ── Error global ───────────────────────────────────────────
 app.use((err, req, res, next) => {
     console.error('Error no manejado:', err);
     res.status(500).json({ error: 'Error interno del servidor' });
@@ -1646,8 +1587,9 @@ async function start() {
     try {
         await connectDB();
         app.listen(PORT, () => {
-            console.log(`🚀 MYG API v4.0.0 corriendo en puerto ${PORT}`);
-            console.log(`📋 Roles disponibles: ${ROLES_VALIDOS.join(', ')}`);
+            console.log(`🚀 MYG API v4.1.1 corriendo en puerto ${PORT}`);
+            console.log(`📋 Roles: ${ROLES_VALIDOS.join(', ')}`);
+            console.log(`🤖 IA Minutas: Groq=${!!process.env.GROQ_API_KEY ? '✅' : '❌'} | Gemini=${!!process.env.GEMINI_API_KEY ? '✅' : '❌'} | Local=✅`);
         });
     } catch (err) {
         console.error('❌ Error iniciando servidor:', err);
