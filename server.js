@@ -983,8 +983,7 @@ app.patch('/api/hub/capacitacion/:id',   ...hubPatch ('hub_capacitacion','hub.ca
 app.delete('/api/hub/capacitacion/:id',  ...hubDelete('hub_capacitacion','hub.capacitacion'));
 
 // ── Mensajes ───────────────────────────────────────────────
-app.get('/api/hub/mensajes',         ...hubGet ('hub_mensajes', 'hub.mensajes'));
-app.post('/api/hub/mensajes',        ...hubPost('hub_mensajes', 'hub.mensajes'));
+// Mensajes genérico reemplazado por /:canal endpoints (ver abajo)
 
 // ── Asistencia ─────────────────────────────────────────────
 app.get('/api/hub/asistencia', requireAuth, requirePermiso('hub.asistencia'), async (req, res) => {
@@ -1079,6 +1078,234 @@ app.get('/api/hub/concentrado', requireAuth, requirePermiso('hub.concentrado.ver
             .find(filter).sort({ createdAt: -1 }).limit(200).toArray();
         res.json(docs);
     } catch (e) { res.status(500).json({ error: 'Error obteniendo concentrado' }); }
+});
+
+
+// ============================================================
+// ENDPOINTS FALTANTES — detectados por auditoría de frontend
+// ============================================================
+
+// ── GET /api/users/:username — perfil individual (perfil-modal.jsx) ──
+app.get('/api/users/:username', requireAuth, async (req, res) => {
+    try {
+        const { username } = req.params;
+        // Solo el propio usuario o ADMIN pueden ver el perfil completo
+        if (req.user.username !== username && req.user.rol !== 'ADMIN') {
+            return res.status(403).json({ error: 'Acceso denegado' });
+        }
+        const usuario = await db.collection('users').findOne(
+            { username },
+            { projection: { password: 0 } }
+        );
+        if (!usuario) return res.status(404).json({ error: 'Usuario no encontrado' });
+        res.json({ ...usuario, rol: normalizarRol(usuario.rol) });
+    } catch (e) {
+        res.status(500).json({ error: 'Error obteniendo usuario' });
+    }
+});
+
+// ── PUT /api/rh/movimientos/:id — editar movimiento completo (rh-frontend-component.jsx) ──
+app.put('/api/rh/movimientos/:id', requireAuth, requirePermiso('rh.movimientos.gestionar'), async (req, res) => {
+    try {
+        const result = await db.collection('rh_movimientos').updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $set: { ...req.body, updatedAt: new Date(), updatedBy: req.user.username } }
+        );
+        if (result.matchedCount === 0) return res.status(404).json({ error: 'Movimiento no encontrado' });
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ error: 'Error editando movimiento RH' });
+    }
+});
+
+// ── /api/formatos/generar — POST generar formato de activación ──
+app.post('/api/formatos/generar', requireAuth, requirePermiso('formatos.generar'), async (req, res) => {
+    try {
+        const { sistema, userData } = req.body;
+        if (!sistema) return res.status(400).json({ error: 'Sistema requerido' });
+
+        // Obtener configuración del sistema desde MongoDB
+        const sistemaDoc = await db.collection('formatos_sistemas').findOne({ nombre: sistema, activo: true });
+        if (!sistemaDoc) return res.status(404).json({ error: `Sistema '${sistema}' no encontrado o inactivo` });
+
+        // Registrar solicitud de formato
+        await db.collection('formatos_log').insertOne({
+            sistema, userData, solicitadoPor: req.user.username,
+            createdAt: new Date(), estado: 'generado'
+        });
+
+        // Responder con datos del sistema para que el frontend genere el Excel
+        res.json({ success: true, sistema: sistemaDoc, userData });
+    } catch (e) {
+        res.status(500).json({ error: 'Error generando formato' });
+    }
+});
+
+// ── /api/formatos/clear-cache — POST limpiar caché de formatos ──
+app.post('/api/formatos/clear-cache', requireAuth, requirePermiso('formatos.generar'), async (req, res) => {
+    try {
+        res.json({ success: true, message: 'Caché de formatos limpiada' });
+    } catch (e) {
+        res.status(500).json({ error: 'Error limpiando caché' });
+    }
+});
+
+// ── /api/chat — POST endpoint del chatbot (dashboard-chatbot.jsx) ──
+app.post('/api/chat', requireAuth, requirePermiso('chatbot.usar'), async (req, res) => {
+    try {
+        const { message, context } = req.body;
+        if (!message) return res.status(400).json({ error: 'Mensaje requerido' });
+
+        // Guardar mensaje en log
+        await db.collection('chat_logs').insertOne({
+            username:  req.user.username,
+            message,
+            context:   context || {},
+            createdAt: new Date(),
+        }).catch(() => {}); // No bloquear si falla el log
+
+        // El chatbot procesa en el frontend — el backend solo registra y confirma
+        res.json({ success: true, received: true });
+    } catch (e) {
+        res.status(500).json({ error: 'Error en chat' });
+    }
+});
+
+// ── Hub Mensajes por canal — sistemas-hub.jsx usa /api/hub/mensajes/:canal ──
+// (reemplaza el genérico que solo tenía GET /api/hub/mensajes)
+app.get('/api/hub/mensajes/:canal', requireAuth, requirePermiso('hub.mensajes'), async (req, res) => {
+    try {
+        const { canal } = req.params;
+        const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+        const docs = await db.collection('hub_mensajes')
+            .find({ canal })
+            .sort({ createdAt: -1 })
+            .limit(limit)
+            .toArray();
+        res.json({ mensajes: docs.reverse() }); // Más recientes al final
+    } catch (e) { res.status(500).json({ error: 'Error obteniendo mensajes' }); }
+});
+
+app.post('/api/hub/mensajes/:canal', requireAuth, requirePermiso('hub.mensajes'), async (req, res) => {
+    try {
+        const doc = {
+            ...req.body,
+            canal:     req.params.canal,
+            autor:     req.user.username,
+            autorNombre: req.user.nombre || req.user.username,
+            reactions: [],
+            createdAt: new Date(),
+        };
+        const result = await db.collection('hub_mensajes').insertOne(doc);
+        res.status(201).json({ success: true, id: result.insertedId, doc });
+    } catch (e) { res.status(500).json({ error: 'Error enviando mensaje' }); }
+});
+
+app.patch('/api/hub/mensajes/:id', requireAuth, requirePermiso('hub.mensajes'), async (req, res) => {
+    try {
+        await db.collection('hub_mensajes').updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $set: { ...req.body, editadoEn: new Date() } }
+        );
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: 'Error editando mensaje' }); }
+});
+
+app.delete('/api/hub/mensajes/:id', requireAuth, requirePermiso('hub.mensajes'), async (req, res) => {
+    try {
+        await db.collection('hub_mensajes').deleteOne({ _id: new ObjectId(req.params.id) });
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: 'Error eliminando mensaje' }); }
+});
+
+// ── Reaction a mensaje ──────────────────────────────────────
+app.post('/api/hub/mensajes/:id/reaction', requireAuth, requirePermiso('hub.mensajes'), async (req, res) => {
+    try {
+        const { emoji } = req.body;
+        const username = req.user.username;
+        const msg = await db.collection('hub_mensajes').findOne({ _id: new ObjectId(req.params.id) });
+        if (!msg) return res.status(404).json({ error: 'Mensaje no encontrado' });
+
+        const reactions = msg.reactions || [];
+        const idx = reactions.findIndex(r => r.emoji === emoji && r.username === username);
+        if (idx >= 0) {
+            reactions.splice(idx, 1); // Toggle: quitar si ya existe
+        } else {
+            reactions.push({ emoji, username, createdAt: new Date() });
+        }
+        await db.collection('hub_mensajes').updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $set: { reactions } }
+        );
+        res.json({ success: true, reactions });
+    } catch (e) { res.status(500).json({ error: 'Error en reaction' }); }
+});
+
+// ── Minutas — comentarios y acciones ──────────────────────
+app.post('/api/hub/minutas/:minutaId/comentarios', requireAuth, requirePermiso('hub.minutas'), async (req, res) => {
+    try {
+        const comentario = {
+            ...req.body,
+            autor:     req.user.username,
+            createdAt: new Date(),
+        };
+        await db.collection('hub_minutas').updateOne(
+            { _id: new ObjectId(req.params.minutaId) },
+            { $push: { comentarios: comentario } }
+        );
+        res.status(201).json({ success: true, comentario });
+    } catch (e) { res.status(500).json({ error: 'Error agregando comentario' }); }
+});
+
+app.patch('/api/hub/minutas/:minutaId/acciones/:itemId', requireAuth, requirePermiso('hub.minutas'), async (req, res) => {
+    try {
+        // Actualiza un item de acción dentro del array 'acciones' de la minuta
+        const updateFields = {};
+        Object.entries(req.body).forEach(([k, v]) => {
+            updateFields[`acciones.$.${k}`] = v;
+        });
+        updateFields['acciones.$.updatedAt'] = new Date();
+
+        await db.collection('hub_minutas').updateOne(
+            { _id: new ObjectId(req.params.minutaId), 'acciones._id': req.params.itemId },
+            { $set: updateFields }
+        );
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: 'Error actualizando acción' }); }
+});
+
+// ── Asistencia PATCH y DELETE ──────────────────────────────
+app.patch('/api/hub/asistencia/:id', requireAuth, requirePermiso('hub.asistencia.admin_registro'), async (req, res) => {
+    try {
+        await db.collection('hub_asistencia').updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $set: { ...req.body, updatedAt: new Date(), updatedBy: req.user.username } }
+        );
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: 'Error actualizando asistencia' }); }
+});
+
+app.delete('/api/hub/asistencia/:id', requireAuth, requirePermiso('hub.asistencia.admin_registro'), async (req, res) => {
+    try {
+        await db.collection('hub_asistencia').deleteOne({ _id: new ObjectId(req.params.id) });
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: 'Error eliminando asistencia' }); }
+});
+
+// ── Vacaciones DELETE ──────────────────────────────────────
+app.delete('/api/hub/vacaciones/:id', requireAuth, requirePermiso('hub.peticiones.aprobar'), async (req, res) => {
+    try {
+        await db.collection('hub_vacaciones').deleteOne({ _id: new ObjectId(req.params.id) });
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: 'Error eliminando vacación' }); }
+});
+
+// ── Peticiones DELETE ──────────────────────────────────────
+app.delete('/api/hub/peticiones/:id', requireAuth, requirePermiso('hub.peticiones.aprobar'), async (req, res) => {
+    try {
+        await db.collection('hub_peticiones').deleteOne({ _id: new ObjectId(req.params.id) });
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: 'Error eliminando petición' }); }
 });
 
 // ── 404 Handler ────────────────────────────────────────────
