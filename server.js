@@ -742,31 +742,175 @@ app.get('/api/admin/form-submissions', requireAuth, requireAdmin, async (req, re
     }
 });
 
-// ── NOTIFICACIONES ─────────────────────────────────────────
+
+// ============================================================
+// NOTIFICACIONES — CRUD COMPLETO + SSE (Server-Sent Events)
+// ============================================================
+
+// Mapa de clientes SSE activos: username → Set<res>
+const sseClients = new Map();
+
+function sseAdd(username, res) {
+    if (!sseClients.has(username)) sseClients.set(username, new Set());
+    sseClients.get(username).add(res);
+}
+
+function sseRemove(username, res) {
+    sseClients.get(username)?.delete(res);
+}
+
+function ssePush(username, evento, datos) {
+    const targets = new Set();
+    if (username === '*') {
+        // Broadcast a todos los conectados
+        sseClients.forEach(set => set.forEach(r => targets.add(r)));
+    } else {
+        sseClients.get(username)?.forEach(r => targets.add(r));
+        sseClients.get('*')?.forEach(r => targets.add(r)); // canales globales
+    }
+    const payload = `event: notificacion
+data: ${JSON.stringify({ ...datos, _ts: Date.now() })}
+
+`;
+    targets.forEach(r => {
+        try { r.write(payload); } catch { /* cliente desconectado */ }
+    });
+}
+
+// ── GET /api/notificaciones/sse — conexión SSE tiempo real ──
+// IMPORTANTE: va ANTES de GET /api/notificaciones para evitar conflicto de rutas
+app.get('/api/notificaciones/sse', requireAuth, (req, res) => {
+    res.setHeader('Content-Type',  'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection',    'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no'); // Nginx / Render: deshabilitar buffering
+    res.flushHeaders();
+
+    const username = req.user.username;
+    sseAdd(username, res);
+
+    // Enviar evento de conexión inicial
+    res.write(`event: connected
+data: ${JSON.stringify({ status: 'ok', username })}
+
+`);
+
+    // Heartbeat cada 25s para que Render / CF no cierre la conexión idle
+    const heartbeat = setInterval(() => {
+        try { res.write(`: heartbeat
+
+`); } catch { clearInterval(heartbeat); }
+    }, 25000);
+
+    req.on('close', () => {
+        clearInterval(heartbeat);
+        sseRemove(username, res);
+    });
+});
+
+// ── GET /api/notificaciones ────────────────────────────────
+// (ya existía, pero se reutiliza el handler con respuesta normalizada)
+
+// ── POST /api/notificaciones — crear y hacer push SSE ─────
+app.post('/api/notificaciones', requireAuth, async (req, res) => {
+    try {
+        const { titulo, mensaje, tipo = 'info', icono, tab_destino,
+                subtab, usuario_destino } = req.body;
+
+        if (!titulo || !mensaje)
+            return res.status(400).json({ error: 'titulo y mensaje son requeridos' });
+
+        const notif = {
+            titulo,
+            mensaje,
+            tipo,
+            icono:           icono       || null,
+            tab_destino:     tab_destino || null,
+            subtab:          subtab      || null,
+            usuario_destino: usuario_destino || req.user.username,
+            creadaPor:       req.user.username,
+            leida:           false,
+            createdAt:       new Date(),
+        };
+
+        const result = await db.collection('notificaciones').insertOne(notif);
+        notif._id = result.insertedId;
+
+        // Push SSE instantáneo
+        ssePush(notif.usuario_destino, 'notificacion', notif);
+
+        res.status(201).json({ success: true, notificacion: notif });
+    } catch (e) {
+        res.status(500).json({ error: 'Error creando notificación' });
+    }
+});
+
+// ── PATCH /api/notificaciones/leer-todas ──────────────────
+// IMPORTANTE: va ANTES de /:id/leer para evitar que 'leer-todas' se interprete como :id
+app.patch('/api/notificaciones/leer-todas', requireAuth, async (req, res) => {
+    try {
+        await db.collection('notificaciones').updateMany(
+            { $or: [{ username: req.user.username }, { usuario_destino: req.user.username }], leida: false },
+            { $set: { leida: true, leidaEn: new Date() } }
+        );
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ error: 'Error marcando notificaciones' });
+    }
+});
+
+// ── DELETE /api/notificaciones — limpiar leídas del usuario ─
+app.delete('/api/notificaciones', requireAuth, async (req, res) => {
+    try {
+        const result = await db.collection('notificaciones').deleteMany({
+            $or: [
+                { username:         req.user.username },
+                { usuario_destino:  req.user.username },
+            ],
+            leida: true,
+        });
+        res.json({ success: true, eliminadas: result.deletedCount });
+    } catch (e) {
+        res.status(500).json({ error: 'Error eliminando notificaciones' });
+    }
+});
+
+// ── GET /api/admin/permissions/roles — permisos base por rol ──
+app.get('/api/admin/permissions/roles', requireAuth, requireAdmin, async (req, res) => {
+    try {
+        res.json({
+            roles:             ROLES_VALIDOS,
+            areasValidas:      AREAS_VALIDAS,
+            rolesConArea:      ROLES_CON_AREA,
+            modulosDisponibles: MODULOS_PERMISOS,
+            permisosDefault:   ROL_PERMISOS_DEFAULT,
+        });
+    } catch (e) {
+        res.status(500).json({ error: 'Error obteniendo permisos por rol' });
+    }
+});
+
+// ── NOTIFICACIONES — GET (reemplazado por bloque completo arriba) ──
 app.get('/api/notificaciones', requireAuth, async (req, res) => {
     try {
         const { username } = req.user;
         const notifs = await db.collection('notificaciones')
-            .find({ $or: [{ username }, { username: 'all' }] })
+            .find({ $or: [{ username }, { usuario_destino: username }, { usuario_destino: '*' }] })
             .sort({ createdAt: -1 })
-            .limit(30)
+            .limit(50)
             .toArray();
-        res.json(notifs);
-    } catch (error) {
-        res.status(500).json({ error: 'Error obteniendo notificaciones' });
-    }
+        res.json({ notificaciones: notifs });
+    } catch (e) { res.status(500).json({ error: 'Error obteniendo notificaciones' }); }
 });
 
 app.patch('/api/notificaciones/:id/leer', requireAuth, async (req, res) => {
     try {
         await db.collection('notificaciones').updateOne(
             { _id: new ObjectId(req.params.id) },
-            { $set: { leida: true } }
+            { $set: { leida: true, leidaEn: new Date() } }
         );
         res.json({ success: true });
-    } catch (error) {
-        res.status(500).json({ error: 'Error marcando notificación' });
-    }
+    } catch (e) { res.status(500).json({ error: 'Error marcando notificación' }); }
 });
 
 // ── RH MOVIMIENTOS ─────────────────────────────────────────
@@ -1150,24 +1294,62 @@ app.post('/api/formatos/clear-cache', requireAuth, requirePermiso('formatos.gene
     }
 });
 
-// ── /api/chat — POST endpoint del chatbot (dashboard-chatbot.jsx) ──
+// ── /api/chat — POST proxy a Anthropic Claude ──────────────
+// El chatbot (dashboard-chatbot.jsx) envía:
+//   { messages: [...], system: "...", max_tokens: 1000, temperature: 0.7 }
+// El frontend acepta:
+//   - JSON: { content: [{ type: 'text', text: '...' }], _provider: 'anthropic' }
+//   - Streaming: text/event-stream (Anthropic format)
+//   - Si no hay IA: 503 → frontend activa modo local
 app.post('/api/chat', requireAuth, requirePermiso('chatbot.usar'), async (req, res) => {
     try {
-        const { message, context } = req.body;
-        if (!message) return res.status(400).json({ error: 'Mensaje requerido' });
+        const { messages, system, max_tokens = 1000, temperature = 0.7 } = req.body;
 
-        // Guardar mensaje en log
-        await db.collection('chat_logs').insertOne({
+        if (!messages || !Array.isArray(messages) || messages.length === 0)
+            return res.status(400).json({ error: 'messages[] requerido' });
+
+        // Log asíncrono — no bloquea la respuesta
+        db.collection('chat_logs').insertOne({
             username:  req.user.username,
-            message,
-            context:   context || {},
+            messages:  messages.slice(-3), // últimos 3 para no saturar
             createdAt: new Date(),
-        }).catch(() => {}); // No bloquear si falla el log
+        }).catch(() => {});
 
-        // El chatbot procesa en el frontend — el backend solo registra y confirma
-        res.json({ success: true, received: true });
+        // ── Intentar proxy a Anthropic si hay API key ──────
+        const anthropicKey = process.env.ANTHROPIC_API_KEY;
+        if (anthropicKey) {
+            try {
+                const anthropicRes = await fetch('https://api.anthropic.com/v1/messages', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type':      'application/json',
+                        'x-api-key':         anthropicKey,
+                        'anthropic-version': '2023-06-01',
+                    },
+                    body: JSON.stringify({
+                        model:      'claude-3-haiku-20240307',
+                        max_tokens,
+                        system:     system || 'Eres un asistente del dashboard MYG Telecom. Responde en español de forma concisa y útil.',
+                        messages:   messages.map(m => ({ role: m.role, content: m.content })),
+                    }),
+                });
+
+                if (anthropicRes.ok) {
+                    const data = await anthropicRes.json();
+                    return res.json({ ...data, _provider: 'anthropic' });
+                }
+            } catch (aiErr) {
+                console.error('Anthropic error:', aiErr.message);
+                // Cae al fallback
+            }
+        }
+
+        // ── Sin IA configurada → 503 para activar modo local ──
+        res.status(503).json({ error: 'IA no configurada. Configura ANTHROPIC_API_KEY en variables de entorno.' });
+
     } catch (e) {
-        res.status(500).json({ error: 'Error en chat' });
+        console.error('Error en /api/chat:', e);
+        res.status(500).json({ error: 'Error interno del chat' });
     }
 });
 
