@@ -78,6 +78,12 @@ async function connectDB() {
         await db.collection('users').createIndex({ username: 1 }, { unique: true });
         await db.collection('access_logs').createIndex({ timestamp: 1 }, { expireAfterSeconds: 30 * 24 * 3600 });
         await db.collection('notificaciones').createIndex({ username: 1, leida: 1 });
+        await db.collection('notificaciones').createIndex({ usuario_destino: 1, leida: 1 });
+        // Índice compuesto para asistencia: queries por username+fecha son los más frecuentes
+        await db.collection('hub_asistencia').createIndex({ username: 1, fecha: 1 }, { unique: true });
+        await db.collection('hub_asistencia').createIndex({ fecha: 1 });
+        // Índice para mensajes del hub por canal
+        await db.collection('hub_mensajes').createIndex({ canal: 1, createdAt: -1 });
 
         return client;
     } catch (error) {
@@ -215,6 +221,18 @@ function calcularPermisos(usuario) {
     const set = new Set([...base, ...extra]);
     revoked.forEach(p => set.delete(p));
     return Array.from(set);
+}
+
+/**
+ * Verifica si un usuario (req.user del JWT) tiene un permiso específico.
+ * Usado en handlers que necesitan lógica condicional de permisos.
+ */
+function tienePermiso(user, permiso) {
+    if (!user) return false;
+    const permisos = user.permisos || [];
+    if (permisos.includes('*')) return true;
+    if (user.rol === 'ADMIN') return true;
+    return permisos.includes(permiso);
 }
 
 // ── Schemas Joi v4.0 ───────────────────────────────────────
@@ -1135,25 +1153,82 @@ app.delete('/api/hub/capacitacion/:id',  ...hubDelete('hub_capacitacion','hub.ca
 app.get('/api/hub/asistencia', requireAuth, requirePermiso('hub.asistencia'), async (req, res) => {
     try {
         const filter = {};
-        if (req.query.username) filter.username = req.query.username;
-        if (req.query.mes)      filter.mes      = req.query.mes;
+
+        // ── username: si no viene, usar el propio (a menos que sea admin/coordinador) ──
+        if (req.query.username) {
+            filter.username = req.query.username;
+        } else if (!tienePermiso(req.user, 'hub.concentrado.ver')) {
+            // Usuarios sin permiso de concentrado solo ven sus propios registros
+            filter.username = req.user.username;
+        }
+
+        // ── mes: el frontend envía YYYY-MM, los docs guardan fecha: YYYY-MM-DD ──
+        // Usar $regex sobre el campo 'fecha' para filtrar por mes
+        if (req.query.mes) {
+            filter.fecha = { $regex: `^${req.query.mes}` };
+        }
+
         const docs = await db.collection('hub_asistencia')
-            .find(filter).sort({ fecha: -1 }).limit(200).toArray();
+            .find(filter)
+            .sort({ fecha: -1, username: 1 })
+            .limit(500)
+            .toArray();
         res.json(docs);
-    } catch (e) { res.status(500).json({ error: 'Error obteniendo asistencia' }); }
+    } catch (e) {
+        console.error('Error GET asistencia:', e);
+        res.status(500).json({ error: 'Error obteniendo asistencia' });
+    }
 });
 
-app.post('/api/hub/asistencia', requireAuth, requirePermiso('hub.asistencia.registrar'), async (req, res) => {
+app.post('/api/hub/asistencia', requireAuth, async (req, res) => {
+    // Permiso: hub.asistencia.registrar para propio, hub.asistencia.admin_registro para otros
+    const { targetUsername, fecha, tipo, horaEntrada, horaSalida, notas } = req.body;
+
+    // Determinar username destino
+    const esAdminReg = targetUsername && targetUsername !== req.user.username;
+    if (esAdminReg && !tienePermiso(req.user, 'hub.asistencia.admin_registro')) {
+        return res.status(403).json({ error: 'Permiso insuficiente: hub.asistencia.admin_registro' });
+    }
+    if (!esAdminReg && !tienePermiso(req.user, 'hub.asistencia.registrar')) {
+        return res.status(403).json({ error: 'Permiso insuficiente: hub.asistencia.registrar' });
+    }
+
+    if (!tipo) return res.status(400).json({ error: 'El campo tipo es requerido' });
+
     try {
-        const hoy = new Date().toISOString().split('T')[0];
+        const usernameDestino = esAdminReg ? targetUsername : req.user.username;
+        // Usar la fecha del body o la de hoy
+        const fechaRegistro = fecha || new Date().toISOString().split('T')[0];
+
+        // Anti-duplicado: misma fecha + mismo usuario
         const existe = await db.collection('hub_asistencia').findOne({
-            username: req.user.username, fecha: hoy
+            username: usernameDestino,
+            fecha:    fechaRegistro,
         });
-        if (existe) return res.status(409).json({ error: 'Ya registraste asistencia hoy' });
-        const doc = { ...req.body, username: req.user.username, fecha: hoy, createdAt: new Date() };
+        if (existe) {
+            return res.status(409).json({
+                error: `Ya existe un registro para ${usernameDestino} el ${fechaRegistro}`,
+                existingId: existe._id,
+            });
+        }
+
+        const doc = {
+            username:     usernameDestino,
+            fecha:        fechaRegistro,
+            tipo:         tipo,
+            horaEntrada:  horaEntrada  || '',
+            horaSalida:   horaSalida   || '',
+            notas:        notas        || '',
+            registradoPor: req.user.username,
+            createdAt:    new Date(),
+        };
+
         await db.collection('hub_asistencia').insertOne(doc);
         res.status(201).json({ success: true, doc });
-    } catch (e) { res.status(500).json({ error: 'Error registrando asistencia' }); }
+    } catch (e) {
+        console.error('Error POST asistencia:', e);
+        res.status(500).json({ error: 'Error registrando asistencia' });
+    }
 });
 
 // ── Vacaciones ─────────────────────────────────────────────
@@ -1459,21 +1534,57 @@ app.patch('/api/hub/minutas/:minutaId/acciones/:itemId', requireAuth, requirePer
 });
 
 // ── Asistencia PATCH y DELETE ──────────────────────────────
-app.patch('/api/hub/asistencia/:id', requireAuth, requirePermiso('hub.asistencia.admin_registro'), async (req, res) => {
+app.patch('/api/hub/asistencia/:id', requireAuth, async (req, res) => {
     try {
+        const doc = await db.collection('hub_asistencia').findOne({ _id: new ObjectId(req.params.id) });
+        if (!doc) return res.status(404).json({ error: 'Registro no encontrado' });
+
+        // Puede editar: el propio usuario (con hub.asistencia.registrar) o admin (con admin_registro)
+        const esPropioUsuario = doc.username === req.user.username;
+        const tieneAdmin      = tienePermiso(req.user, 'hub.asistencia.admin_registro');
+        const tieneRegistrar  = tienePermiso(req.user, 'hub.asistencia.registrar');
+
+        if (!tieneAdmin && !(esPropioUsuario && tieneRegistrar)) {
+            return res.status(403).json({ error: 'No tienes permiso para editar este registro' });
+        }
+
+        // Evitar que usuarios normales cambien el username del registro
+        const updates = { ...req.body };
+        if (!tieneAdmin) delete updates.username;
+        updates.updatedAt = new Date();
+        updates.updatedBy = req.user.username;
+
         await db.collection('hub_asistencia').updateOne(
             { _id: new ObjectId(req.params.id) },
-            { $set: { ...req.body, updatedAt: new Date(), updatedBy: req.user.username } }
+            { $set: updates }
         );
         res.json({ success: true });
-    } catch (e) { res.status(500).json({ error: 'Error actualizando asistencia' }); }
+    } catch (e) {
+        console.error('Error PATCH asistencia:', e);
+        res.status(500).json({ error: 'Error actualizando asistencia' });
+    }
 });
 
-app.delete('/api/hub/asistencia/:id', requireAuth, requirePermiso('hub.asistencia.admin_registro'), async (req, res) => {
+app.delete('/api/hub/asistencia/:id', requireAuth, async (req, res) => {
     try {
+        const doc = await db.collection('hub_asistencia').findOne({ _id: new ObjectId(req.params.id) });
+        if (!doc) return res.status(404).json({ error: 'Registro no encontrado' });
+
+        // Puede borrar: el propio usuario (con hub.asistencia.registrar) o admin
+        const esPropioUsuario = doc.username === req.user.username;
+        const tieneAdmin      = tienePermiso(req.user, 'hub.asistencia.admin_registro');
+        const tieneRegistrar  = tienePermiso(req.user, 'hub.asistencia.registrar');
+
+        if (!tieneAdmin && !(esPropioUsuario && tieneRegistrar)) {
+            return res.status(403).json({ error: 'No tienes permiso para eliminar este registro' });
+        }
+
         await db.collection('hub_asistencia').deleteOne({ _id: new ObjectId(req.params.id) });
         res.json({ success: true });
-    } catch (e) { res.status(500).json({ error: 'Error eliminando asistencia' }); }
+    } catch (e) {
+        console.error('Error DELETE asistencia:', e);
+        res.status(500).json({ error: 'Error eliminando asistencia' });
+    }
 });
 
 // ── Vacaciones DELETE ──────────────────────────────────────
