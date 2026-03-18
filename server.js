@@ -899,7 +899,9 @@ app.get('/api/notificaciones', requireAuth, async (req, res) => {
             .sort({ createdAt: -1 })
             .limit(50)
             .toArray();
-        res.json({ notificaciones: notifs });
+        // components.js L419 espera { notificaciones: [], total_no_leidas: N }
+        const total_no_leidas = notifs.filter(n => !n.leida).length;
+        res.json({ notificaciones: notifs, total_no_leidas });
     } catch (e) { res.status(500).json({ error: 'Error obteniendo notificaciones' }); }
 });
 
@@ -1401,7 +1403,7 @@ app.delete('/api/hub/mensajes/:id', requireAuth, requirePermiso('hub.mensajes'),
 });
 
 // ── Reaction a mensaje ──────────────────────────────────────
-app.post('/api/hub/mensajes/:id/reaction', requireAuth, requirePermiso('hub.mensajes'), async (req, res) => {
+app.patch('/api/hub/mensajes/:id/reaction', requireAuth, requirePermiso('hub.mensajes'), async (req, res) => {
     try {
         const { emoji } = req.body;
         const username = req.user.username;
