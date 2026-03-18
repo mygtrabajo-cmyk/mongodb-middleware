@@ -1,7 +1,7 @@
 // ============================================================
 // MYG TELECOM — API SERVER v4.0.0
 // Render (Node.js) + MongoDB Atlas
-//
+// 
 // Cambios v4.0:
 // - 7 roles: ADMIN, GERENTE_OPERACIONES, COORDINADOR, ANALISTA,
 //            GERENTE_COMERCIAL, EJECUTIVO_COMERCIAL, USUARIO
