@@ -150,8 +150,12 @@ const ROL_PERMISOS_DEFAULT = {
     GERENTE_OPERACIONES: [
         'dashboard.ver', 'dashboard.rh', 'dashboard.headcount', 'dashboard.activos',
         'dashboard.tickets', 'dashboard.dispositivos', 'dashboard.kpi_sistemas',
-        'hub.acceso', 'hub.concentrado.ver', 'hub.peticiones.ver_todas',
-        'hub.peticiones.aprobar', 'exportar_datos', 'chatbot.usar',
+        'hub.acceso', 'hub.mensajes', 'hub.reuniones', 'hub.minutas', 'hub.tareas',
+        'hub.anuncios', 'hub.concentrado', 'hub.concentrado.ver',
+        'hub.asistencia', 'hub.asistencia.registrar',
+        'hub.peticiones.ver_todas', 'hub.peticiones.aprobar',
+        'hub.peticiones.crear',
+        'exportar_datos', 'chatbot.usar',
     ],
 
     // COORDINADOR: permisos completos del área Sistemas (base)
@@ -172,15 +176,17 @@ const ROL_PERMISOS_DEFAULT = {
     ANALISTA: [
         'dashboard.ver', 'dashboard.rh', 'dashboard.headcount', 'dashboard.activos',
         'dashboard.tickets', 'dashboard.dispositivos', 'dashboard.kpi_sistemas',
+        'hub.acceso',
+        'hub.asistencia', 'hub.asistencia.registrar',
         'rh.movimientos.ver', 'activos.ver', 'exportar_datos', 'chatbot.usar',
     ],
 
-    // Solo lo que el Admin asigne manualmente
-    GERENTE_COMERCIAL:    [],
-    EJECUTIVO_COMERCIAL:  [],
+    // Permisos base mínimos — Admin asigna lo demás manualmente vía permisosExtra
+    // Si están vacíos el usuario ve pantalla en blanco; 'dashboard.ver' les da al menos el resumen
+    GERENTE_COMERCIAL:    ['dashboard.ver', 'chatbot.usar'],
+    EJECUTIVO_COMERCIAL:  ['dashboard.ver', 'chatbot.usar'],
 
-    // GERENTE_RH: solo tabs RH y Headcount + gestión completa de movimientos
-    // Más restringido que COORDINADOR (sin acceso a Tickets, Activos, Hub, Equipos, etc.)
+    // GERENTE_RH: RH, Headcount + gestión de movimientos + Hub (asistencia propia)
     GERENTE_RH: [
         'dashboard.ver',
         'dashboard.rh',
@@ -188,17 +194,26 @@ const ROL_PERMISOS_DEFAULT = {
         'rh.movimientos.crear',
         'rh.movimientos.ver',
         'rh.movimientos.gestionar',
+        'hub.acceso',
+        'hub.asistencia',
+        'hub.asistencia.registrar',
+        'hub.vacaciones',
+        'hub.peticiones.crear',
         'exportar_datos',
         'chatbot.usar',
     ],
 
-    // ANALISTA_RH: solo tabs RH y Headcount — consulta y crea movimientos, no aprueba
+    // ANALISTA_RH: RH, Headcount + crea movimientos + Hub (asistencia propia)
     ANALISTA_RH: [
         'dashboard.ver',
         'dashboard.rh',
         'dashboard.headcount',
         'rh.movimientos.crear',
         'rh.movimientos.ver',
+        'hub.acceso',
+        'hub.asistencia',
+        'hub.asistencia.registrar',
+        'hub.peticiones.crear',
         'exportar_datos',
         'chatbot.usar',
     ],
