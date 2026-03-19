@@ -1,6 +1,6 @@
 /* ============================================================
    CONFIGURACIÓN GLOBAL - MYG TELECOM DASHBOARD
-   Versión: 4.0.0
+   Versión: 4.2.0
    Cambios v4.0:
    - Nueva estructura de 7 roles: ADMIN, GERENTE_OPERACIONES,
      COORDINADOR(+area), ANALISTA(+area), GERENTE_COMERCIAL,
@@ -170,7 +170,7 @@ var CONFIG = {
             colorHex:   '#F59E0B',
             label:      'Mantenimiento',
             descripcion:'Mantenimiento Preventivo y Correctivo',
-            tabs:       [] // Próximamente
+            tabs:       ['hub_mantenimiento']  // v4.2 — Hub propio de área
         },
         Credito: {
             emoji:      '💳',
@@ -178,7 +178,7 @@ var CONFIG = {
             colorHex:   '#10B981',
             label:      'Crédito',
             descripcion:'Crédito, Cobranza y Gestión Financiera',
-            tabs:       [] // Próximamente
+            tabs:       ['hub_credito']        // v4.2 — Hub propio de área
         },
         Logistica: {
             emoji:      '🚚',
@@ -186,7 +186,7 @@ var CONFIG = {
             colorHex:   '#F97316',
             label:      'Logística',
             descripcion:'Logística, Distribución y Cadena de Suministro',
-            tabs:       [] // Próximamente
+            tabs:       ['hub_logistica']      // v4.2 — Hub propio de área
         }
     },
 
@@ -203,7 +203,7 @@ const ITEMS_POR_PAGINA = 30;
 // Validación de configuración al cargar
 (() => {
     const esLocal = window.location.hostname === 'localhost';
-    console.log('📋 Config MYG v4.1 cargada:');
+    console.log('📋 Config MYG v4.2 cargada:');
     console.log('   Entorno:',  esLocal ? '🛠️  Local' : '🌐 Producción');
     console.log('   API Base:', CONFIG.api.baseURL);
     console.log('   Roles:',    Object.keys(CONFIG.roles).length);
