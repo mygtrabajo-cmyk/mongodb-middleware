@@ -1,6 +1,18 @@
 // ============================================================
-// MYG TELECOM — API SERVER v4.2.0
+// MYG TELECOM — API SERVER v4.3.0
 // Render (Node.js) + MongoDB Atlas
+//
+// Cambios v4.3.0 (sobre v4.2.0):
+// - Hub Area Scoping: tareas, minutas, anuncios, recursos,
+//   guías y plantillas aislados por área (Sistemas|Credito|
+//   Mantenimiento|Logistica)
+// - hubGet(): filtro ?area= con backward compat ($exists:false = Sistemas)
+// - hubPost(): persiste campo 'area' en documentos nuevos
+// - COLECCIONES_CON_AREA: Set centralizado de colecciones con scoping
+// - 6 índices nuevos {area, createdAt} para queries eficientes
+// - hub_reuniones: sigue siendo GLOBAL (calendario compartido)
+// - hub_mensajes: aislado por canal (prefijo en ID del canal)
+// - hub_asistencia/peticiones/vacaciones: sin cambios (ya tienen lógica propia)
 //
 // Cambios v4.2.0 (sobre v4.1.1):
 // - MODULOS_PERMISOS: agrega hub.concentrado.editar, hub.capacitacion.ver
@@ -57,16 +69,33 @@ async function connectDB() {
     await client.connect();
     db = client.db(DB_NAME);
     console.log(`MongoDB conectado: ${DB_NAME}`);
-    const idx = async (col, spec, opts={}) => { try { await db.collection(col).createIndex(spec, opts); } catch(e) { console.warn(`Indice ${col}: ${e.message?.split('\n')[0]}`); } };
+
+    const idx = async (col, spec, opts={}) => {
+        try {
+            await db.collection(col).createIndex(spec, opts);
+        } catch(e) {
+            console.warn(`Indice ${col}: ${e.message?.split('\n')[0]}`);
+        }
+    };
+
+    // ── Índices existentes ─────────────────────────────────────
     await idx('users',          { username: 1 },             { unique: true, name: 'username_unique' });
     await idx('access_logs',    { timestamp: 1 },            { expireAfterSeconds: 30*24*3600, name: 'ttl_30d' });
     await idx('notificaciones', { username: 1, leida: 1 },        { name: 'notif_username_leida' });
     await idx('notificaciones', { usuario_destino: 1, leida: 1 }, { name: 'notif_destino_leida' });
     await idx('hub_asistencia', { username: 1, fecha: 1 },   { name: 'asistencia_user_fecha' });
     await idx('hub_asistencia', { fecha: 1 },                { name: 'asistencia_fecha' });
-    // FIX v4.2: indice por area para filtros de coordinador
     await idx('hub_asistencia', { area: 1, fecha: 1 },       { name: 'asistencia_area_fecha' });
     await idx('hub_mensajes',   { canal: 1, createdAt: -1 }, { name: 'mensajes_canal_fecha' });
+
+    // ── v4.3: Índices de área para colecciones con scoping ─────
+    await idx('hub_tareas',     { area: 1, createdAt: -1 }, { name: 'tareas_area_fecha'     });
+    await idx('hub_minutas',    { area: 1, createdAt: -1 }, { name: 'minutas_area_fecha'    });
+    await idx('hub_anuncios',   { area: 1, createdAt: -1 }, { name: 'anuncios_area_fecha'   });
+    await idx('hub_recursos',   { area: 1, createdAt: -1 }, { name: 'recursos_area_fecha'   });
+    await idx('hub_guias',      { area: 1, createdAt: -1 }, { name: 'guias_area_fecha'      });
+    await idx('hub_plantillas', { area: 1, createdAt: -1 }, { name: 'plantillas_area_fecha' });
+
     return client;
 }
 
@@ -84,7 +113,7 @@ const MODULOS_PERMISOS = [
     'hub.asistencia','hub.vacaciones','hub.concentrado',
     'hub.asistencia.registrar','hub.asistencia.admin_registro',
     'hub.concentrado.ver',
-    'hub.concentrado.editar',       // v4.2 NUEVO
+    'hub.concentrado.editar',
     'hub.peticiones.crear','hub.peticiones.aprobar',
     'hub.peticiones.ver_todas','formatos.generar',
     'rh.movimientos.crear','rh.movimientos.ver','rh.movimientos.gestionar',
@@ -216,7 +245,7 @@ function requireAuth(req, res, next) {
         const token = header.slice(7);
         const payload = jwt.verify(token, process.env.JWT_SECRET);
         payload.rol = normalizarRol(payload.rol);
-        req.usuario = payload;   // siempre req.usuario (no req.user)
+        req.usuario = payload;
         next();
     } catch (error) {
         if (error.name === 'TokenExpiredError')
@@ -247,7 +276,12 @@ async function logAccess(username, action, details = {}) {
 }
 
 // ── HEALTH ─────────────────────────────────────────────────────
-app.get('/health', (req, res) => res.json({ status: 'ok', version: '4.2.0', timestamp: new Date().toISOString(), db: db ? 'connected' : 'disconnected' }));
+app.get('/health', (req, res) => res.json({
+    status: 'ok',
+    version: '4.3.0',
+    timestamp: new Date().toISOString(),
+    db: db ? 'connected' : 'disconnected'
+}));
 
 // ── LOGIN ──────────────────────────────────────────────────────
 app.post('/api/auth/login', loginLimiter, async (req, res) => {
@@ -313,7 +347,7 @@ app.put('/api/users/:username', requireAuth, requireAdmin, async (req, res) => {
         if (error) return res.status(400).json({ error: error.details[0].message });
         const updates = { updatedAt: new Date(), updatedBy: req.usuario.username };
         if (value.nombre)            updates.nombre        = value.nombre.trim();
-        if (value.email !== undefined) updates.email        = value.email||'';
+        if (value.email !== undefined) updates.email       = value.email||'';
         if (value.rol)               updates.rol           = value.rol;
         if (value.area !== undefined) updates.area         = value.area||null;
         if (value.rolSecundario !== undefined) updates.rolSecundario = value.rolSecundario||null;
@@ -572,8 +606,25 @@ app.post('/api/chat', requireAuth, requirePermiso('chatbot.usar'), async (req, r
 });
 
 // ================================================================
-// HUB — Helpers CRUD genéricos
+// HUB — Helpers CRUD genéricos v4.3.0
 // ================================================================
+
+// v4.3: Colecciones con scoping por área
+// hub_reuniones  → GLOBAL (calendario compartido entre todos los hubs)
+// hub_mensajes   → aislado por canal (prefijo de área en el ID del canal)
+// hub_asistencia → lógica propia (v4.2)
+// hub_peticiones → lógica propia (v4.2)
+// hub_vacaciones → por username
+// hub_capacitacion → solo Sistemas
+const COLECCIONES_CON_AREA = new Set([
+    'hub_tareas',
+    'hub_minutas',
+    'hub_anuncios',
+    'hub_recursos',
+    'hub_guias',
+    'hub_plantillas',
+]);
+
 function hubGet(col, perm) {
     return [requireAuth, requirePermiso(perm), async (req, res) => {
         try {
@@ -582,19 +633,50 @@ function hubGet(col, perm) {
             if (req.query.username) filter.username = req.query.username;
             if (req.query.mes)      filter.mes      = req.query.mes;
             if (req.query.estado)   filter.estado   = req.query.estado;
+
+            // v4.3: Filtro por área — solo para colecciones con scoping
+            if (COLECCIONES_CON_AREA.has(col) && req.query.area) {
+                const area = req.query.area;
+                if (area === 'Sistemas') {
+                    // BACKWARD COMPAT: documentos legacy sin campo 'area'
+                    // pertenecen implícitamente a Sistemas
+                    filter.$or = [
+                        { area: 'Sistemas' },
+                        { area: { $exists: false } },
+                        { area: null },
+                    ];
+                } else {
+                    // Credito, Mantenimiento, Logistica — solo sus propios documentos
+                    filter.area = area;
+                }
+            }
+
             res.json(await db.collection(col).find(filter).sort({ createdAt:-1 }).limit(limit).toArray());
         } catch (e) { res.status(500).json({ error: `Error ${col}` }); }
     }];
 }
+
 function hubPost(col, perm) {
     return [requireAuth, requirePermiso(perm), async (req, res) => {
         try {
-            const doc = { ...req.body, creadoPor: req.usuario.username, createdAt: new Date() };
+            // v4.3: Si la colección soporta area y el body no lo trae,
+            // se asigna 'Sistemas' como default (backward compat con data existente)
+            const areaDefault = COLECCIONES_CON_AREA.has(col) && !req.body.area
+                ? 'Sistemas'
+                : undefined;
+
+            const doc = {
+                ...req.body,
+                ...(areaDefault !== undefined && { area: areaDefault }),
+                creadoPor: req.usuario.username,
+                createdAt: new Date(),
+            };
             const result = await db.collection(col).insertOne(doc);
             res.status(201).json({ success:true, id:result.insertedId, doc });
         } catch (e) { res.status(500).json({ error: `Error ${col}` }); }
     }];
 }
+
 function hubPatch(col, perm) {
     return [requireAuth, requirePermiso(perm), async (req, res) => {
         try {
@@ -607,6 +689,7 @@ function hubPatch(col, perm) {
         } catch (e) { res.status(500).json({ error: `Error ${col}` }); }
     }];
 }
+
 function hubDelete(col, perm) {
     return [requireAuth, requirePermiso(perm), async (req, res) => {
         try {
@@ -634,7 +717,7 @@ app.get('/api/hub/general', requireAuth, requirePermiso('hub.acceso'), async (re
     } catch (e) { res.status(500).json({ error: 'Error hub general' }); }
 });
 
-// ── Reuniones ──────────────────────────────────────────────────
+// ── Reuniones — GLOBAL (sin scoping por área) ──────────────────
 app.get('/api/hub/reuniones',        ...hubGet   ('hub_reuniones','hub.reuniones'));
 app.post('/api/hub/reuniones',       ...hubPost  ('hub_reuniones','hub.reuniones'));
 app.patch('/api/hub/reuniones/:id',  ...hubPatch ('hub_reuniones','hub.reuniones'));
@@ -725,8 +808,6 @@ app.post('/api/hub/reuniones/:id/generar-minuta', requireAuth, requirePermiso('h
             }
         }
         if (!resultado) throw ultimoError || new Error('Todos los proveedores fallaron');
-
-        // Limpiar campos internos de debug antes de responder
         const { _proveedor, _ms, ...minutaLimpia } = resultado;
         console.log(`[MinutaIA] Respuesta enviada (proveedor: ${_proveedor}, ${_ms}ms)`);
         if (_proveedor === 'local') {
@@ -737,6 +818,7 @@ app.post('/api/hub/reuniones/:id/generar-minuta', requireAuth, requirePermiso('h
 });
 
 // ── Tareas / Minutas / Anuncios / Recursos / Guias / Plantillas ─
+// v4.3: Estos endpoints ahora filtran y persisten campo 'area' via hubGet/hubPost
 app.get('/api/hub/tareas',           ...hubGet   ('hub_tareas',      'hub.tareas'));
 app.post('/api/hub/tareas',          ...hubPost  ('hub_tareas',      'hub.tareas'));
 app.patch('/api/hub/tareas/:id',     ...hubPatch ('hub_tareas',      'hub.tareas'));
@@ -772,7 +854,7 @@ app.post('/api/hub/capacitacion',        ...hubPost  ('hub_capacitacion','hub.ca
 app.patch('/api/hub/capacitacion/:id',   ...hubPatch ('hub_capacitacion','hub.capacitacion'));
 app.delete('/api/hub/capacitacion/:id',  ...hubDelete('hub_capacitacion','hub.capacitacion'));
 
-// ── Mensajes ───────────────────────────────────────────────────
+// ── Mensajes — aislado por canal (prefijo de área en el ID) ───
 app.get('/api/hub/mensajes/:canal', requireAuth, requirePermiso('hub.mensajes'), async (req, res) => {
     try {
         const { canal } = req.params;
@@ -829,16 +911,13 @@ app.patch('/api/hub/minutas/:minutaId/acciones/:itemId', requireAuth, requirePer
 // ASISTENCIA — Con filtros de área para coordinadores (v4.2)
 // ================================================================
 
-// FIX v4.2: GET filtra por área si es COORDINADOR
 app.get('/api/hub/asistencia', requireAuth, requirePermiso('hub.asistencia'), async (req, res) => {
     try {
         const { usuario } = req;
         const filter = {};
 
         if (req.query.username) {
-            // Solicitud explícita de un usuario específico
             filter.username = req.query.username;
-            // FIX v4.2: Coordinador solo puede ver asistencia de su área
             if (usuario.rol === 'COORDINADOR' && !tienePermiso(usuario,'hub.concentrado.ver')) {
                 const targetUser = await db.collection('users').findOne({ username: req.query.username }, { projection:{area:1} });
                 if (targetUser && targetUser.area !== usuario.area) {
@@ -846,15 +925,11 @@ app.get('/api/hub/asistencia', requireAuth, requirePermiso('hub.asistencia'), as
                 }
             }
         } else if (tienePermiso(usuario,'hub.concentrado.ver')) {
-            // ADMIN / GERENTE_OPERACIONES / COORDINADOR con concentrado.ver: ven todos
-            // FIX v4.2: Coordinador solo ve su área
-            if (usuario.rol === 'COORDINADOR') {  // Coordinador siempre filtra por su area
-                // Buscar usernames de su area
+            if (usuario.rol === 'COORDINADOR') {
                 const usuariosArea = await db.collection('users').find({ area: usuario.area, activo: true }, { projection:{username:1} }).toArray();
                 filter.username = { $in: usuariosArea.map(u=>u.username) };
             }
         } else {
-            // Usuario normal: solo ve los suyos
             filter.username = usuario.username;
         }
 
@@ -865,7 +940,6 @@ app.get('/api/hub/asistencia', requireAuth, requirePermiso('hub.asistencia'), as
     } catch (e) { console.error('Error GET asistencia:', e); res.status(500).json({ error: 'Error obteniendo asistencia' }); }
 });
 
-// FIX v4.2: POST valida área del coordinador
 app.post('/api/hub/asistencia', requireAuth, async (req, res) => {
     const { targetUsername, fecha, tipo, horaEntrada, horaSalida, notas } = req.body;
     const { usuario } = req;
@@ -878,7 +952,6 @@ app.post('/api/hub/asistencia', requireAuth, async (req, res) => {
     if (!tipo) return res.status(400).json({ error: 'El campo tipo es requerido' });
 
     try {
-        // FIX v4.2: Coordinador solo registra para usuarios de su área (dentro de try)
         if (esAdminReg && usuario.rol === 'COORDINADOR') {
             const targetUser = await db.collection('users').findOne({ username: targetUsername }, { projection:{area:1} });
             if (targetUser && targetUser.area !== usuario.area) {
@@ -890,13 +963,12 @@ app.post('/api/hub/asistencia', requireAuth, async (req, res) => {
         const fechaRegistro   = fecha || new Date().toISOString().split('T')[0];
         const existe = await db.collection('hub_asistencia').findOne({ username:usernameDestino, fecha:fechaRegistro });
         if (existe) return res.status(409).json({ error:`Ya existe un registro para ${usernameDestino} el ${fechaRegistro}`, existingId:existe._id });
-        // FIX v4.2: guardar area del usuario destino para filtros futuros
         const userDoc = await db.collection('users').findOne({ username: usernameDestino }, { projection:{area:1} });
         const doc = {
             username: usernameDestino, fecha: fechaRegistro, tipo,
             horaEntrada: horaEntrada||'', horaSalida: horaSalida||'',
             notas: notas||'', registradoPor: usuario.username,
-            area: userDoc?.area || null,   // v4.2: area del empleado para filtros
+            area: userDoc?.area || null,
             createdAt: new Date(),
         };
         await db.collection('hub_asistencia').insertOne(doc);
@@ -904,7 +976,6 @@ app.post('/api/hub/asistencia', requireAuth, async (req, res) => {
     } catch (e) { console.error('Error POST asistencia:', e); res.status(500).json({ error: 'Error registrando asistencia' }); }
 });
 
-// FIX v4.2: PATCH valida que coordinador solo edite registros de su área
 app.patch('/api/hub/asistencia/:id', requireAuth, async (req, res) => {
     try {
         const doc = await db.collection('hub_asistencia').findOne({ _id: new ObjectId(req.params.id) });
@@ -915,11 +986,9 @@ app.patch('/api/hub/asistencia/:id', requireAuth, async (req, res) => {
         const tieneRegistrar  = tienePermiso(usuario,'hub.asistencia.registrar');
         const tieneEditConc   = tienePermiso(usuario,'hub.concentrado.editar');
 
-        // FIX v4.2: COORDINADOR puede editar si es su área
         let puedeEditar = tieneAdmin || (esPropioUsuario && tieneRegistrar) || tieneEditConc;
         if (!puedeEditar) return res.status(403).json({ error: 'Sin permiso para editar este registro' });
 
-        // FIX v4.2: Coordinador solo puede editar registros de su área
         if (usuario.rol === 'COORDINADOR' && !tienePermiso(usuario,'admin.panel')) {
             const targetUser = await db.collection('users').findOne({ username: doc.username }, { projection:{area:1} });
             if (targetUser && targetUser.area !== usuario.area) {
@@ -928,7 +997,7 @@ app.patch('/api/hub/asistencia/:id', requireAuth, async (req, res) => {
         }
 
         const updates = { ...req.body };
-        if (!tieneAdmin) delete updates.username;   // no permite cambiar dueño del registro
+        if (!tieneAdmin) delete updates.username;
         updates.updatedAt = new Date();
         updates.updatedBy = usuario.username;
 
@@ -947,7 +1016,6 @@ app.delete('/api/hub/asistencia/:id', requireAuth, async (req, res) => {
         const tieneRegistrar  = tienePermiso(usuario,'hub.asistencia.registrar');
         if (!tieneAdmin && !(esPropioUsuario && tieneRegistrar))
             return res.status(403).json({ error: 'Sin permiso para eliminar este registro' });
-        // FIX v4.2: Coordinador solo elimina registros de su área
         if (usuario.rol === 'COORDINADOR' && !tieneAdmin) {
             const targetUser = await db.collection('users').findOne({ username: doc.username }, { projection:{area:1} });
             if (targetUser && targetUser.area !== usuario.area)
@@ -958,28 +1026,22 @@ app.delete('/api/hub/asistencia/:id', requireAuth, async (req, res) => {
     } catch (e) { console.error('Error DELETE asistencia:', e); res.status(500).json({ error: 'Error eliminando asistencia' }); }
 });
 
-// FIX v4.2: Endpoint de usuarios activos para admin-registro
 app.get('/api/hub/usuarios-activos', requireAuth, requirePermiso('hub.asistencia.admin_registro'), async (req, res) => {
     try {
         const { usuario } = req;
         const filter = { activo: true };
-        // Coordinador solo ve usuarios de su área
         if (usuario.rol === 'COORDINADOR') filter.area = usuario.area;
         const usuarios = await db.collection('users').find(filter, { projection:{password:0} }).toArray();
         res.json(usuarios.map(u => ({ username:u.username, nombre:u.nombre, rol:normalizarRol(u.rol), area:u.area||null, activo:u.activo })));
     } catch (e) { res.status(500).json({ error: 'Error obteniendo usuarios activos' }); }
 });
 
-// ── Concentrado (legacy — vista matricial admin) ──────────────
-// GET /api/hub/concentrado: devuelve registros de hub_concentrado (coleccion separada)
-// Nota: el frontend usa /api/hub/asistencia?mes= para construir la matriz en AsistenciaSection.
-// Este endpoint se mantiene para compatibilidad con admin-panel y TabConcentrado externos.
+// ── Concentrado ────────────────────────────────────────────────
 app.get('/api/hub/concentrado', requireAuth, requirePermiso('hub.concentrado.ver'), async (req, res) => {
     try {
         const { usuario } = req;
         const filter = {};
         if (req.query.mes) filter.mes = req.query.mes;
-        // FIX v4.2: Coordinador solo ve su area
         if (usuario.rol === 'COORDINADOR') {
             const usersArea = await db.collection('users').find({ area: usuario.area, activo: true }, { projection:{username:1} }).toArray();
             filter.username = { $in: usersArea.map(u => u.username) };
@@ -1016,20 +1078,16 @@ app.delete('/api/hub/vacaciones/:id', requireAuth, requirePermiso('hub.peticione
 });
 
 // ── Peticiones ──────────────────────────────────────────────────
-// FIX v4.2: ANALISTA ve sus propias peticiones (sin hub.peticiones.ver_todas)
 app.get('/api/hub/peticiones', requireAuth, requirePermiso('hub.acceso'), async (req, res) => {
     try {
         const { usuario } = req;
         const filter = {};
         if (tienePermiso(usuario,'hub.peticiones.ver_todas')) {
-            // COORDINADOR ve todas pero filtradas por area
             if (usuario.rol === 'COORDINADOR') {
                 const usersArea = await db.collection('users').find({ area:usuario.area }, { projection:{username:1} }).toArray();
                 filter.username = { $in: usersArea.map(u=>u.username) };
             }
-            // ADMIN y GERENTE_OPERACIONES ven todo
         } else {
-            // ANALISTA y otros: solo sus propias peticiones
             filter.username = usuario.username;
         }
         if (req.query.estado) filter.estado = req.query.estado;
@@ -1061,8 +1119,9 @@ async function start() {
     try {
         await connectDB();
         app.listen(PORT, () => {
-            console.log(`MYG API v4.2.0 en puerto ${PORT}`);
+            console.log(`MYG API v4.3.0 en puerto ${PORT}`);
             console.log(`Roles: ${ROLES_VALIDOS.join(', ')}`);
+            console.log(`Hub Area Scoping: ${[...COLECCIONES_CON_AREA].join(', ')}`);
             console.log(`IA Minutas: Groq=${!!process.env.GROQ_API_KEY?'OK':'NO'} Gemini=${!!process.env.GEMINI_API_KEY?'OK':'NO'} Local=OK`);
         });
     } catch (err) { console.error('Error iniciando:', err); process.exit(1); }
