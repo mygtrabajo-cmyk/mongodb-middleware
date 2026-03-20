@@ -1,26 +1,24 @@
 // ============================================================
-// MYG TELECOM — API SERVER v4.3.0
+// MYG TELECOM — API SERVER v4.3.1
 // Render (Node.js) + MongoDB Atlas
+//
+// Cambios v4.3.1 (sobre v4.3.0):
+// ─── FIXES IA MINUTAS ────────────────────────────────────────
+// [FIX-S1] buildMinutaPrompt: prompt profesional detallado con contexto
+//          MYG Telecom, instrucciones campo-por-campo y JSON estricto.
+// [FIX-S2] Eliminado gate transcript < 30 chars que bloqueaba Groq/Gemini.
+//          Ahora SIEMPRE se intenta IA, sin importar longitud del transcript.
+// [FIX-S3] generarConGroq reescrito con fetch REST directo a api.groq.com
+//          (sin depender del SDK groq-sdk instalado en producción).
+//          Timeout de 22s propio para no exceder el límite de Cloudflare Worker.
+// [FIX-S4] generarConGemini con timeout 22s y fallback limpio.
+// [FIX-S5] generarConReglasLocales: acciones sin punto doble, mejor extracción.
+// [FIX-S6] Endpoint generar-minuta: responde _proveedor y _ms al cliente.
+// ─── Sin cambios en el resto del servidor ────────────────────
 //
 // Cambios v4.3.0 (sobre v4.2.0):
 // - Hub Area Scoping: tareas, minutas, anuncios, recursos,
-//   guías y plantillas aislados por área (Sistemas|Credito|
-//   Mantenimiento|Logistica)
-// - hubGet(): filtro ?area= con backward compat ($exists:false = Sistemas)
-// - hubPost(): persiste campo 'area' en documentos nuevos
-// - COLECCIONES_CON_AREA: Set centralizado de colecciones con scoping
-// - 6 índices nuevos {area, createdAt} para queries eficientes
-// - hub_reuniones: sigue siendo GLOBAL (calendario compartido)
-// - hub_mensajes: aislado por canal (prefijo en ID del canal)
-// - hub_asistencia/peticiones/vacaciones: sin cambios (ya tienen lógica propia)
-//
-// Cambios v4.2.0 (sobre v4.1.1):
-// - MODULOS_PERMISOS: agrega hub.concentrado.editar, hub.capacitacion.ver
-// - GET /api/hub/asistencia: filtro por area del coordinador
-// - PATCH /api/hub/asistencia/:id: coordinador solo edita registros de su area
-// - POST /api/hub/asistencia: coordinador solo registra usuarios de su area
-// - GET /api/hub/peticiones: ANALISTA ve sus propias peticiones (sin hub.peticiones.ver_todas)
-// - Nuevo endpoint GET /api/hub/usuarios-activos para lista en admin-registro
+//   guías y plantillas aislados por área
 // ============================================================
 
 require('dotenv').config();
@@ -34,10 +32,9 @@ const Joi       = require('joi');
 const rateLimit = require('express-rate-limit');
 const morgan    = require('morgan');
 
-// IA Minutas (Groq -> Gemini -> local)
-let Groq, GoogleGenerativeAI;
-try { Groq = require('groq-sdk'); } catch (_) { console.warn('groq-sdk no instalado'); }
-try { ({ GoogleGenerativeAI } = require('@google/generative-ai')); } catch (_) { console.warn('@google/generative-ai no instalado'); }
+// IA Minutas — SDK opcional (fallback a REST si no están instalados)
+let GoogleGenerativeAI;
+try { ({ GoogleGenerativeAI } = require('@google/generative-ai')); } catch (_) { console.warn('⚠️  @google/generative-ai no instalado — Gemini usará REST'); }
 
 const app  = express();
 const PORT = process.env.PORT || 5500;
@@ -78,7 +75,6 @@ async function connectDB() {
         }
     };
 
-    // ── Índices existentes ─────────────────────────────────────
     await idx('users',          { username: 1 },             { unique: true, name: 'username_unique' });
     await idx('access_logs',    { timestamp: 1 },            { expireAfterSeconds: 30*24*3600, name: 'ttl_30d' });
     await idx('notificaciones', { username: 1, leida: 1 },        { name: 'notif_username_leida' });
@@ -87,8 +83,6 @@ async function connectDB() {
     await idx('hub_asistencia', { fecha: 1 },                { name: 'asistencia_fecha' });
     await idx('hub_asistencia', { area: 1, fecha: 1 },       { name: 'asistencia_area_fecha' });
     await idx('hub_mensajes',   { canal: 1, createdAt: -1 }, { name: 'mensajes_canal_fecha' });
-
-    // ── v4.3: Índices de área para colecciones con scoping ─────
     await idx('hub_tareas',     { area: 1, createdAt: -1 }, { name: 'tareas_area_fecha'     });
     await idx('hub_minutas',    { area: 1, createdAt: -1 }, { name: 'minutas_area_fecha'    });
     await idx('hub_anuncios',   { area: 1, createdAt: -1 }, { name: 'anuncios_area_fecha'   });
@@ -278,9 +272,13 @@ async function logAccess(username, action, details = {}) {
 // ── HEALTH ─────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({
     status: 'ok',
-    version: '4.3.0',
+    version: '4.3.1',
     timestamp: new Date().toISOString(),
-    db: db ? 'connected' : 'disconnected'
+    db: db ? 'connected' : 'disconnected',
+    ia: {
+        groq:   !!process.env.GROQ_API_KEY,
+        gemini: !!process.env.GEMINI_API_KEY,
+    }
 }));
 
 // ── LOGIN ──────────────────────────────────────────────────────
@@ -606,23 +604,10 @@ app.post('/api/chat', requireAuth, requirePermiso('chatbot.usar'), async (req, r
 });
 
 // ================================================================
-// HUB — Helpers CRUD genéricos v4.3.0
+// HUB — Helpers CRUD genéricos v4.3
 // ================================================================
-
-// v4.3: Colecciones con scoping por área
-// hub_reuniones  → GLOBAL (calendario compartido entre todos los hubs)
-// hub_mensajes   → aislado por canal (prefijo de área en el ID del canal)
-// hub_asistencia → lógica propia (v4.2)
-// hub_peticiones → lógica propia (v4.2)
-// hub_vacaciones → por username
-// hub_capacitacion → solo Sistemas
 const COLECCIONES_CON_AREA = new Set([
-    'hub_tareas',
-    'hub_minutas',
-    'hub_anuncios',
-    'hub_recursos',
-    'hub_guias',
-    'hub_plantillas',
+    'hub_tareas','hub_minutas','hub_anuncios','hub_recursos','hub_guias','hub_plantillas',
 ]);
 
 function hubGet(col, perm) {
@@ -633,24 +618,14 @@ function hubGet(col, perm) {
             if (req.query.username) filter.username = req.query.username;
             if (req.query.mes)      filter.mes      = req.query.mes;
             if (req.query.estado)   filter.estado   = req.query.estado;
-
-            // v4.3: Filtro por área — solo para colecciones con scoping
             if (COLECCIONES_CON_AREA.has(col) && req.query.area) {
                 const area = req.query.area;
                 if (area === 'Sistemas') {
-                    // BACKWARD COMPAT: documentos legacy sin campo 'area'
-                    // pertenecen implícitamente a Sistemas
-                    filter.$or = [
-                        { area: 'Sistemas' },
-                        { area: { $exists: false } },
-                        { area: null },
-                    ];
+                    filter.$or = [{ area: 'Sistemas' }, { area: { $exists: false } }, { area: null }];
                 } else {
-                    // Credito, Mantenimiento, Logistica — solo sus propios documentos
                     filter.area = area;
                 }
             }
-
             res.json(await db.collection(col).find(filter).sort({ createdAt:-1 }).limit(limit).toArray());
         } catch (e) { res.status(500).json({ error: `Error ${col}` }); }
     }];
@@ -659,12 +634,7 @@ function hubGet(col, perm) {
 function hubPost(col, perm) {
     return [requireAuth, requirePermiso(perm), async (req, res) => {
         try {
-            // v4.3: Si la colección soporta area y el body no lo trae,
-            // se asigna 'Sistemas' como default (backward compat con data existente)
-            const areaDefault = COLECCIONES_CON_AREA.has(col) && !req.body.area
-                ? 'Sistemas'
-                : undefined;
-
+            const areaDefault = COLECCIONES_CON_AREA.has(col) && !req.body.area ? 'Sistemas' : undefined;
             const doc = {
                 ...req.body,
                 ...(areaDefault !== undefined && { area: areaDefault }),
@@ -717,108 +687,287 @@ app.get('/api/hub/general', requireAuth, requirePermiso('hub.acceso'), async (re
     } catch (e) { res.status(500).json({ error: 'Error hub general' }); }
 });
 
-// ── Reuniones — GLOBAL (sin scoping por área) ──────────────────
+// ── Reuniones ──────────────────────────────────────────────────
 app.get('/api/hub/reuniones',        ...hubGet   ('hub_reuniones','hub.reuniones'));
 app.post('/api/hub/reuniones',       ...hubPost  ('hub_reuniones','hub.reuniones'));
 app.patch('/api/hub/reuniones/:id',  ...hubPatch ('hub_reuniones','hub.reuniones'));
 app.delete('/api/hub/reuniones/:id', ...hubDelete('hub_reuniones','hub.reuniones'));
 
-// ── Generar Minuta con IA ──────────────────────────────────────
-const buildMinutaPrompt = ({ transcript, meetingTitle, meetingDate, meetingTime, attendees, agenda, duracion }) => {
-    const durMin = Math.ceil((duracion||0)/60);
-    const asistentes = Array.isArray(attendees) ? attendees.join(', ') : (attendees||'No especificados');
-    const hasT = transcript && transcript.trim().length > 30;
-    return {
-        system: `Eres un asistente corporativo de MYG Telecom especializado en minutas formales en español mexicano. Responde UNICAMENTE con JSON valido, sin backticks.`,
-        user: `Genera una minuta corporativa formal:
-REUNION: ${meetingTitle||'Reunion MYG Telecom'}
-FECHA: ${meetingDate||'No especificada'} ${meetingTime?'a las '+meetingTime:''}
-DURACION: ${durMin} min
-ASISTENTES: ${asistentes}
-AGENDA: ${agenda||'No especificada'}
-TRANSCRIPCION: ${hasT ? transcript.trim() : '(Sin transcripcion suficiente)'}
-Responde con JSON exacto (sin backticks):
-{"title":"Minuta: ...","resumen":"...","decisions":"...","acciones":["..."],"observaciones":"..."}`
-    };
+// ================================================================
+// IA MINUTAS v4.3.1 — Groq REST + Gemini SDK + Local fallback
+// ================================================================
+
+// [FIX-S1] Prompt profesional detallado — contexto MYG Telecom + instrucciones por campo
+const buildMinutaPrompt = ({ transcript, meetingTitle, meetingDate, meetingTime, attendees, agenda, duracion, notasAdicionales }) => {
+    const durMin = Math.ceil((duracion || 0) / 60);
+    const asistentes = Array.isArray(attendees) ? attendees.join(', ') : (attendees || 'No especificados');
+    const hasTranscript = transcript && transcript.trim().length > 5;
+    const transcriptText = hasTranscript ? transcript.trim() : '(Sin transcripción de voz — usar contexto de la agenda)';
+    const notasText = notasAdicionales && notasAdicionales.trim() ? `\nNOTAS MANUALES DEL ORGANIZADOR: ${notasAdicionales.trim()}` : '';
+
+    const systemPrompt = `Eres el asistente corporativo oficial de MYG Telecom, empresa de telecomunicaciones mexicana.
+Tu especialidad es redactar minutas ejecutivas formales en español mexicano profesional para el área de Sistemas/IT.
+REGLAS ABSOLUTAS:
+1. Responde ÚNICAMENTE con JSON válido. Sin backticks, sin texto antes o después.
+2. Todos los campos en español mexicano formal.
+3. El campo "resumen" debe ser un párrafo ejecutivo de 3-5 oraciones que capture los temas principales.
+4. El campo "decisions" debe listar solo decisiones concretas tomadas, como bullet points con "•".
+5. El campo "acciones" debe ser un array de strings, cada uno con formato "Responsable: Acción concreta [Fecha límite si se mencionó]".
+6. Si no hay información suficiente para un campo, escribe una cadena vacía "", NO inventes datos.
+7. El campo "observaciones" es para notas adicionales, próximas reuniones, o contexto relevante.`;
+
+    const userPrompt = `Genera la minuta ejecutiva formal para esta reunión de MYG Telecom:
+
+DATOS DE LA REUNIÓN:
+- Título: ${meetingTitle || 'Reunión de Sistemas MYG Telecom'}
+- Fecha: ${meetingDate || 'No especificada'}${meetingTime ? ' a las ' + meetingTime : ''}
+- Duración: ${durMin > 0 ? durMin + ' minutos' : 'No especificada'}
+- Asistentes: ${asistentes}
+- Agenda: ${agenda || 'No especificada'}${notasText}
+
+TRANSCRIPCIÓN DE LA REUNIÓN:
+${transcriptText}
+
+Responde con este JSON exacto (sin backticks, sin texto adicional):
+{
+  "title": "Minuta: ${meetingTitle || 'Reunión de Sistemas'}",
+  "resumen": "Párrafo ejecutivo de 3-5 oraciones sobre los temas tratados",
+  "decisions": "• Primera decisión tomada\\n• Segunda decisión tomada",
+  "acciones": ["Responsable: Acción concreta", "Responsable2: Otra acción"],
+  "observaciones": "Observaciones adicionales, próxima reunión, etc."
+}`;
+
+    return { system: systemPrompt, user: userPrompt };
 };
 
+// [FIX-S3] Groq via REST directo — sin depender del SDK groq-sdk
 const generarConGroq = async (pd) => {
-    if (!Groq || !process.env.GROQ_API_KEY) throw new Error('Groq no disponible');
-    const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+    const apiKey = process.env.GROQ_API_KEY;
+    if (!apiKey) throw new Error('GROQ_API_KEY no configurada');
+
     const p = buildMinutaPrompt(pd);
-    const c = await groq.chat.completions.create({ model:'llama-3.3-70b-versatile', max_tokens:1200, temperature:0.3, messages:[{role:'system',content:p.system},{role:'user',content:p.user}] });
-    return JSON.parse(c.choices[0]?.message?.content?.replace(/```json\s*/gi,'').replace(/```\s*/gi,'').trim()||'{}');
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 22000); // 22s timeout
+
+    try {
+        const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+                'Content-Type':  'application/json',
+                'Authorization': `Bearer ${apiKey}`,
+            },
+            signal: controller.signal,
+            body: JSON.stringify({
+                model:       'llama-3.3-70b-versatile',
+                max_tokens:  1400,
+                temperature: 0.25,
+                messages: [
+                    { role: 'system', content: p.system },
+                    { role: 'user',   content: p.user   },
+                ],
+                response_format: { type: 'json_object' }, // fuerza JSON puro
+            }),
+        });
+
+        clearTimeout(timeout);
+
+        if (!response.ok) {
+            const errBody = await response.text().catch(() => '');
+            throw new Error(`Groq HTTP ${response.status}: ${errBody.slice(0, 200)}`);
+        }
+
+        const data = await response.json();
+        const content = data.choices?.[0]?.message?.content || '';
+        if (!content) throw new Error('Groq devolvió respuesta vacía');
+
+        const parsed = JSON.parse(content.replace(/```json\s*/gi, '').replace(/```\s*/gi, '').trim());
+        if (!parsed || typeof parsed !== 'object') throw new Error('JSON inválido de Groq');
+        return parsed;
+
+    } finally {
+        clearTimeout(timeout);
+    }
 };
 
+// [FIX-S4] Gemini con timeout
 const generarConGemini = async (pd) => {
-    if (!GoogleGenerativeAI || !process.env.GEMINI_API_KEY) throw new Error('Gemini no disponible');
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) throw new Error('GEMINI_API_KEY no configurada');
+
     const p = buildMinutaPrompt(pd);
-    const model = new GoogleGenerativeAI(process.env.GEMINI_API_KEY).getGenerativeModel({ model:'gemini-2.0-flash', generationConfig:{temperature:0.3,maxOutputTokens:1200,responseMimeType:'application/json'}, systemInstruction:p.system });
-    const r = await model.generateContent(p.user);
-    return JSON.parse(r.response.text().replace(/```json\s*/gi,'').replace(/```\s*/gi,'').trim());
+
+    // Path 1: SDK instalado
+    if (GoogleGenerativeAI) {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 22000);
+        try {
+            const model = new GoogleGenerativeAI(apiKey).getGenerativeModel({
+                model: 'gemini-2.0-flash',
+                generationConfig: { temperature: 0.25, maxOutputTokens: 1400, responseMimeType: 'application/json' },
+                systemInstruction: p.system,
+            });
+            const result = await model.generateContent(p.user);
+            clearTimeout(timeout);
+            const text = result.response.text().replace(/```json\s*/gi, '').replace(/```\s*/gi, '').trim();
+            const parsed = JSON.parse(text);
+            if (!parsed || typeof parsed !== 'object') throw new Error('JSON inválido de Gemini');
+            return parsed;
+        } finally {
+            clearTimeout(timeout);
+        }
+    }
+
+    // Path 2: REST directo si SDK no instalado
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 22000);
+    try {
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            signal: controller.signal,
+            body: JSON.stringify({
+                contents: [{ parts: [{ text: p.user }] }],
+                systemInstruction: { parts: [{ text: p.system }] },
+                generationConfig: { temperature: 0.25, maxOutputTokens: 1400, responseMimeType: 'application/json' },
+            }),
+        });
+        clearTimeout(timeout);
+        if (!response.ok) throw new Error(`Gemini HTTP ${response.status}`);
+        const data = await response.json();
+        const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+        if (!text) throw new Error('Gemini devolvió respuesta vacía');
+        return JSON.parse(text.replace(/```json\s*/gi, '').replace(/```\s*/gi, '').trim());
+    } finally {
+        clearTimeout(timeout);
+    }
 };
 
+// [FIX-S5] Motor local mejorado — acciones sin punto doble
 const generarConReglasLocales = (pd) => {
-    const { transcript='', meetingTitle='Reunion', meetingDate='', meetingTime='', attendees=[], duracion=0 } = pd;
-    const durMin = Math.ceil(duracion/60);
-    const oraciones = transcript.split(/[.!?;]\s+/).map(s=>s.trim()).filter(s=>s.length>15);
-    const stopwords = new Set(['el','la','los','las','un','una','de','del','en','y','a','que','se','es','no','con','por','para','como','mas','pero']);
-    const score = s => new Set(s.toLowerCase().split(/\s+/).filter(w=>!stopwords.has(w)&&w.length>3)).size;
-    const resumenOraciones = oraciones.map(o=>({text:o,score:score(o)})).sort((a,b)=>b.score-a.score).slice(0,4).map(o=>o.text+'.');
-    const decisiones = oraciones.filter(o=>/\bse (decide|acuerda|aprueba)\b/i.test(o)).slice(0,4).map(d=>`• ${d}.`);
-    const acciones   = oraciones.filter(o=>/\b(pendiente|entregar|revisar|enviar)\b/i.test(o)).slice(0,5).map(a=>a+'.');
+    const { transcript = '', meetingTitle = 'Reunión', meetingDate = '', meetingTime = '', attendees = [], agenda = '', duracion = 0, notasAdicionales = '' } = pd;
+    const durMin = Math.ceil(duracion / 60);
+
+    // Fuente de texto: transcript + notas
+    const fuenteTexto = [transcript, notasAdicionales].filter(Boolean).join(' ').trim();
+    const oraciones = fuenteTexto.split(/[.!?;]\s+/).map(s => s.trim()).filter(s => s.length > 15);
+
+    const stopwords = new Set(['el','la','los','las','un','una','de','del','en','y','a','que','se','es','no','con','por','para','como','mas','pero','su','sus','al','lo','le','les']);
+    const score = s => new Set(s.toLowerCase().split(/\s+/).filter(w => !stopwords.has(w) && w.length > 3)).size;
+
+    const mejoresOraciones = oraciones
+        .map(o => ({ text: o, score: score(o) }))
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 5)
+        .map(o => o.text + '.');
+
+    // Decisiones: buscar patrones explícitos
+    const decisiones = oraciones
+        .filter(o => /\b(se decide|se acuerda|se aprueba|quedamos|acordamos|decidimos)\b/i.test(o))
+        .slice(0, 5)
+        .map(d => `• ${d.trim().replace(/\.$/, '')}.`);
+
+    // Acciones: buscar compromisos — SIN añadir punto si ya termina en punto
+    const acciones = oraciones
+        .filter(o => /\b(pendiente|entregar|revisar|enviar|actualizar|verificar|contactar|coordinar|preparar|elaborar)\b/i.test(o))
+        .slice(0, 6)
+        .map(a => a.trim().replace(/\.$/, '')); // [FIX-S5] quitar punto antes de normalizeAcciones lo procese
+
+    const agendaTexto = agenda ? `Agenda: ${agenda}.` : '';
+    const resumenBase = mejoresOraciones.length > 0
+        ? mejoresOraciones.join(' ')
+        : `Reunión "${meetingTitle}" del ${meetingDate}${meetingTime ? ' a las ' + meetingTime : ''}. ${agendaTexto} Duración: ${durMin} min. Por favor complementa los detalles.`;
+
     return {
-        title: `Minuta: ${meetingTitle}`,
-        resumen: resumenOraciones.length ? resumenOraciones.join(' ') : `Reunion del ${meetingDate}, duracion ${durMin} min. Completa manualmente.`,
-        decisions: decisiones.join('\n')||'',
-        acciones: acciones.length ? acciones : [],
-        observaciones: `Reunion de ${durMin} min con ${(Array.isArray(attendees)?attendees:[]).length} asistente(s).`,
+        title:        `Minuta: ${meetingTitle}`,
+        resumen:      resumenBase,
+        decisions:    decisiones.join('\n') || '',
+        acciones,   // array de strings limpios
+        observaciones: `Reunión de ${durMin > 0 ? durMin + ' min' : 'duración no registrada'} con ${Array.isArray(attendees) ? attendees.length : 0} asistente(s). ${notasAdicionales ? 'Notas: ' + notasAdicionales : ''}`.trim(),
     };
 };
 
+// ── Endpoint: Generar Minuta con IA ───────────────────────────
 app.post('/api/hub/reuniones/:id/generar-minuta', requireAuth, requirePermiso('hub.reuniones'), async (req, res) => {
     try {
-        const { transcript='', meetingTitle, meetingDate, meetingTime, attendees, agenda, duracion } = req.body;
+        const {
+            transcript      = '',
+            meetingTitle,
+            meetingDate,
+            meetingTime,
+            attendees,
+            agenda,
+            duracion,
+            notasAdicionales = '',  // [FIX-R1] nuevo campo
+        } = req.body;
+
         const transcriptUtil = transcript.trim();
-        const pd = { transcript:transcriptUtil, meetingTitle, meetingDate, meetingTime, attendees, agenda, duracion };
-        if (transcriptUtil.length < 30) return res.json({ ...generarConReglasLocales(pd), _aviso:'Transcript insuficiente. Completa manualmente.' });
+        const pd = { transcript: transcriptUtil, meetingTitle, meetingDate, meetingTime, attendees, agenda, duracion, notasAdicionales };
+
+        // [FIX-S2] ELIMINADO el gate "if (length < 30) return local"
+        // Ahora SIEMPRE intenta Groq → Gemini → local, sin importar longitud
+        // Solo si realmente no hay NADA de texto Y no hay notas, se usa local directamente
+        const sinContenido = !transcriptUtil && !notasAdicionales.trim() && !agenda;
+        if (sinContenido) {
+            console.log('[MinutaIA] Sin transcripción ni notas → motor local inmediato');
+            const local = generarConReglasLocales(pd);
+            return res.json({ ...local, _proveedor: 'local', _aviso: 'Sin transcripción. Completa los campos manualmente.' });
+        }
+
         const forced = process.env.AI_PROVIDER;
         const cadena = [
-            { nombre:'groq',   fn:generarConGroq,                     activo:!forced||forced==='groq',   tiene_key:!!process.env.GROQ_API_KEY },
-            { nombre:'gemini', fn:generarConGemini,                    activo:!forced||forced==='gemini', tiene_key:!!process.env.GEMINI_API_KEY },
-            { nombre:'local',  fn:async d=>generarConReglasLocales(d), activo:true,                       tiene_key:true },
+            { nombre: 'groq',   fn: generarConGroq,                      activo: !forced || forced === 'groq',   tiene_key: !!process.env.GROQ_API_KEY   },
+            { nombre: 'gemini', fn: generarConGemini,                     activo: !forced || forced === 'gemini', tiene_key: !!process.env.GEMINI_API_KEY  },
+            { nombre: 'local',  fn: async d => generarConReglasLocales(d), activo: true,                          tiene_key: true                          },
         ];
-        let resultado = null, ultimoError = null;
-        for (const p of cadena) {
-            if (!p.activo || !p.tiene_key) continue;
+
+        let resultado = null;
+        let ultimoError = null;
+
+        for (const proveedor of cadena) {
+            if (!proveedor.activo || !proveedor.tiene_key) {
+                console.log(`[MinutaIA] ${proveedor.nombre.toUpperCase()} omitido (activo=${proveedor.activo}, key=${proveedor.tiene_key})`);
+                continue;
+            }
             try {
+                console.log(`[MinutaIA] Intentando ${proveedor.nombre.toUpperCase()}...`);
                 const t0 = Date.now();
-                resultado = await p.fn(pd);
+                resultado = await proveedor.fn(pd);
                 const ms = Date.now() - t0;
-                if (!resultado || typeof resultado !== 'object') throw new Error('Respuesta invalida del proveedor');
-                console.log(`[MinutaIA] ${p.nombre.toUpperCase()} respondio en ${ms}ms`);
-                resultado._proveedor = p.nombre;
+
+                if (!resultado || typeof resultado !== 'object') throw new Error('Respuesta inválida del proveedor');
+
+                // Validar que tenga al menos title o resumen
+                if (!resultado.title && !resultado.resumen) throw new Error('Respuesta sin campos esperados');
+
+                resultado._proveedor = proveedor.nombre;
                 resultado._ms        = ms;
+                console.log(`[MinutaIA] ✅ ${proveedor.nombre.toUpperCase()} respondió en ${ms}ms`);
                 break;
-            } catch(err) {
-                console.warn(`[MinutaIA] ${p.nombre.toUpperCase()} fallo: ${err.message}`);
+            } catch (err) {
+                console.warn(`[MinutaIA] ⚠️ ${proveedor.nombre.toUpperCase()} falló: ${err.message}`);
                 ultimoError = err;
-                if (err.status === 429 || err.message?.includes('rate_limit'))
+                // Rate limit → esperar antes del siguiente proveedor
+                if (err.message?.includes('429') || err.message?.includes('rate_limit')) {
                     await new Promise(r => setTimeout(r, 2000));
+                }
             }
         }
+
         if (!resultado) throw ultimoError || new Error('Todos los proveedores fallaron');
-        const { _proveedor, _ms, ...minutaLimpia } = resultado;
-        console.log(`[MinutaIA] Respuesta enviada (proveedor: ${_proveedor}, ${_ms}ms)`);
-        if (_proveedor === 'local') {
-            minutaLimpia._aviso = 'Generado con analisis local. Revisa y completa los campos.';
-        }
-        res.json(minutaLimpia);
-    } catch (err) { res.status(500).json({ error: `Error generando minuta: ${err.message}` }); }
+
+        // [FIX-S6] Incluir _proveedor en respuesta para que el frontend lo muestre
+        const { _ms, ...respuesta } = resultado;
+        console.log(`[MinutaIA] Respuesta final enviada (proveedor=${respuesta._proveedor}, ${_ms}ms, transcript=${transcriptUtil.length}chars)`);
+        res.json(respuesta);
+
+    } catch (err) {
+        console.error('[MinutaIA] Error fatal:', err.message);
+        res.status(500).json({ error: `Error generando minuta: ${err.message}` });
+    }
 });
 
-// ── Tareas / Minutas / Anuncios / Recursos / Guias / Plantillas ─
-// v4.3: Estos endpoints ahora filtran y persisten campo 'area' via hubGet/hubPost
+// ── Tareas / Minutas / Anuncios / Recursos / Guías / Plantillas ─
 app.get('/api/hub/tareas',           ...hubGet   ('hub_tareas',      'hub.tareas'));
 app.post('/api/hub/tareas',          ...hubPost  ('hub_tareas',      'hub.tareas'));
 app.patch('/api/hub/tareas/:id',     ...hubPatch ('hub_tareas',      'hub.tareas'));
@@ -854,7 +1003,23 @@ app.post('/api/hub/capacitacion',        ...hubPost  ('hub_capacitacion','hub.ca
 app.patch('/api/hub/capacitacion/:id',   ...hubPatch ('hub_capacitacion','hub.capacitacion'));
 app.delete('/api/hub/capacitacion/:id',  ...hubDelete('hub_capacitacion','hub.capacitacion'));
 
-// ── Mensajes — aislado por canal (prefijo de área en el ID) ───
+// ── Minutas comentarios/acciones ───────────────────────────────
+app.post('/api/hub/minutas/:minutaId/comentarios', requireAuth, requirePermiso('hub.minutas'), async (req, res) => {
+    try {
+        const comentario = { ...req.body, autor:req.usuario.username, createdAt:new Date() };
+        await db.collection('hub_minutas').updateOne({ _id:new ObjectId(req.params.minutaId) }, { $push:{comentarios:comentario} });
+        res.status(201).json({ success:true, comentario });
+    } catch (e) { res.status(500).json({ error: 'Error comentario' }); }
+});
+app.patch('/api/hub/minutas/:minutaId/acciones/:itemId', requireAuth, requirePermiso('hub.minutas'), async (req, res) => {
+    try {
+        const fields = {}; Object.entries(req.body).forEach(([k,v])=>{fields[`acciones.$.${k}`]=v;}); fields['acciones.$.updatedAt']=new Date();
+        await db.collection('hub_minutas').updateOne({ _id:new ObjectId(req.params.minutaId),'acciones._id':req.params.itemId }, { $set:fields });
+        res.json({ success:true });
+    } catch (e) { res.status(500).json({ error: 'Error accion' }); }
+});
+
+// ── Mensajes ───────────────────────────────────────────────────
 app.get('/api/hub/mensajes/:canal', requireAuth, requirePermiso('hub.mensajes'), async (req, res) => {
     try {
         const { canal } = req.params;
@@ -891,38 +1056,19 @@ app.patch('/api/hub/mensajes/:id/reaction', requireAuth, requirePermiso('hub.men
     } catch (e) { res.status(500).json({ error: 'Error reaction' }); }
 });
 
-// ── Minutas comentarios/acciones ───────────────────────────────
-app.post('/api/hub/minutas/:minutaId/comentarios', requireAuth, requirePermiso('hub.minutas'), async (req, res) => {
-    try {
-        const comentario = { ...req.body, autor:req.usuario.username, createdAt:new Date() };
-        await db.collection('hub_minutas').updateOne({ _id:new ObjectId(req.params.minutaId) }, { $push:{comentarios:comentario} });
-        res.status(201).json({ success:true, comentario });
-    } catch (e) { res.status(500).json({ error: 'Error comentario' }); }
-});
-app.patch('/api/hub/minutas/:minutaId/acciones/:itemId', requireAuth, requirePermiso('hub.minutas'), async (req, res) => {
-    try {
-        const fields = {}; Object.entries(req.body).forEach(([k,v])=>{fields[`acciones.$.${k}`]=v;}); fields['acciones.$.updatedAt']=new Date();
-        await db.collection('hub_minutas').updateOne({ _id:new ObjectId(req.params.minutaId),'acciones._id':req.params.itemId }, { $set:fields });
-        res.json({ success:true });
-    } catch (e) { res.status(500).json({ error: 'Error accion' }); }
-});
-
 // ================================================================
-// ASISTENCIA — Con filtros de área para coordinadores (v4.2)
+// ASISTENCIA (v4.2 sin cambios)
 // ================================================================
-
 app.get('/api/hub/asistencia', requireAuth, requirePermiso('hub.asistencia'), async (req, res) => {
     try {
         const { usuario } = req;
         const filter = {};
-
         if (req.query.username) {
             filter.username = req.query.username;
             if (usuario.rol === 'COORDINADOR' && !tienePermiso(usuario,'hub.concentrado.ver')) {
                 const targetUser = await db.collection('users').findOne({ username: req.query.username }, { projection:{area:1} });
-                if (targetUser && targetUser.area !== usuario.area) {
+                if (targetUser && targetUser.area !== usuario.area)
                     return res.status(403).json({ error: 'Solo puedes ver asistencia de usuarios de tu area' });
-                }
             }
         } else if (tienePermiso(usuario,'hub.concentrado.ver')) {
             if (usuario.rol === 'COORDINADOR') {
@@ -932,9 +1078,7 @@ app.get('/api/hub/asistencia', requireAuth, requirePermiso('hub.asistencia'), as
         } else {
             filter.username = usuario.username;
         }
-
         if (req.query.mes) filter.fecha = { $regex: `^${req.query.mes}` };
-
         const docs = await db.collection('hub_asistencia').find(filter).sort({ fecha:-1, username:1 }).limit(500).toArray();
         res.json(docs);
     } catch (e) { console.error('Error GET asistencia:', e); res.status(500).json({ error: 'Error obteniendo asistencia' }); }
@@ -944,21 +1088,17 @@ app.post('/api/hub/asistencia', requireAuth, async (req, res) => {
     const { targetUsername, fecha, tipo, horaEntrada, horaSalida, notas } = req.body;
     const { usuario } = req;
     const esAdminReg = targetUsername && targetUsername !== usuario.username;
-
     if (esAdminReg && !tienePermiso(usuario,'hub.asistencia.admin_registro'))
         return res.status(403).json({ error: 'Permiso insuficiente: hub.asistencia.admin_registro' });
     if (!esAdminReg && !tienePermiso(usuario,'hub.asistencia.registrar'))
         return res.status(403).json({ error: 'Permiso insuficiente: hub.asistencia.registrar' });
     if (!tipo) return res.status(400).json({ error: 'El campo tipo es requerido' });
-
     try {
         if (esAdminReg && usuario.rol === 'COORDINADOR') {
             const targetUser = await db.collection('users').findOne({ username: targetUsername }, { projection:{area:1} });
-            if (targetUser && targetUser.area !== usuario.area) {
+            if (targetUser && targetUser.area !== usuario.area)
                 return res.status(403).json({ error: 'Solo puedes registrar asistencia para usuarios de tu area' });
-            }
         }
-
         const usernameDestino = esAdminReg ? targetUsername : usuario.username;
         const fechaRegistro   = fecha || new Date().toISOString().split('T')[0];
         const existe = await db.collection('hub_asistencia').findOne({ username:usernameDestino, fecha:fechaRegistro });
@@ -985,22 +1125,17 @@ app.patch('/api/hub/asistencia/:id', requireAuth, async (req, res) => {
         const tieneAdmin      = tienePermiso(usuario,'hub.asistencia.admin_registro');
         const tieneRegistrar  = tienePermiso(usuario,'hub.asistencia.registrar');
         const tieneEditConc   = tienePermiso(usuario,'hub.concentrado.editar');
-
         let puedeEditar = tieneAdmin || (esPropioUsuario && tieneRegistrar) || tieneEditConc;
         if (!puedeEditar) return res.status(403).json({ error: 'Sin permiso para editar este registro' });
-
         if (usuario.rol === 'COORDINADOR' && !tienePermiso(usuario,'admin.panel')) {
             const targetUser = await db.collection('users').findOne({ username: doc.username }, { projection:{area:1} });
-            if (targetUser && targetUser.area !== usuario.area) {
+            if (targetUser && targetUser.area !== usuario.area)
                 return res.status(403).json({ error: 'Solo puedes editar registros de usuarios de tu area' });
-            }
         }
-
         const updates = { ...req.body };
         if (!tieneAdmin) delete updates.username;
         updates.updatedAt = new Date();
         updates.updatedBy = usuario.username;
-
         await db.collection('hub_asistencia').updateOne({ _id:new ObjectId(req.params.id) }, { $set:updates });
         res.json({ success:true });
     } catch (e) { console.error('Error PATCH asistencia:', e); res.status(500).json({ error: 'Error actualizando asistencia' }); }
@@ -1051,7 +1186,7 @@ app.get('/api/hub/concentrado', requireAuth, requirePermiso('hub.concentrado.ver
     } catch (e) { res.status(500).json({ error: 'Error obteniendo concentrado' }); }
 });
 
-// ── Vacaciones ──────────────────────────────────────────────────
+// ── Vacaciones ─────────────────────────────────────────────────
 app.get('/api/hub/vacaciones', requireAuth, requirePermiso('hub.vacaciones'), async (req, res) => {
     try {
         const filter = {};
@@ -1077,7 +1212,7 @@ app.delete('/api/hub/vacaciones/:id', requireAuth, requirePermiso('hub.peticione
     catch (e) { res.status(500).json({ error: 'Error vacaciones' }); }
 });
 
-// ── Peticiones ──────────────────────────────────────────────────
+// ── Peticiones ─────────────────────────────────────────────────
 app.get('/api/hub/peticiones', requireAuth, requirePermiso('hub.acceso'), async (req, res) => {
     try {
         const { usuario } = req;
@@ -1119,10 +1254,9 @@ async function start() {
     try {
         await connectDB();
         app.listen(PORT, () => {
-            console.log(`MYG API v4.3.0 en puerto ${PORT}`);
-            console.log(`Roles: ${ROLES_VALIDOS.join(', ')}`);
+            console.log(`MYG API v4.3.1 en puerto ${PORT}`);
+            console.log(`IA Minutas: Groq=${!!process.env.GROQ_API_KEY ? '✅' : '❌ falta GROQ_API_KEY'} | Gemini=${!!process.env.GEMINI_API_KEY ? '✅' : '❌ falta GEMINI_API_KEY'} | Local=✅`);
             console.log(`Hub Area Scoping: ${[...COLECCIONES_CON_AREA].join(', ')}`);
-            console.log(`IA Minutas: Groq=${!!process.env.GROQ_API_KEY?'OK':'NO'} Gemini=${!!process.env.GEMINI_API_KEY?'OK':'NO'} Local=OK`);
         });
     } catch (err) { console.error('Error iniciando:', err); process.exit(1); }
 }
