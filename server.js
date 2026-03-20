@@ -1,8 +1,8 @@
 // ============================================================
-// MYG TELECOM — API SERVER v4.3.1
+// MYG TELECOM — API SERVER v4.3.2
 // Render (Node.js) + MongoDB Atlas
 //
-// Cambios v4.3.1 (sobre v4.3.0):
+// Cambios v4.3.2 (sobre v4.3.0):
 // ─── FIXES IA MINUTAS ────────────────────────────────────────
 // [FIX-S1] buildMinutaPrompt: prompt profesional detallado con contexto
 //          MYG Telecom, instrucciones campo-por-campo y JSON estricto.
@@ -272,7 +272,7 @@ async function logAccess(username, action, details = {}) {
 // ── HEALTH ─────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({
     status: 'ok',
-    version: '4.3.1',
+    version: '4.3.2',
     timestamp: new Date().toISOString(),
     db: db ? 'connected' : 'disconnected',
     ia: {
@@ -694,47 +694,63 @@ app.patch('/api/hub/reuniones/:id',  ...hubPatch ('hub_reuniones','hub.reuniones
 app.delete('/api/hub/reuniones/:id', ...hubDelete('hub_reuniones','hub.reuniones'));
 
 // ================================================================
-// IA MINUTAS v4.3.1 — Groq REST + Gemini SDK + Local fallback
+// IA MINUTAS v4.3.2 — Groq REST + Gemini SDK + Local fallback
 // ================================================================
 
-// [FIX-S1] Prompt profesional detallado — contexto MYG Telecom + instrucciones por campo
-const buildMinutaPrompt = ({ transcript, meetingTitle, meetingDate, meetingTime, attendees, agenda, duracion, notasAdicionales }) => {
+// [FIX-S1 v2] Prompt profesional — contexto MYG Telecom + schema extendido con todos los campos nuevos
+const buildMinutaPrompt = ({ transcript, meetingTitle, meetingDate, meetingTime, attendees, agenda, duracion, notasAdicionales, modoAudio, usóWhisper }) => {
     const durMin = Math.ceil((duracion || 0) / 60);
     const asistentes = Array.isArray(attendees) ? attendees.join(', ') : (attendees || 'No especificados');
     const hasTranscript = transcript && transcript.trim().length > 5;
-    const transcriptText = hasTranscript ? transcript.trim() : '(Sin transcripción de voz — usar contexto de la agenda)';
-    const notasText = notasAdicionales && notasAdicionales.trim() ? `\nNOTAS MANUALES DEL ORGANIZADOR: ${notasAdicionales.trim()}` : '';
+    // Detectar si el transcript tiene timestamps [00:02:15] — viene de Whisper o SpeechRecognition segmentado
+    const tieneTimestamps = hasTranscript && /\[\d{2}:\d{2}(:\d{2})?\]/.test(transcript);
+    const transcriptText = hasTranscript
+        ? transcript.trim()
+        : '(Sin transcripción de voz — usar contexto de la agenda y notas del organizador)';
+    const notasText = notasAdicionales?.trim() ? `\nNOTAS DEL ORGANIZADOR:\n${notasAdicionales.trim()}` : '';
+    const modoText  = modoAudio === 'sistema' ? ' (grabación de reunión virtual — todos los participantes)' : ' (micrófono local)';
 
-    const systemPrompt = `Eres el asistente corporativo oficial de MYG Telecom, empresa de telecomunicaciones mexicana.
-Tu especialidad es redactar minutas ejecutivas formales en español mexicano profesional para el área de Sistemas/IT.
-REGLAS ABSOLUTAS:
-1. Responde ÚNICAMENTE con JSON válido. Sin backticks, sin texto antes o después.
-2. Todos los campos en español mexicano formal.
-3. El campo "resumen" debe ser un párrafo ejecutivo de 3-5 oraciones que capture los temas principales.
-4. El campo "decisions" debe listar solo decisiones concretas tomadas, como bullet points con "•".
-5. El campo "acciones" debe ser un array de strings, cada uno con formato "Responsable: Acción concreta [Fecha límite si se mencionó]".
-6. Si no hay información suficiente para un campo, escribe una cadena vacía "", NO inventes datos.
-7. El campo "observaciones" es para notas adicionales, próximas reuniones, o contexto relevante.`;
+    const systemPrompt = `Eres el secretario ejecutivo corporativo de MYG Telecom, empresa mexicana de telecomunicaciones.
+Tu función es redactar minutas ejecutivas formales, precisas y accionables en español mexicano profesional para el área de Sistemas/IT.
 
-    const userPrompt = `Genera la minuta ejecutiva formal para esta reunión de MYG Telecom:
+REGLAS CRÍTICAS — DEBES SEGUIRLAS AL PIE DE LA LETRA:
+1. Responde ÚNICAMENTE con JSON válido. Cero backticks, cero texto fuera del JSON.
+2. Español mexicano formal. Sin anglicismos innecesarios.
+3. "tipoReunion": clasifica el tipo usando SOLO uno de estos valores exactos: seguimiento, kickoff, retrospectiva, planificacion, revision, urgente, capacitacion, otro
+4. "resumen": párrafo ejecutivo de 3-6 oraciones. Debe capturar: objetivo principal, temas clave tratados, y resultado o estado general. NO es una lista — es prosa ejecutiva fluida.
+5. "temasTratados": array de strings, uno por tema identificado. Formato: "Nombre del tema: breve descripción de lo discutido". Mínimo 1, máximo 8.
+6. "decisions": string con bullet points "•". Solo decisiones CONCRETAS y CONFIRMADAS. Si no hay, dejar vacío "".
+7. "acciones": array de objetos con exactamente 3 campos: responsable (nombre o rol), accion (qué debe hacer), fechaLimite (cuándo, o "" si no se mencionó).
+8. "proximaReunion": string con fecha, hora y objetivo de la siguiente reunión. Si no se mencionó, dejar vacío "".
+9. "observaciones": notas adicionales, contexto importante, riesgos identificados. Si no hay, dejar vacío "".
+10. NO inventes información que no esté en la transcripción o notas. Si un campo no tiene datos suficientes, escribe "".`;
 
-DATOS DE LA REUNIÓN:
+    const userPrompt = `Genera la minuta ejecutiva para esta reunión de MYG Telecom:
+
+METADATOS:
 - Título: ${meetingTitle || 'Reunión de Sistemas MYG Telecom'}
 - Fecha: ${meetingDate || 'No especificada'}${meetingTime ? ' a las ' + meetingTime : ''}
-- Duración: ${durMin > 0 ? durMin + ' minutos' : 'No especificada'}
+- Duración: ${durMin > 0 ? durMin + ' minutos' : 'No registrada'}
 - Asistentes: ${asistentes}
-- Agenda: ${agenda || 'No especificada'}${notasText}
+- Agenda previa: ${agenda || 'No especificada'}
+- Modo de grabación: ${modoText}${notasText}
 
-TRANSCRIPCIÓN DE LA REUNIÓN:
+TRANSCRIPCIÓN${tieneTimestamps ? ' (con timestamps MM:SS)' : ''}:
 ${transcriptText}
 
-Responde con este JSON exacto (sin backticks, sin texto adicional):
+Responde con EXACTAMENTE este JSON (sin backticks, sin texto adicional):
 {
   "title": "Minuta: ${meetingTitle || 'Reunión de Sistemas'}",
-  "resumen": "Párrafo ejecutivo de 3-5 oraciones sobre los temas tratados",
-  "decisions": "• Primera decisión tomada\\n• Segunda decisión tomada",
-  "acciones": ["Responsable: Acción concreta", "Responsable2: Otra acción"],
-  "observaciones": "Observaciones adicionales, próxima reunión, etc."
+  "tipoReunion": "seguimiento",
+  "resumen": "Párrafo ejecutivo de 3-6 oraciones sobre temas tratados, decisiones clave y resultado general",
+  "temasTratados": ["Tema 1: descripción de lo discutido", "Tema 2: descripción"],
+  "decisions": "• Primera decisión concreta\\n• Segunda decisión concreta",
+  "acciones": [
+    {"responsable": "Nombre o Rol", "accion": "Descripción clara de la acción", "fechaLimite": "fecha o plazo"},
+    {"responsable": "Nombre o Rol", "accion": "Otra acción", "fechaLimite": ""}
+  ],
+  "proximaReunion": "Fecha, hora y objetivo de la siguiente reunión, o vacío",
+  "observaciones": "Notas adicionales, riesgos, contexto relevante, o vacío"
 }`;
 
     return { system: systemPrompt, user: userPrompt };
@@ -759,7 +775,7 @@ const generarConGroq = async (pd) => {
             signal: controller.signal,
             body: JSON.stringify({
                 model:       'llama-3.3-70b-versatile',
-                max_tokens:  1400,
+                max_tokens:  2000,
                 temperature: 0.25,
                 messages: [
                     { role: 'system', content: p.system },
@@ -803,7 +819,7 @@ const generarConGemini = async (pd) => {
         try {
             const model = new GoogleGenerativeAI(apiKey).getGenerativeModel({
                 model: 'gemini-2.0-flash',
-                generationConfig: { temperature: 0.25, maxOutputTokens: 1400, responseMimeType: 'application/json' },
+                generationConfig: { temperature: 0.25, maxOutputTokens: 2000, responseMimeType: 'application/json' },
                 systemInstruction: p.system,
             });
             const result = await model.generateContent(p.user);
@@ -829,7 +845,7 @@ const generarConGemini = async (pd) => {
             body: JSON.stringify({
                 contents: [{ parts: [{ text: p.user }] }],
                 systemInstruction: { parts: [{ text: p.system }] },
-                generationConfig: { temperature: 0.25, maxOutputTokens: 1400, responseMimeType: 'application/json' },
+                generationConfig: { temperature: 0.25, maxOutputTokens: 2000, responseMimeType: 'application/json' },
             }),
         });
         clearTimeout(timeout);
@@ -843,49 +859,121 @@ const generarConGemini = async (pd) => {
     }
 };
 
-// [FIX-S5] Motor local mejorado — acciones sin punto doble
+// [FIX-S5 v2] Motor local — retorna todos los campos nuevos con formato correcto
 const generarConReglasLocales = (pd) => {
     const { transcript = '', meetingTitle = 'Reunión', meetingDate = '', meetingTime = '', attendees = [], agenda = '', duracion = 0, notasAdicionales = '' } = pd;
     const durMin = Math.ceil(duracion / 60);
-
-    // Fuente de texto: transcript + notas
     const fuenteTexto = [transcript, notasAdicionales].filter(Boolean).join(' ').trim();
-    const oraciones = fuenteTexto.split(/[.!?;]\s+/).map(s => s.trim()).filter(s => s.length > 15);
-
-    const stopwords = new Set(['el','la','los','las','un','una','de','del','en','y','a','que','se','es','no','con','por','para','como','mas','pero','su','sus','al','lo','le','les']);
+    // Limpiar timestamps [00:02:15] del texto antes de procesar
+    const textoLimpio = fuenteTexto.replace(/\[\d{2}:\d{2}(:\d{2})?\]\s*/g, '');
+    const oraciones = textoLimpio.split(/[.!?;]\s+/).map(s => s.trim()).filter(s => s.length > 15);
+    const stopwords = new Set(['el','la','los','las','un','una','de','del','en','y','a','que','se','es','no','con','por','para','como','mas','pero','su','sus','al','lo','le','les','este','esta','estos','estas']);
     const score = s => new Set(s.toLowerCase().split(/\s+/).filter(w => !stopwords.has(w) && w.length > 3)).size;
-
-    const mejoresOraciones = oraciones
-        .map(o => ({ text: o, score: score(o) }))
-        .sort((a, b) => b.score - a.score)
-        .slice(0, 5)
-        .map(o => o.text + '.');
-
-    // Decisiones: buscar patrones explícitos
-    const decisiones = oraciones
-        .filter(o => /\b(se decide|se acuerda|se aprueba|quedamos|acordamos|decidimos)\b/i.test(o))
-        .slice(0, 5)
-        .map(d => `• ${d.trim().replace(/\.$/, '')}.`);
-
-    // Acciones: buscar compromisos — SIN añadir punto si ya termina en punto
-    const acciones = oraciones
-        .filter(o => /\b(pendiente|entregar|revisar|enviar|actualizar|verificar|contactar|coordinar|preparar|elaborar)\b/i.test(o))
+    const mejoresOraciones = oraciones.map(o => ({ text: o, score: score(o) })).sort((a,b) => b.score - a.score).slice(0, 5).map(o => o.text + '.');
+    const decisiones = oraciones.filter(o => /\b(se decide|se acuerda|se aprueba|quedamos|acordamos|decidimos|se autoriza)\b/i.test(o)).slice(0, 5).map(d => `• ${d.trim().replace(/\.$/, '')}.`);
+    // Acciones como objetos estructurados
+    const accionesObjs = oraciones
+        .filter(o => /\b(pendiente|entregar|revisar|enviar|actualizar|verificar|contactar|coordinar|preparar|elaborar|subir|bajar|migrar)\b/i.test(o))
         .slice(0, 6)
-        .map(a => a.trim().replace(/\.$/, '')); // [FIX-S5] quitar punto antes de normalizeAcciones lo procese
+        .map(a => {
+            const s = a.trim().replace(/\.$/, '');
+            return { responsable: '', accion: s, fechaLimite: '' };
+        });
+    // Temas tratados — agrupar por palabras clave del texto
+    const temasTratados = [];
+    if (agenda) { agenda.split(/[,;]/).map(t => t.trim()).filter(Boolean).slice(0, 5).forEach(t => { temasTratados.push(`${t}: discutido durante la reunión`); }); }
+    else if (mejoresOraciones.length > 0) { temasTratados.push(`Temas generales: ${mejoresOraciones[0]}`); }
+    if (temasTratados.length === 0) temasTratados.push('Temas de la reunión: ver transcripción');
 
     const agendaTexto = agenda ? `Agenda: ${agenda}.` : '';
     const resumenBase = mejoresOraciones.length > 0
-        ? mejoresOraciones.join(' ')
+        ? mejoresOraciones.slice(0, 3).join(' ')
         : `Reunión "${meetingTitle}" del ${meetingDate}${meetingTime ? ' a las ' + meetingTime : ''}. ${agendaTexto} Duración: ${durMin} min. Por favor complementa los detalles.`;
 
     return {
-        title:        `Minuta: ${meetingTitle}`,
-        resumen:      resumenBase,
-        decisions:    decisiones.join('\n') || '',
-        acciones,   // array de strings limpios
-        observaciones: `Reunión de ${durMin > 0 ? durMin + ' min' : 'duración no registrada'} con ${Array.isArray(attendees) ? attendees.length : 0} asistente(s). ${notasAdicionales ? 'Notas: ' + notasAdicionales : ''}`.trim(),
+        title: `Minuta: ${meetingTitle}`,
+        tipoReunion: 'seguimiento',
+        resumen: resumenBase,
+        temasTratados,
+        decisions: decisiones.join('\n') || '',
+        acciones: accionesObjs,
+        proximaReunion: '',
+        observaciones: `Reunión de ${durMin > 0 ? durMin + ' min' : 'duración no registrada'} con ${Array.isArray(attendees) ? attendees.length : 0} asistente(s).${notasAdicionales ? ' Notas: ' + notasAdicionales : ''}`.trim(),
     };
 };
+
+// ── Endpoint: Transcribir audio con Groq Whisper ─────────────
+// [NEW v4.3.2] Recibe audio en base64 → Groq Whisper → transcript con timestamps
+app.post('/api/hub/reuniones/:id/transcribir-audio', requireAuth, requirePermiso('hub.reuniones'), async (req, res) => {
+    try {
+        const { audio, mimeType = 'audio/webm', duracion = 0, lang = 'es' } = req.body;
+        const apiKey = process.env.GROQ_API_KEY;
+        if (!apiKey) return res.status(503).json({ error: 'GROQ_API_KEY no configurada para Whisper' });
+        if (!audio) return res.status(400).json({ error: 'Campo audio (base64) requerido' });
+
+        // Decode base64 → Buffer
+        const audioBuffer = Buffer.from(audio, 'base64');
+        if (audioBuffer.length < 1000) {
+            return res.status(400).json({ error: 'Audio demasiado corto para transcribir' });
+        }
+
+        // Determinar extensión desde mimeType
+        const extMap = {
+            'audio/webm': 'webm', 'audio/webm;codecs=opus': 'webm',
+            'audio/ogg':  'ogg',  'audio/ogg;codecs=opus':  'ogg',
+            'audio/mp4':  'm4a',  'audio/mpeg': 'mp3', 'audio/wav': 'wav',
+        };
+        const ext = extMap[mimeType] || extMap[mimeType.split(';')[0]] || 'webm';
+        const filename = `reunion-${Date.now()}.${ext}`;
+
+        // Construir FormData para Groq Whisper
+        const formData = new FormData();
+        const blob = new Blob([audioBuffer], { type: mimeType });
+        formData.append('file', blob, filename);
+        formData.append('model', 'whisper-large-v3-turbo'); // más rápido, muy preciso
+        formData.append('language', lang || 'es');
+        formData.append('response_format', 'verbose_json');  // incluye timestamps
+        formData.append('temperature', '0');                  // máxima precisión
+
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 300000); // 5min para audio largo
+
+        try {
+            const response = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+                method:  'POST',
+                headers: { 'Authorization': `Bearer ${apiKey}` },
+                body:    formData,
+                signal:  controller.signal,
+            });
+            clearTimeout(timeout);
+
+            if (!response.ok) {
+                const errText = await response.text().catch(() => '');
+                throw new Error(`Groq Whisper HTTP ${response.status}: ${errText.slice(0, 300)}`);
+            }
+
+            const data = await response.json();
+            const transcript = data.text || '';
+            const segments   = (data.segments || []).map(s => ({
+                start: s.start || 0,
+                end:   s.end   || 0,
+                text:  (s.text || '').trim(),
+            }));
+
+            console.log(`[Whisper] Transcripción completada: ${transcript.length} chars, ${segments.length} segmentos, audio ${Math.round(audioBuffer.length/1024)}KB`);
+            res.json({ transcript, segments, duracion, idioma: data.language || lang });
+
+        } finally {
+            clearTimeout(timeout);
+        }
+    } catch (err) {
+        console.error('[Whisper] Error:', err.message);
+        if (err.name === 'AbortError') {
+            return res.status(504).json({ error: 'Timeout transcribiendo audio — intenta con grabaciones más cortas' });
+        }
+        res.status(500).json({ error: `Error en transcripción: ${err.message}` });
+    }
+});
 
 // ── Endpoint: Generar Minuta con IA ───────────────────────────
 app.post('/api/hub/reuniones/:id/generar-minuta', requireAuth, requirePermiso('hub.reuniones'), async (req, res) => {
@@ -898,11 +986,13 @@ app.post('/api/hub/reuniones/:id/generar-minuta', requireAuth, requirePermiso('h
             attendees,
             agenda,
             duracion,
-            notasAdicionales = '',  // [FIX-R1] nuevo campo
+            notasAdicionales = '',
+            modoAudio        = 'microfono',
+            usóWhisper       = false,
         } = req.body;
 
         const transcriptUtil = transcript.trim();
-        const pd = { transcript: transcriptUtil, meetingTitle, meetingDate, meetingTime, attendees, agenda, duracion, notasAdicionales };
+        const pd = { transcript: transcriptUtil, meetingTitle, meetingDate, meetingTime, attendees, agenda, duracion, notasAdicionales, modoAudio, usóWhisper };
 
         // [FIX-S2] ELIMINADO el gate "if (length < 30) return local"
         // Ahora SIEMPRE intenta Groq → Gemini → local, sin importar longitud
@@ -1254,7 +1344,7 @@ async function start() {
     try {
         await connectDB();
         app.listen(PORT, () => {
-            console.log(`MYG API v4.3.1 en puerto ${PORT}`);
+            console.log(`MYG API v4.3.2 en puerto ${PORT}`);
             console.log(`IA Minutas: Groq=${!!process.env.GROQ_API_KEY ? '✅' : '❌ falta GROQ_API_KEY'} | Gemini=${!!process.env.GEMINI_API_KEY ? '✅' : '❌ falta GEMINI_API_KEY'} | Local=✅`);
             console.log(`Hub Area Scoping: ${[...COLECCIONES_CON_AREA].join(', ')}`);
         });
