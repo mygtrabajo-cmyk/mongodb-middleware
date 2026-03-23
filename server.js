@@ -85,6 +85,8 @@ async function connectDB() {
     await idx('hub_mensajes',   { canal: 1, createdAt: -1 }, { name: 'mensajes_canal_fecha' });
     await idx('hub_tareas',     { area: 1, createdAt: -1 }, { name: 'tareas_area_fecha'     });
     await idx('hub_minutas',    { area: 1, createdAt: -1 }, { name: 'minutas_area_fecha'    });
+    await idx('hub_minutas',    { invitadoUsernames: 1 },   { name: 'minutas_invitados'     });
+    await idx('hub_reuniones',  { invitadoUsernames: 1 },   { name: 'reuniones_invitados'   });
     await idx('hub_anuncios',   { area: 1, createdAt: -1 }, { name: 'anuncios_area_fecha'   });
     await idx('hub_recursos',   { area: 1, createdAt: -1 }, { name: 'recursos_area_fecha'   });
     await idx('hub_guias',      { area: 1, createdAt: -1 }, { name: 'guias_area_fecha'      });
@@ -693,6 +695,62 @@ app.post('/api/hub/reuniones',       ...hubPost  ('hub_reuniones','hub.reuniones
 app.patch('/api/hub/reuniones/:id',  ...hubPatch ('hub_reuniones','hub.reuniones'));
 app.delete('/api/hub/reuniones/:id', ...hubDelete('hub_reuniones','hub.reuniones'));
 
+// ── [NEW] Usuarios disponibles para invitar a una reunión ──────
+// Devuelve 3 grupos según el rol del solicitante:
+//   miArea:      usuarios activos del área propia (siempre)
+//   otrosCoordi: coordinadores de otras áreas (solo COORDINADOR+)
+//   gerencia:    GERENTE_OPERACIONES + ADMIN (solo COORDINADOR+)
+app.get('/api/hub/usuarios-reunion', requireAuth, requirePermiso('hub.reuniones'), async (req, res) => {
+    try {
+        const { usuario } = req;
+        const rol  = usuario.rol;
+        const area = usuario.area;
+
+        // Todos los usuarios activos (sin password)
+        const todos = await db.collection('users')
+            .find({ activo: true }, { projection: { password: 0 } })
+            .toArray();
+
+        const toInfo = (u) => ({
+            username: u.username,
+            nombre:   u.nombre,
+            rol:      normalizarRol(u.rol),
+            area:     u.area || null,
+        });
+
+        // Grupo 1: Mi área (excluyendo al propio usuario)
+        const miArea = todos
+            .filter(u => u.username !== usuario.username && u.area === area)
+            .map(toInfo);
+
+        // Grupos 2 y 3: solo para COORDINADOR, GERENTE_OPERACIONES, ADMIN
+        const puedeInvitarCruzado = ['ADMIN','GERENTE_OPERACIONES','COORDINADOR'].includes(rol);
+
+        let otrosCoordi = [];
+        let gerencia    = [];
+
+        if (puedeInvitarCruzado) {
+            // Coordinadores de otras áreas
+            otrosCoordi = todos
+                .filter(u => u.username !== usuario.username
+                          && u.area !== area
+                          && normalizarRol(u.rol) === 'COORDINADOR')
+                .map(toInfo);
+
+            // Gerencia: GERENTE_OPERACIONES y ADMIN
+            gerencia = todos
+                .filter(u => u.username !== usuario.username
+                          && ['ADMIN','GERENTE_OPERACIONES'].includes(normalizarRol(u.rol)))
+                .map(toInfo);
+        }
+
+        res.json({ miArea, otrosCoordi, gerencia });
+    } catch (e) {
+        console.error('Error usuarios-reunion:', e);
+        res.status(500).json({ error: 'Error obteniendo usuarios para reunión' });
+    }
+});
+
 // ================================================================
 // IA MINUTAS v4.3.2 — Groq REST + Gemini SDK + Local fallback
 // ================================================================
@@ -1063,7 +1121,48 @@ app.post('/api/hub/tareas',          ...hubPost  ('hub_tareas',      'hub.tareas
 app.patch('/api/hub/tareas/:id',     ...hubPatch ('hub_tareas',      'hub.tareas'));
 app.delete('/api/hub/tareas/:id',    ...hubDelete('hub_tareas',      'hub.tareas'));
 
-app.get('/api/hub/minutas',          ...hubGet   ('hub_minutas',     'hub.minutas'));
+// ── Minutas — con visibilidad cross-área para invitados ────────
+// Un usuario ve las minutas:
+//   1. Del área que le corresponde (scoping normal)
+//   2. De cualquier área si aparece en invitadoUsernames[]
+app.get('/api/hub/minutas', requireAuth, requirePermiso('hub.minutas'), async (req, res) => {
+    try {
+        const { usuario } = req;
+        const limit  = Math.min(parseInt(req.query.limit) || 100, 500);
+        const area   = req.query.area || usuario.area || 'Sistemas';
+
+        // Filtro por área propia (backward compat)
+        let areaFilter;
+        if (area === 'Sistemas') {
+            areaFilter = { $or: [{ area:'Sistemas' }, { area:{ $exists:false } }, { area:null }] };
+        } else {
+            areaFilter = { area };
+        }
+
+        // ADMIN y GERENTE_OPERACIONES ven todo
+        const verTodo = ['ADMIN','GERENTE_OPERACIONES'].includes(usuario.rol) || (usuario.permisos||[]).includes('*');
+
+        let filter;
+        if (verTodo) {
+            filter = req.query.area ? areaFilter : {};
+        } else {
+            // Ver minutas del área propia O donde estoy en invitadoUsernames
+            filter = { $or: [ areaFilter, { invitadoUsernames: usuario.username } ] };
+        }
+
+        if (req.query.estado) filter.estado = req.query.estado;
+
+        const docs = await db.collection('hub_minutas')
+            .find(filter)
+            .sort({ createdAt: -1 })
+            .limit(limit)
+            .toArray();
+
+        res.json(docs);
+    } catch (e) {
+        res.status(500).json({ error: 'Error hub_minutas' });
+    }
+});
 app.post('/api/hub/minutas',         ...hubPost  ('hub_minutas',     'hub.minutas'));
 app.patch('/api/hub/minutas/:id',    ...hubPatch ('hub_minutas',     'hub.minutas'));
 app.delete('/api/hub/minutas/:id',   ...hubDelete('hub_minutas',     'hub.minutas'));
