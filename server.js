@@ -1,24 +1,33 @@
 // ============================================================
-// MYG TELECOM — API SERVER v4.3.2
+// MYG TELECOM — API SERVER v4.3.3
 // Render (Node.js) + MongoDB Atlas
 //
-// Cambios v4.3.2 (sobre v4.3.0):
-// ─── FIXES IA MINUTAS ────────────────────────────────────────
-// [FIX-S1] buildMinutaPrompt: prompt profesional detallado con contexto
-//          MYG Telecom, instrucciones campo-por-campo y JSON estricto.
-// [FIX-S2] Eliminado gate transcript < 30 chars que bloqueaba Groq/Gemini.
-//          Ahora SIEMPRE se intenta IA, sin importar longitud del transcript.
-// [FIX-S3] generarConGroq reescrito con fetch REST directo a api.groq.com
-//          (sin depender del SDK groq-sdk instalado en producción).
-//          Timeout de 22s propio para no exceder el límite de Cloudflare Worker.
-// [FIX-S4] generarConGemini con timeout 22s y fallback limpio.
-// [FIX-S5] generarConReglasLocales: acciones sin punto doble, mejor extracción.
-// [FIX-S6] Endpoint generar-minuta: responde _proveedor y _ms al cliente.
-// ─── Sin cambios en el resto del servidor ────────────────────
+// ── CAMBIOS v4.3.3 (sobre v4.3.2) ────────────────────────────
+// [FIX-A1] POST /api/activos/movimientos:
+//          El frontend envía { movimientos: [...] }.
+//          Antes: insertOne({...req.body}) guardaba UN solo documento
+//          con la clave "movimientos" conteniendo el array —
+//          los registros individuales nunca llegaban a la colección.
+//          Ahora: insertMany() de cada elemento del array,
+//          añadiendo creadoPor + createdAt a cada uno.
+//          Compatibilidad hacia atrás: si el body NO trae
+//          "movimientos" (body plano), se hace insertOne como antes.
 //
-// Cambios v4.3.0 (sobre v4.2.0):
-// - Hub Area Scoping: tareas, minutas, anuncios, recursos,
-//   guías y plantillas aislados por área
+// [FIX-A2] GET /api/activos/movimientos:
+//          Respetaba el parámetro ?limit=N del query string.
+//          Antes estaba hardcodeado en .limit(500) sin leerlo.
+//          Nuevo máximo configurable: min(req.query.limit, 1000).
+//          Respuesta envuelta en { movimientos: [...], total }
+//          para que el frontend pueda usar data.movimientos.
+//
+// [FIX-A3] NUEVO: PATCH /api/activos/movimientos/:id
+//          Permite editar cualquier campo de un movimiento
+//          (edición normal) y confirmar la entrega de salidas
+//          (campo "Entrega Confirmada": true).
+//          Requiere permiso activos.registrar.
+//          Solo aplica sobre documentos con _id válido de MongoDB.
+//
+// ── Sin cambios en el resto del servidor v4.3.2 ──────────────
 // ============================================================
 
 require('dotenv').config();
@@ -91,6 +100,10 @@ async function connectDB() {
     await idx('hub_recursos',   { area: 1, createdAt: -1 }, { name: 'recursos_area_fecha'   });
     await idx('hub_guias',      { area: 1, createdAt: -1 }, { name: 'guias_area_fecha'      });
     await idx('hub_plantillas', { area: 1, createdAt: -1 }, { name: 'plantillas_area_fecha' });
+    // [FIX-A2] Índice para búsquedas frecuentes sobre activos
+    await idx('activos_movimientos', { createdAt: -1 },      { name: 'activos_fecha'         });
+    await idx('activos_movimientos', { 'Almacen': 1 },       { name: 'activos_almacen'       });
+    await idx('activos_movimientos', { 'Tipo de Movimiento': 1 }, { name: 'activos_tipo'     });
 
     return client;
 }
@@ -274,7 +287,7 @@ async function logAccess(username, action, details = {}) {
 // ── HEALTH ─────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({
     status: 'ok',
-    version: '4.3.2',
+    version: '4.3.3',
     timestamp: new Date().toISOString(),
     db: db ? 'connected' : 'disconnected',
     ia: {
@@ -572,17 +585,174 @@ app.delete('/api/notificaciones', requireAuth, async (req, res) => {
     } catch (e) { res.status(500).json({ error: 'Error eliminando notificaciones' }); }
 });
 
-// ── RH / ACTIVOS / FORMATOS / CHAT ──────────────────────────────
-app.get('/api/rh/movimientos',         requireAuth, requirePermiso('rh.movimientos.ver'),      async (req, res) => { try { const q={}; if(req.query.tipo) q.tipo=req.query.tipo; res.json(await db.collection('rh_movimientos').find(q).sort({createdAt:-1}).limit(200).toArray()); } catch(e){res.status(500).json({error:'Error RH'})} });
-app.post('/api/rh/movimientos',        requireAuth, requirePermiso('rh.movimientos.crear'),    async (req, res) => { try { const m={...req.body,creadoPor:req.usuario.username,createdAt:new Date(),estado:'pendiente'}; await db.collection('rh_movimientos').insertOne(m); res.status(201).json({success:true,movimiento:m}); } catch(e){res.status(500).json({error:'Error RH'})} });
-app.put('/api/rh/movimientos/:id',     requireAuth, requirePermiso('rh.movimientos.gestionar'),async (req, res) => { try { const r=await db.collection('rh_movimientos').updateOne({_id:new ObjectId(req.params.id)},{$set:{...req.body,updatedAt:new Date(),updatedBy:req.usuario.username}}); if(!r.matchedCount) return res.status(404).json({error:'No encontrado'}); res.json({success:true}); } catch(e){res.status(500).json({error:'Error RH'})} });
+// ── RH ──────────────────────────────────────────────────────────
+app.get('/api/rh/movimientos',              requireAuth, requirePermiso('rh.movimientos.ver'),      async (req, res) => { try { const q={}; if(req.query.tipo) q.tipo=req.query.tipo; res.json(await db.collection('rh_movimientos').find(q).sort({createdAt:-1}).limit(200).toArray()); } catch(e){res.status(500).json({error:'Error RH'})} });
+app.post('/api/rh/movimientos',             requireAuth, requirePermiso('rh.movimientos.crear'),    async (req, res) => { try { const m={...req.body,creadoPor:req.usuario.username,createdAt:new Date(),estado:'pendiente'}; await db.collection('rh_movimientos').insertOne(m); res.status(201).json({success:true,movimiento:m}); } catch(e){res.status(500).json({error:'Error RH'})} });
+app.put('/api/rh/movimientos/:id',          requireAuth, requirePermiso('rh.movimientos.gestionar'),async (req, res) => { try { const r=await db.collection('rh_movimientos').updateOne({_id:new ObjectId(req.params.id)},{$set:{...req.body,updatedAt:new Date(),updatedBy:req.usuario.username}}); if(!r.matchedCount) return res.status(404).json({error:'No encontrado'}); res.json({success:true}); } catch(e){res.status(500).json({error:'Error RH'})} });
 app.patch('/api/rh/movimientos/:id/estado', requireAuth, requirePermiso('rh.movimientos.gestionar'), async (req, res) => { try { const {estado,comentario}=req.body; await db.collection('rh_movimientos').updateOne({_id:new ObjectId(req.params.id)},{$set:{estado,comentario,updatedAt:new Date(),updatedBy:req.usuario.username}}); res.json({success:true}); } catch(e){res.status(500).json({error:'Error RH'})} });
-app.get('/api/activos/movimientos',    requireAuth, requirePermiso('activos.ver'),             async (req, res) => { try { res.json(await db.collection('activos_movimientos').find({}).sort({createdAt:-1}).limit(500).toArray()); } catch(e){res.status(500).json({error:'Error activos'})} });
-app.post('/api/activos/movimientos',   requireAuth, requirePermiso('activos.registrar'),       async (req, res) => { try { const m={...req.body,creadoPor:req.usuario.username,createdAt:new Date()}; await db.collection('activos_movimientos').insertOne(m); res.status(201).json({success:true,movimiento:m}); } catch(e){res.status(500).json({error:'Error activos'})} });
-app.get('/api/devices',                requireAuth, requirePermiso('dashboard.dispositivos'),  async (req, res) => { try { res.json(await db.collection('dispositivos').find({}).toArray()); } catch(e){res.status(500).json({error:'Error dispositivos'})} });
-app.get('/api/formatos/sistemas',      requireAuth, requirePermiso('formatos.generar'),        async (req, res) => { try { const sistemas = await db.collection('formatos_sistemas').find({activo:true}).toArray();res.json({ sistemas }); } catch(e){res.status(500).json({error:'Error formatos'})} });
-app.post('/api/formatos/generar',      requireAuth, requirePermiso('formatos.generar'),        async (req, res) => { try { const {sistema,userData}=req.body; if(!sistema) return res.status(400).json({error:'Sistema requerido'}); const s=await db.collection('formatos_sistemas').findOne({nombre:sistema,activo:true}); if(!s) return res.status(404).json({error:`Sistema '${sistema}' no encontrado`}); await db.collection('formatos_log').insertOne({sistema,userData,solicitadoPor:req.usuario.username,createdAt:new Date(),estado:'generado'}); res.json({success:true,sistema:s,userData}); } catch(e){res.status(500).json({error:'Error formato'})} });
-app.post('/api/formatos/clear-cache',  requireAuth, requirePermiso('formatos.generar'),        (req, res) => res.json({ success: true, message: 'Cache limpiada' }));
+
+// ── ACTIVOS — VERSIÓN CORREGIDA v4.3.3 ─────────────────────────
+//
+// [FIX-A2] GET: respeta ?limit=N y retorna { movimientos: [], total }
+app.get('/api/activos/movimientos', requireAuth, requirePermiso('activos.ver'), async (req, res) => {
+    try {
+        const limit  = Math.min(parseInt(req.query.limit) || 200, 1000);
+        const filter = {};
+
+        // Filtros opcionales útiles para búsquedas futuras
+        if (req.query.almacen)         filter['Almacen']              = req.query.almacen.toUpperCase();
+        if (req.query.tipo_movimiento) filter['Tipo de Movimiento']   = req.query.tipo_movimiento.toUpperCase();
+        if (req.query.confirmada !== undefined) {
+            filter['Entrega Confirmada'] = req.query.confirmada === 'true';
+        }
+
+        const [movimientos, total] = await Promise.all([
+            db.collection('activos_movimientos')
+              .find(filter)
+              .sort({ createdAt: -1 })
+              .limit(limit)
+              .toArray(),
+            db.collection('activos_movimientos').countDocuments(filter),
+        ]);
+
+        // Respuesta envuelta: el frontend acepta { movimientos: [] } o []
+        res.json({ movimientos, total });
+    } catch (e) {
+        console.error('Error GET activos:', e);
+        res.status(500).json({ error: 'Error obteniendo activos' });
+    }
+});
+
+// [FIX-A1] POST: el frontend manda { movimientos: [...] }
+//          Se usa insertMany para crear un documento por activo.
+//          Si el body es plano (sin clave "movimientos"), compatibilidad
+//          con clientes que llamen el endpoint directamente.
+app.post('/api/activos/movimientos', requireAuth, requirePermiso('activos.registrar'), async (req, res) => {
+    try {
+        const { movimientos } = req.body;
+
+        // ── Ruta normal: array de registros ─────────────────
+        if (Array.isArray(movimientos) && movimientos.length > 0) {
+            // Sanitizar y enriquecer cada documento antes de persistir
+            const docs = movimientos.map(m => {
+                // Eliminar el _id local generado por el frontend (Date.now + Math.random)
+                // MongoDB asignará su propio ObjectId
+                const { _id: _localId, ...rest } = m;
+                return {
+                    ...rest,
+                    creadoPor:  req.usuario.username,
+                    createdAt:  new Date(),
+                    // Normalizar el tipo de movimiento a mayúsculas por consistencia
+                    'Tipo de Movimiento': (rest['Tipo de Movimiento'] || '').toUpperCase(),
+                    // Asegurar que Entrega Confirmada empiece en false si no viene
+                    'Entrega Confirmada': rest['Entrega Confirmada'] ?? false,
+                    'Fecha Confirmacion Entrega': rest['Fecha Confirmacion Entrega'] || null,
+                    'Confirmado Por': rest['Confirmado Por'] || null,
+                };
+            });
+
+            const result = await db.collection('activos_movimientos').insertMany(docs, { ordered: false });
+
+            console.log(`[Activos] insertMany: ${result.insertedCount} docs por ${req.usuario.username}`);
+            return res.status(201).json({
+                success:       true,
+                insertedCount: result.insertedCount,
+                // Retornar los _id asignados para que el frontend pueda usarlos
+                insertedIds:   result.insertedIds,
+            });
+        }
+
+        // ── Compatibilidad hacia atrás: body plano ───────────
+        // Solo aplica si alguien llama el endpoint sin envolver en { movimientos }
+        if (!movimientos && Object.keys(req.body).length > 0) {
+            const doc = {
+                ...req.body,
+                creadoPor:  req.usuario.username,
+                createdAt:  new Date(),
+                'Tipo de Movimiento': (req.body['Tipo de Movimiento'] || '').toUpperCase(),
+                'Entrega Confirmada': req.body['Entrega Confirmada'] ?? false,
+                'Fecha Confirmacion Entrega': req.body['Fecha Confirmacion Entrega'] || null,
+                'Confirmado Por': req.body['Confirmado Por'] || null,
+            };
+            const result = await db.collection('activos_movimientos').insertOne(doc);
+            return res.status(201).json({ success: true, insertedCount: 1, movimiento: { ...doc, _id: result.insertedId } });
+        }
+
+        return res.status(400).json({ error: 'El campo "movimientos" debe ser un array no vacío' });
+
+    } catch (e) {
+        console.error('Error POST activos:', e);
+        // insertMany con ordered:false puede fallar parcialmente
+        if (e.code === 11000) {
+            return res.status(409).json({ error: 'Algunos registros ya existen (clave duplicada)' });
+        }
+        res.status(500).json({ error: 'Error registrando activos' });
+    }
+});
+
+// [FIX-A3] PATCH: editar o confirmar entrega de un movimiento existente
+app.patch('/api/activos/movimientos/:id', requireAuth, requirePermiso('activos.registrar'), async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        // Validar que el id sea un ObjectId válido de MongoDB
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).json({ error: `ID inválido: "${id}". Debe ser un ObjectId de MongoDB de 24 caracteres.` });
+        }
+
+        // Campos que el cliente NO puede sobreescribir a través de PATCH
+        const CAMPOS_PROTEGIDOS = ['_id', 'creadoPor', 'createdAt'];
+        const updates = { ...req.body };
+        CAMPOS_PROTEGIDOS.forEach(c => delete updates[c]);
+
+        if (Object.keys(updates).length === 0) {
+            return res.status(400).json({ error: 'No se enviaron campos a actualizar' });
+        }
+
+        // Normalizar tipo de movimiento si viene en el body
+        if (updates['Tipo de Movimiento']) {
+            updates['Tipo de Movimiento'] = updates['Tipo de Movimiento'].toUpperCase();
+        }
+
+        // Auditoría: registrar quién y cuándo modificó el documento
+        updates.updatedAt  = new Date();
+        updates.updatedBy  = req.usuario.username;
+
+        // Detectar si es una confirmación de entrega para loguearla aparte
+        const esConfirmacion = updates['Entrega Confirmada'] === true;
+
+        const result = await db.collection('activos_movimientos').updateOne(
+            { _id: new ObjectId(id) },
+            { $set: updates }
+        );
+
+        if (result.matchedCount === 0) {
+            return res.status(404).json({ error: `Movimiento con id "${id}" no encontrado` });
+        }
+
+        if (esConfirmacion) {
+            console.log(`[Activos] Entrega confirmada: id=${id} por ${req.usuario.username} en ${updates['Fecha Confirmacion Entrega']}`);
+        } else {
+            console.log(`[Activos] Registro editado: id=${id} por ${req.usuario.username} — campos: ${Object.keys(req.body).filter(k => !CAMPOS_PROTEGIDOS.includes(k)).join(', ')}`);
+        }
+
+        // Retornar el documento actualizado
+        const docActualizado = await db.collection('activos_movimientos')
+            .findOne({ _id: new ObjectId(id) });
+
+        res.json({ success: true, movimiento: docActualizado });
+
+    } catch (e) {
+        console.error('Error PATCH activos:', e);
+        res.status(500).json({ error: `Error actualizando activo: ${e.message}` });
+    }
+});
+
+// ── Otros endpoints ────────────────────────────────────────────
+app.get('/api/devices',           requireAuth, requirePermiso('dashboard.dispositivos'),  async (req, res) => { try { res.json(await db.collection('dispositivos').find({}).toArray()); } catch(e){res.status(500).json({error:'Error dispositivos'})} });
+app.get('/api/formatos/sistemas', requireAuth, requirePermiso('formatos.generar'),        async (req, res) => { try { const sistemas = await db.collection('formatos_sistemas').find({activo:true}).toArray(); res.json({ sistemas }); } catch(e){res.status(500).json({error:'Error formatos'})} });
+app.post('/api/formatos/generar', requireAuth, requirePermiso('formatos.generar'),        async (req, res) => { try { const {sistema,userData}=req.body; if(!sistema) return res.status(400).json({error:'Sistema requerido'}); const s=await db.collection('formatos_sistemas').findOne({nombre:sistema,activo:true}); if(!s) return res.status(404).json({error:`Sistema '${sistema}' no encontrado`}); await db.collection('formatos_log').insertOne({sistema,userData,solicitadoPor:req.usuario.username,createdAt:new Date(),estado:'generado'}); res.json({success:true,sistema:s,userData}); } catch(e){res.status(500).json({error:'Error formato'})} });
+app.post('/api/formatos/clear-cache', requireAuth, requirePermiso('formatos.generar'), (req, res) => res.json({ success: true, message: 'Cache limpiada' }));
 
 app.post('/api/chat', requireAuth, requirePermiso('chatbot.usar'), async (req, res) => {
     try {
@@ -695,76 +865,32 @@ app.post('/api/hub/reuniones',       ...hubPost  ('hub_reuniones','hub.reuniones
 app.patch('/api/hub/reuniones/:id',  ...hubPatch ('hub_reuniones','hub.reuniones'));
 app.delete('/api/hub/reuniones/:id', ...hubDelete('hub_reuniones','hub.reuniones'));
 
-// ── [NEW] Usuarios disponibles para invitar a una reunión ──────
-// Devuelve 3 grupos según el rol del solicitante:
-//   miArea:      usuarios activos del área propia (siempre)
-//   otrosCoordi: coordinadores de otras áreas (solo COORDINADOR+)
-//   gerencia:    GERENTE_OPERACIONES + ADMIN (solo COORDINADOR+)
 app.get('/api/hub/usuarios-reunion', requireAuth, requirePermiso('hub.reuniones'), async (req, res) => {
     try {
         const { usuario } = req;
         const rol  = usuario.rol;
         const area = usuario.area;
-
-        // Todos los usuarios activos (sin password)
-        const todos = await db.collection('users')
-            .find({ activo: true }, { projection: { password: 0 } })
-            .toArray();
-
-        const toInfo = (u) => ({
-            username: u.username,
-            nombre:   u.nombre,
-            rol:      normalizarRol(u.rol),
-            area:     u.area || null,
-        });
-
-        // Grupo 1: Mi área (excluyendo al propio usuario)
-        const miArea = todos
-            .filter(u => u.username !== usuario.username && u.area === area)
-            .map(toInfo);
-
-        // Grupos 2 y 3: solo para COORDINADOR, GERENTE_OPERACIONES, ADMIN
+        const todos = await db.collection('users').find({ activo: true }, { projection: { password: 0 } }).toArray();
+        const toInfo = (u) => ({ username: u.username, nombre: u.nombre, rol: normalizarRol(u.rol), area: u.area || null });
+        const miArea = todos.filter(u => u.username !== usuario.username && u.area === area).map(toInfo);
         const puedeInvitarCruzado = ['ADMIN','GERENTE_OPERACIONES','COORDINADOR'].includes(rol);
-
         let otrosCoordi = [];
         let gerencia    = [];
-
         if (puedeInvitarCruzado) {
-            // Coordinadores de otras áreas
-            otrosCoordi = todos
-                .filter(u => u.username !== usuario.username
-                          && u.area !== area
-                          && normalizarRol(u.rol) === 'COORDINADOR')
-                .map(toInfo);
-
-            // Gerencia: GERENTE_OPERACIONES y ADMIN
-            gerencia = todos
-                .filter(u => u.username !== usuario.username
-                          && ['ADMIN','GERENTE_OPERACIONES'].includes(normalizarRol(u.rol)))
-                .map(toInfo);
+            otrosCoordi = todos.filter(u => u.username !== usuario.username && u.area !== area && normalizarRol(u.rol) === 'COORDINADOR').map(toInfo);
+            gerencia    = todos.filter(u => u.username !== usuario.username && ['ADMIN','GERENTE_OPERACIONES'].includes(normalizarRol(u.rol))).map(toInfo);
         }
-
         res.json({ miArea, otrosCoordi, gerencia });
-    } catch (e) {
-        console.error('Error usuarios-reunion:', e);
-        res.status(500).json({ error: 'Error obteniendo usuarios para reunión' });
-    }
+    } catch (e) { console.error('Error usuarios-reunion:', e); res.status(500).json({ error: 'Error obteniendo usuarios para reunión' }); }
 });
 
-// ================================================================
-// IA MINUTAS v4.3.2 — Groq REST + Gemini SDK + Local fallback
-// ================================================================
-
-// [FIX-S1 v2] Prompt profesional — contexto MYG Telecom + schema extendido con todos los campos nuevos
+// ── IA Minutas v4.3.2 ──────────────────────────────────────────
 const buildMinutaPrompt = ({ transcript, meetingTitle, meetingDate, meetingTime, attendees, agenda, duracion, notasAdicionales, modoAudio, usóWhisper }) => {
     const durMin = Math.ceil((duracion || 0) / 60);
     const asistentes = Array.isArray(attendees) ? attendees.join(', ') : (attendees || 'No especificados');
     const hasTranscript = transcript && transcript.trim().length > 5;
-    // Detectar si el transcript tiene timestamps [00:02:15] — viene de Whisper o SpeechRecognition segmentado
     const tieneTimestamps = hasTranscript && /\[\d{2}:\d{2}(:\d{2})?\]/.test(transcript);
-    const transcriptText = hasTranscript
-        ? transcript.trim()
-        : '(Sin transcripción de voz — usar contexto de la agenda y notas del organizador)';
+    const transcriptText = hasTranscript ? transcript.trim() : '(Sin transcripción de voz — usar contexto de la agenda y notas del organizador)';
     const notasText = notasAdicionales?.trim() ? `\nNOTAS DEL ORGANIZADOR:\n${notasAdicionales.trim()}` : '';
     const modoText  = modoAudio === 'sistema' ? ' (grabación de reunión virtual — todos los participantes)' : ' (micrófono local)';
 
@@ -814,305 +940,161 @@ Responde con EXACTAMENTE este JSON (sin backticks, sin texto adicional):
     return { system: systemPrompt, user: userPrompt };
 };
 
-// [FIX-S3] Groq via REST directo — sin depender del SDK groq-sdk
 const generarConGroq = async (pd) => {
     const apiKey = process.env.GROQ_API_KEY;
     if (!apiKey) throw new Error('GROQ_API_KEY no configurada');
-
     const p = buildMinutaPrompt(pd);
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 22000); // 22s timeout
-
+    const timeout = setTimeout(() => controller.abort(), 22000);
     try {
         const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
             method: 'POST',
-            headers: {
-                'Content-Type':  'application/json',
-                'Authorization': `Bearer ${apiKey}`,
-            },
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
             signal: controller.signal,
-            body: JSON.stringify({
-                model:       'llama-3.3-70b-versatile',
-                max_tokens:  2000,
-                temperature: 0.25,
-                messages: [
-                    { role: 'system', content: p.system },
-                    { role: 'user',   content: p.user   },
-                ],
-                response_format: { type: 'json_object' }, // fuerza JSON puro
-            }),
+            body: JSON.stringify({ model: 'llama-3.3-70b-versatile', max_tokens: 2000, temperature: 0.25, messages: [{ role: 'system', content: p.system }, { role: 'user', content: p.user }], response_format: { type: 'json_object' } }),
         });
-
         clearTimeout(timeout);
-
-        if (!response.ok) {
-            const errBody = await response.text().catch(() => '');
-            throw new Error(`Groq HTTP ${response.status}: ${errBody.slice(0, 200)}`);
-        }
-
+        if (!response.ok) { const errBody = await response.text().catch(() => ''); throw new Error(`Groq HTTP ${response.status}: ${errBody.slice(0, 200)}`); }
         const data = await response.json();
         const content = data.choices?.[0]?.message?.content || '';
         if (!content) throw new Error('Groq devolvió respuesta vacía');
-
         const parsed = JSON.parse(content.replace(/```json\s*/gi, '').replace(/```\s*/gi, '').trim());
         if (!parsed || typeof parsed !== 'object') throw new Error('JSON inválido de Groq');
         return parsed;
-
-    } finally {
-        clearTimeout(timeout);
-    }
+    } finally { clearTimeout(timeout); }
 };
 
-// [FIX-S4] Gemini con timeout
 const generarConGemini = async (pd) => {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) throw new Error('GEMINI_API_KEY no configurada');
-
     const p = buildMinutaPrompt(pd);
-
-    // Path 1: SDK instalado
     if (GoogleGenerativeAI) {
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 22000);
         try {
-            const model = new GoogleGenerativeAI(apiKey).getGenerativeModel({
-                model: 'gemini-2.0-flash',
-                generationConfig: { temperature: 0.25, maxOutputTokens: 2000, responseMimeType: 'application/json' },
-                systemInstruction: p.system,
-            });
+            const model = new GoogleGenerativeAI(apiKey).getGenerativeModel({ model: 'gemini-2.0-flash', generationConfig: { temperature: 0.25, maxOutputTokens: 2000, responseMimeType: 'application/json' }, systemInstruction: p.system });
             const result = await model.generateContent(p.user);
             clearTimeout(timeout);
             const text = result.response.text().replace(/```json\s*/gi, '').replace(/```\s*/gi, '').trim();
             const parsed = JSON.parse(text);
             if (!parsed || typeof parsed !== 'object') throw new Error('JSON inválido de Gemini');
             return parsed;
-        } finally {
-            clearTimeout(timeout);
-        }
+        } finally { clearTimeout(timeout); }
     }
-
-    // Path 2: REST directo si SDK no instalado
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 22000);
     try {
         const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
-        const response = await fetch(url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            signal: controller.signal,
-            body: JSON.stringify({
-                contents: [{ parts: [{ text: p.user }] }],
-                systemInstruction: { parts: [{ text: p.system }] },
-                generationConfig: { temperature: 0.25, maxOutputTokens: 2000, responseMimeType: 'application/json' },
-            }),
-        });
+        const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal, body: JSON.stringify({ contents: [{ parts: [{ text: p.user }] }], systemInstruction: { parts: [{ text: p.system }] }, generationConfig: { temperature: 0.25, maxOutputTokens: 2000, responseMimeType: 'application/json' } }) });
         clearTimeout(timeout);
         if (!response.ok) throw new Error(`Gemini HTTP ${response.status}`);
         const data = await response.json();
         const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
         if (!text) throw new Error('Gemini devolvió respuesta vacía');
         return JSON.parse(text.replace(/```json\s*/gi, '').replace(/```\s*/gi, '').trim());
-    } finally {
-        clearTimeout(timeout);
-    }
+    } finally { clearTimeout(timeout); }
 };
 
-// [FIX-S5 v2] Motor local — retorna todos los campos nuevos con formato correcto
 const generarConReglasLocales = (pd) => {
     const { transcript = '', meetingTitle = 'Reunión', meetingDate = '', meetingTime = '', attendees = [], agenda = '', duracion = 0, notasAdicionales = '' } = pd;
     const durMin = Math.ceil(duracion / 60);
     const fuenteTexto = [transcript, notasAdicionales].filter(Boolean).join(' ').trim();
-    // Limpiar timestamps [00:02:15] del texto antes de procesar
     const textoLimpio = fuenteTexto.replace(/\[\d{2}:\d{2}(:\d{2})?\]\s*/g, '');
     const oraciones = textoLimpio.split(/[.!?;]\s+/).map(s => s.trim()).filter(s => s.length > 15);
     const stopwords = new Set(['el','la','los','las','un','una','de','del','en','y','a','que','se','es','no','con','por','para','como','mas','pero','su','sus','al','lo','le','les','este','esta','estos','estas']);
     const score = s => new Set(s.toLowerCase().split(/\s+/).filter(w => !stopwords.has(w) && w.length > 3)).size;
     const mejoresOraciones = oraciones.map(o => ({ text: o, score: score(o) })).sort((a,b) => b.score - a.score).slice(0, 5).map(o => o.text + '.');
     const decisiones = oraciones.filter(o => /\b(se decide|se acuerda|se aprueba|quedamos|acordamos|decidimos|se autoriza)\b/i.test(o)).slice(0, 5).map(d => `• ${d.trim().replace(/\.$/, '')}.`);
-    // Acciones como objetos estructurados
-    const accionesObjs = oraciones
-        .filter(o => /\b(pendiente|entregar|revisar|enviar|actualizar|verificar|contactar|coordinar|preparar|elaborar|subir|bajar|migrar)\b/i.test(o))
-        .slice(0, 6)
-        .map(a => {
-            const s = a.trim().replace(/\.$/, '');
-            return { responsable: '', accion: s, fechaLimite: '' };
-        });
-    // Temas tratados — agrupar por palabras clave del texto
+    const accionesObjs = oraciones.filter(o => /\b(pendiente|entregar|revisar|enviar|actualizar|verificar|contactar|coordinar|preparar|elaborar|subir|bajar|migrar)\b/i.test(o)).slice(0, 6).map(a => ({ responsable: '', accion: a.trim().replace(/\.$/, ''), fechaLimite: '' }));
     const temasTratados = [];
     if (agenda) { agenda.split(/[,;]/).map(t => t.trim()).filter(Boolean).slice(0, 5).forEach(t => { temasTratados.push(`${t}: discutido durante la reunión`); }); }
     else if (mejoresOraciones.length > 0) { temasTratados.push(`Temas generales: ${mejoresOraciones[0]}`); }
     if (temasTratados.length === 0) temasTratados.push('Temas de la reunión: ver transcripción');
-
     const agendaTexto = agenda ? `Agenda: ${agenda}.` : '';
-    const resumenBase = mejoresOraciones.length > 0
-        ? mejoresOraciones.slice(0, 3).join(' ')
-        : `Reunión "${meetingTitle}" del ${meetingDate}${meetingTime ? ' a las ' + meetingTime : ''}. ${agendaTexto} Duración: ${durMin} min. Por favor complementa los detalles.`;
-
-    return {
-        title: `Minuta: ${meetingTitle}`,
-        tipoReunion: 'seguimiento',
-        resumen: resumenBase,
-        temasTratados,
-        decisions: decisiones.join('\n') || '',
-        acciones: accionesObjs,
-        proximaReunion: '',
-        observaciones: `Reunión de ${durMin > 0 ? durMin + ' min' : 'duración no registrada'} con ${Array.isArray(attendees) ? attendees.length : 0} asistente(s).${notasAdicionales ? ' Notas: ' + notasAdicionales : ''}`.trim(),
-    };
+    const resumenBase = mejoresOraciones.length > 0 ? mejoresOraciones.slice(0, 3).join(' ') : `Reunión "${meetingTitle}" del ${meetingDate}${meetingTime ? ' a las ' + meetingTime : ''}. ${agendaTexto} Duración: ${durMin} min. Por favor complementa los detalles.`;
+    return { title: `Minuta: ${meetingTitle}`, tipoReunion: 'seguimiento', resumen: resumenBase, temasTratados, decisions: decisiones.join('\n') || '', acciones: accionesObjs, proximaReunion: '', observaciones: `Reunión de ${durMin > 0 ? durMin + ' min' : 'duración no registrada'} con ${Array.isArray(attendees) ? attendees.length : 0} asistente(s).${notasAdicionales ? ' Notas: ' + notasAdicionales : ''}`.trim() };
 };
 
-// ── Endpoint: Transcribir audio con Groq Whisper ─────────────
-// [NEW v4.3.2] Recibe audio en base64 → Groq Whisper → transcript con timestamps
 app.post('/api/hub/reuniones/:id/transcribir-audio', requireAuth, requirePermiso('hub.reuniones'), async (req, res) => {
     try {
         const { audio, mimeType = 'audio/webm', duracion = 0, lang = 'es' } = req.body;
         const apiKey = process.env.GROQ_API_KEY;
         if (!apiKey) return res.status(503).json({ error: 'GROQ_API_KEY no configurada para Whisper' });
         if (!audio) return res.status(400).json({ error: 'Campo audio (base64) requerido' });
-
-        // Decode base64 → Buffer
         const audioBuffer = Buffer.from(audio, 'base64');
-        if (audioBuffer.length < 1000) {
-            return res.status(400).json({ error: 'Audio demasiado corto para transcribir' });
-        }
-
-        // Determinar extensión desde mimeType
-        const extMap = {
-            'audio/webm': 'webm', 'audio/webm;codecs=opus': 'webm',
-            'audio/ogg':  'ogg',  'audio/ogg;codecs=opus':  'ogg',
-            'audio/mp4':  'm4a',  'audio/mpeg': 'mp3', 'audio/wav': 'wav',
-        };
+        if (audioBuffer.length < 1000) return res.status(400).json({ error: 'Audio demasiado corto para transcribir' });
+        const extMap = { 'audio/webm': 'webm', 'audio/webm;codecs=opus': 'webm', 'audio/ogg': 'ogg', 'audio/ogg;codecs=opus': 'ogg', 'audio/mp4': 'm4a', 'audio/mpeg': 'mp3', 'audio/wav': 'wav' };
         const ext = extMap[mimeType] || extMap[mimeType.split(';')[0]] || 'webm';
         const filename = `reunion-${Date.now()}.${ext}`;
-
-        // Construir FormData para Groq Whisper
         const formData = new FormData();
         const blob = new Blob([audioBuffer], { type: mimeType });
         formData.append('file', blob, filename);
-        formData.append('model', 'whisper-large-v3-turbo'); // más rápido, muy preciso
+        formData.append('model', 'whisper-large-v3-turbo');
         formData.append('language', lang || 'es');
-        formData.append('response_format', 'verbose_json');  // incluye timestamps
-        formData.append('temperature', '0');                  // máxima precisión
-
+        formData.append('response_format', 'verbose_json');
+        formData.append('temperature', '0');
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 300000); // 5min para audio largo
-
+        const timeout = setTimeout(() => controller.abort(), 300000);
         try {
-            const response = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
-                method:  'POST',
-                headers: { 'Authorization': `Bearer ${apiKey}` },
-                body:    formData,
-                signal:  controller.signal,
-            });
+            const response = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', { method: 'POST', headers: { 'Authorization': `Bearer ${apiKey}` }, body: formData, signal: controller.signal });
             clearTimeout(timeout);
-
-            if (!response.ok) {
-                const errText = await response.text().catch(() => '');
-                throw new Error(`Groq Whisper HTTP ${response.status}: ${errText.slice(0, 300)}`);
-            }
-
+            if (!response.ok) { const errText = await response.text().catch(() => ''); throw new Error(`Groq Whisper HTTP ${response.status}: ${errText.slice(0, 300)}`); }
             const data = await response.json();
             const transcript = data.text || '';
-            const segments   = (data.segments || []).map(s => ({
-                start: s.start || 0,
-                end:   s.end   || 0,
-                text:  (s.text || '').trim(),
-            }));
-
-            console.log(`[Whisper] Transcripción completada: ${transcript.length} chars, ${segments.length} segmentos, audio ${Math.round(audioBuffer.length/1024)}KB`);
+            const segments = (data.segments || []).map(s => ({ start: s.start || 0, end: s.end || 0, text: (s.text || '').trim() }));
+            console.log(`[Whisper] ${transcript.length} chars, ${segments.length} segmentos, ${Math.round(audioBuffer.length/1024)}KB`);
             res.json({ transcript, segments, duracion, idioma: data.language || lang });
-
-        } finally {
-            clearTimeout(timeout);
-        }
+        } finally { clearTimeout(timeout); }
     } catch (err) {
         console.error('[Whisper] Error:', err.message);
-        if (err.name === 'AbortError') {
-            return res.status(504).json({ error: 'Timeout transcribiendo audio — intenta con grabaciones más cortas' });
-        }
+        if (err.name === 'AbortError') return res.status(504).json({ error: 'Timeout transcribiendo audio — intenta con grabaciones más cortas' });
         res.status(500).json({ error: `Error en transcripción: ${err.message}` });
     }
 });
 
-// ── Endpoint: Generar Minuta con IA ───────────────────────────
 app.post('/api/hub/reuniones/:id/generar-minuta', requireAuth, requirePermiso('hub.reuniones'), async (req, res) => {
     try {
-        const {
-            transcript      = '',
-            meetingTitle,
-            meetingDate,
-            meetingTime,
-            attendees,
-            agenda,
-            duracion,
-            notasAdicionales = '',
-            modoAudio        = 'microfono',
-            usóWhisper       = false,
-        } = req.body;
-
+        const { transcript = '', meetingTitle, meetingDate, meetingTime, attendees, agenda, duracion, notasAdicionales = '', modoAudio = 'microfono', usóWhisper = false } = req.body;
         const transcriptUtil = transcript.trim();
         const pd = { transcript: transcriptUtil, meetingTitle, meetingDate, meetingTime, attendees, agenda, duracion, notasAdicionales, modoAudio, usóWhisper };
-
-        // [FIX-S2] ELIMINADO el gate "if (length < 30) return local"
-        // Ahora SIEMPRE intenta Groq → Gemini → local, sin importar longitud
-        // Solo si realmente no hay NADA de texto Y no hay notas, se usa local directamente
         const sinContenido = !transcriptUtil && !notasAdicionales.trim() && !agenda;
         if (sinContenido) {
-            console.log('[MinutaIA] Sin transcripción ni notas → motor local inmediato');
+            console.log('[MinutaIA] Sin contenido → motor local');
             const local = generarConReglasLocales(pd);
             return res.json({ ...local, _proveedor: 'local', _aviso: 'Sin transcripción. Completa los campos manualmente.' });
         }
-
         const forced = process.env.AI_PROVIDER;
         const cadena = [
-            { nombre: 'groq',   fn: generarConGroq,                      activo: !forced || forced === 'groq',   tiene_key: !!process.env.GROQ_API_KEY   },
-            { nombre: 'gemini', fn: generarConGemini,                     activo: !forced || forced === 'gemini', tiene_key: !!process.env.GEMINI_API_KEY  },
-            { nombre: 'local',  fn: async d => generarConReglasLocales(d), activo: true,                          tiene_key: true                          },
+            { nombre: 'groq',   fn: generarConGroq,                       activo: !forced || forced === 'groq',   tiene_key: !!process.env.GROQ_API_KEY   },
+            { nombre: 'gemini', fn: generarConGemini,                      activo: !forced || forced === 'gemini', tiene_key: !!process.env.GEMINI_API_KEY  },
+            { nombre: 'local',  fn: async d => generarConReglasLocales(d), activo: true,                           tiene_key: true                          },
         ];
-
         let resultado = null;
         let ultimoError = null;
-
         for (const proveedor of cadena) {
-            if (!proveedor.activo || !proveedor.tiene_key) {
-                console.log(`[MinutaIA] ${proveedor.nombre.toUpperCase()} omitido (activo=${proveedor.activo}, key=${proveedor.tiene_key})`);
-                continue;
-            }
+            if (!proveedor.activo || !proveedor.tiene_key) { console.log(`[MinutaIA] ${proveedor.nombre} omitido`); continue; }
             try {
-                console.log(`[MinutaIA] Intentando ${proveedor.nombre.toUpperCase()}...`);
+                console.log(`[MinutaIA] Intentando ${proveedor.nombre}...`);
                 const t0 = Date.now();
                 resultado = await proveedor.fn(pd);
                 const ms = Date.now() - t0;
-
-                if (!resultado || typeof resultado !== 'object') throw new Error('Respuesta inválida del proveedor');
-
-                // Validar que tenga al menos title o resumen
+                if (!resultado || typeof resultado !== 'object') throw new Error('Respuesta inválida');
                 if (!resultado.title && !resultado.resumen) throw new Error('Respuesta sin campos esperados');
-
                 resultado._proveedor = proveedor.nombre;
-                resultado._ms        = ms;
-                console.log(`[MinutaIA] ✅ ${proveedor.nombre.toUpperCase()} respondió en ${ms}ms`);
+                resultado._ms = ms;
+                console.log(`[MinutaIA] ✅ ${proveedor.nombre} en ${ms}ms`);
                 break;
             } catch (err) {
-                console.warn(`[MinutaIA] ⚠️ ${proveedor.nombre.toUpperCase()} falló: ${err.message}`);
+                console.warn(`[MinutaIA] ⚠️ ${proveedor.nombre} falló: ${err.message}`);
                 ultimoError = err;
-                // Rate limit → esperar antes del siguiente proveedor
-                if (err.message?.includes('429') || err.message?.includes('rate_limit')) {
-                    await new Promise(r => setTimeout(r, 2000));
-                }
+                if (err.message?.includes('429') || err.message?.includes('rate_limit')) await new Promise(r => setTimeout(r, 2000));
             }
         }
-
         if (!resultado) throw ultimoError || new Error('Todos los proveedores fallaron');
-
-        // [FIX-S6] Incluir _proveedor en respuesta para que el frontend lo muestre
         const { _ms, ...respuesta } = resultado;
-        console.log(`[MinutaIA] Respuesta final enviada (proveedor=${respuesta._proveedor}, ${_ms}ms, transcript=${transcriptUtil.length}chars)`);
+        console.log(`[MinutaIA] Enviado (proveedor=${respuesta._proveedor}, ${_ms}ms, ${transcriptUtil.length}chars)`);
         res.json(respuesta);
-
-    } catch (err) {
-        console.error('[MinutaIA] Error fatal:', err.message);
-        res.status(500).json({ error: `Error generando minuta: ${err.message}` });
-    }
+    } catch (err) { console.error('[MinutaIA] Error fatal:', err.message); res.status(500).json({ error: `Error generando minuta: ${err.message}` }); }
 });
 
 // ── Tareas / Minutas / Anuncios / Recursos / Guías / Plantillas ─
@@ -1121,47 +1103,22 @@ app.post('/api/hub/tareas',          ...hubPost  ('hub_tareas',      'hub.tareas
 app.patch('/api/hub/tareas/:id',     ...hubPatch ('hub_tareas',      'hub.tareas'));
 app.delete('/api/hub/tareas/:id',    ...hubDelete('hub_tareas',      'hub.tareas'));
 
-// ── Minutas — con visibilidad cross-área para invitados ────────
-// Un usuario ve las minutas:
-//   1. Del área que le corresponde (scoping normal)
-//   2. De cualquier área si aparece en invitadoUsernames[]
 app.get('/api/hub/minutas', requireAuth, requirePermiso('hub.minutas'), async (req, res) => {
     try {
         const { usuario } = req;
         const limit  = Math.min(parseInt(req.query.limit) || 100, 500);
         const area   = req.query.area || usuario.area || 'Sistemas';
-
-        // Filtro por área propia (backward compat)
         let areaFilter;
-        if (area === 'Sistemas') {
-            areaFilter = { $or: [{ area:'Sistemas' }, { area:{ $exists:false } }, { area:null }] };
-        } else {
-            areaFilter = { area };
-        }
-
-        // ADMIN y GERENTE_OPERACIONES ven todo
+        if (area === 'Sistemas') { areaFilter = { $or: [{ area:'Sistemas' }, { area:{ $exists:false } }, { area:null }] }; }
+        else { areaFilter = { area }; }
         const verTodo = ['ADMIN','GERENTE_OPERACIONES'].includes(usuario.rol) || (usuario.permisos||[]).includes('*');
-
         let filter;
-        if (verTodo) {
-            filter = req.query.area ? areaFilter : {};
-        } else {
-            // Ver minutas del área propia O donde estoy en invitadoUsernames
-            filter = { $or: [ areaFilter, { invitadoUsernames: usuario.username } ] };
-        }
-
+        if (verTodo) { filter = req.query.area ? areaFilter : {}; }
+        else { filter = { $or: [ areaFilter, { invitadoUsernames: usuario.username } ] }; }
         if (req.query.estado) filter.estado = req.query.estado;
-
-        const docs = await db.collection('hub_minutas')
-            .find(filter)
-            .sort({ createdAt: -1 })
-            .limit(limit)
-            .toArray();
-
+        const docs = await db.collection('hub_minutas').find(filter).sort({ createdAt: -1 }).limit(limit).toArray();
         res.json(docs);
-    } catch (e) {
-        res.status(500).json({ error: 'Error hub_minutas' });
-    }
+    } catch (e) { res.status(500).json({ error: 'Error hub_minutas' }); }
 });
 app.post('/api/hub/minutas',         ...hubPost  ('hub_minutas',     'hub.minutas'));
 app.patch('/api/hub/minutas/:id',    ...hubPatch ('hub_minutas',     'hub.minutas'));
@@ -1245,9 +1202,7 @@ app.patch('/api/hub/mensajes/:id/reaction', requireAuth, requirePermiso('hub.men
     } catch (e) { res.status(500).json({ error: 'Error reaction' }); }
 });
 
-// ================================================================
-// ASISTENCIA (v4.2 sin cambios)
-// ================================================================
+// ── Asistencia ─────────────────────────────────────────────────
 app.get('/api/hub/asistencia', requireAuth, requirePermiso('hub.asistencia'), async (req, res) => {
     try {
         const { usuario } = req;
@@ -1293,13 +1248,7 @@ app.post('/api/hub/asistencia', requireAuth, async (req, res) => {
         const existe = await db.collection('hub_asistencia').findOne({ username:usernameDestino, fecha:fechaRegistro });
         if (existe) return res.status(409).json({ error:`Ya existe un registro para ${usernameDestino} el ${fechaRegistro}`, existingId:existe._id });
         const userDoc = await db.collection('users').findOne({ username: usernameDestino }, { projection:{area:1} });
-        const doc = {
-            username: usernameDestino, fecha: fechaRegistro, tipo,
-            horaEntrada: horaEntrada||'', horaSalida: horaSalida||'',
-            notas: notas||'', registradoPor: usuario.username,
-            area: userDoc?.area || null,
-            createdAt: new Date(),
-        };
+        const doc = { username: usernameDestino, fecha: fechaRegistro, tipo, horaEntrada: horaEntrada||'', horaSalida: horaSalida||'', notas: notas||'', registradoPor: usuario.username, area: userDoc?.area || null, createdAt: new Date() };
         await db.collection('hub_asistencia').insertOne(doc);
         res.status(201).json({ success:true, doc });
     } catch (e) { console.error('Error POST asistencia:', e); res.status(500).json({ error: 'Error registrando asistencia' }); }
@@ -1443,9 +1392,9 @@ async function start() {
     try {
         await connectDB();
         app.listen(PORT, () => {
-            console.log(`MYG API v4.3.2 en puerto ${PORT}`);
-            console.log(`IA Minutas: Groq=${!!process.env.GROQ_API_KEY ? '✅' : '❌ falta GROQ_API_KEY'} | Gemini=${!!process.env.GEMINI_API_KEY ? '✅' : '❌ falta GEMINI_API_KEY'} | Local=✅`);
-            console.log(`Hub Area Scoping: ${[...COLECCIONES_CON_AREA].join(', ')}`);
+            console.log(`MYG API v4.3.3 en puerto ${PORT}`);
+            console.log(`IA Minutas: Groq=${!!process.env.GROQ_API_KEY ? '✅' : '❌'} | Gemini=${!!process.env.GEMINI_API_KEY ? '✅' : '❌'} | Local=✅`);
+            console.log(`Activos: GET(limit dinámico) POST(insertMany) PATCH(edición+confirmación) ✅`);
         });
     } catch (err) { console.error('Error iniciando:', err); process.exit(1); }
 }
