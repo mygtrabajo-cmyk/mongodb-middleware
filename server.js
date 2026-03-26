@@ -1,33 +1,31 @@
 // ============================================================
-// MYG TELECOM — API SERVER v4.3.3
+// MYG TELECOM — API SERVER v4.4.0
 // Render (Node.js) + MongoDB Atlas
 //
-// ── CAMBIOS v4.3.3 (sobre v4.3.2) ────────────────────────────
-// [FIX-A1] POST /api/activos/movimientos:
-//          El frontend envía { movimientos: [...] }.
-//          Antes: insertOne({...req.body}) guardaba UN solo documento
-//          con la clave "movimientos" conteniendo el array —
-//          los registros individuales nunca llegaban a la colección.
-//          Ahora: insertMany() de cada elemento del array,
-//          añadiendo creadoPor + createdAt a cada uno.
-//          Compatibilidad hacia atrás: si el body NO trae
-//          "movimientos" (body plano), se hace insertOne como antes.
+// ── CAMBIOS v4.4.0 (sobre v4.3.3) ────────────────────────────
+// [REU-1] GET /api/hub/reuniones:
+//         Reemplaza hubGet genérico con filtro de privacidad.
+//         ADMIN / GERENTE_OPERACIONES → ven todas.
+//         COORDINADOR / ANALISTA     → solo reuniones donde
+//         son organizer, creadoPor o están en invitadoUsernames.
+//         Reuniones legacy (sin invitadoUsernames) → solo
+//         el organizador + ADMIN las ven.
 //
-// [FIX-A2] GET /api/activos/movimientos:
-//          Respetaba el parámetro ?limit=N del query string.
-//          Antes estaba hardcodeado en .limit(500) sin leerlo.
-//          Nuevo máximo configurable: min(req.query.limit, 1000).
-//          Respuesta envuelta en { movimientos: [...], total }
-//          para que el frontend pueda usar data.movimientos.
+// [ACT-1] DELETE /api/activos/movimientos/:id
+//         ADMIN/COORDINADOR/GERENTE_OPERACIONES → borran cualquiera.
+//         ANALISTA → solo sus propios registros (creadoPor).
 //
-// [FIX-A3] NUEVO: PATCH /api/activos/movimientos/:id
-//          Permite editar cualquier campo de un movimiento
-//          (edición normal) y confirmar la entrega de salidas
-//          (campo "Entrega Confirmada": true).
-//          Requiere permiso activos.registrar.
-//          Solo aplica sobre documentos con _id válido de MongoDB.
+// [ACT-2] POST /api/activos/movimientos/bulk
+//         Carga masiva con validación: máx 500 registros,
+//         campos requeridos y BulkWriteError parcial manejado.
+//         (El POST base ya usa insertMany — este endpoint
+//          agrega validación previa y reporting de errores.)
 //
-// ── Sin cambios en el resto del servidor v4.3.2 ──────────────
+// [REP-1..5] CRUD completo de Reposiciones
+//         Colección: hub_reposiciones
+//         GET / POST / POST-bulk / PATCH / DELETE
+//
+// ── Sin otros cambios respecto a v4.3.3 ─────────────────────
 // ============================================================
 
 require('dotenv').config();
@@ -96,14 +94,20 @@ async function connectDB() {
     await idx('hub_minutas',    { area: 1, createdAt: -1 }, { name: 'minutas_area_fecha'    });
     await idx('hub_minutas',    { invitadoUsernames: 1 },   { name: 'minutas_invitados'     });
     await idx('hub_reuniones',  { invitadoUsernames: 1 },   { name: 'reuniones_invitados'   });
+    await idx('hub_reuniones',  { organizer: 1 },           { name: 'reuniones_organizer'   });
+    await idx('hub_reuniones',  { date: -1 },               { name: 'reuniones_fecha'       });
     await idx('hub_anuncios',   { area: 1, createdAt: -1 }, { name: 'anuncios_area_fecha'   });
     await idx('hub_recursos',   { area: 1, createdAt: -1 }, { name: 'recursos_area_fecha'   });
     await idx('hub_guias',      { area: 1, createdAt: -1 }, { name: 'guias_area_fecha'      });
     await idx('hub_plantillas', { area: 1, createdAt: -1 }, { name: 'plantillas_area_fecha' });
-    // [FIX-A2] Índice para búsquedas frecuentes sobre activos
+    // Activos
     await idx('activos_movimientos', { createdAt: -1 },      { name: 'activos_fecha'         });
     await idx('activos_movimientos', { 'Almacen': 1 },       { name: 'activos_almacen'       });
     await idx('activos_movimientos', { 'Tipo de Movimiento': 1 }, { name: 'activos_tipo'     });
+    // [REP-1] Reposiciones
+    await idx('hub_reposiciones', { createdAt: -1 },         { name: 'repos_fecha'           });
+    await idx('hub_reposiciones', { 'PDV': 1 },              { name: 'repos_pdv'             });
+    await idx('hub_reposiciones', { 'Estado': 1 },           { name: 'repos_estado'          });
 
     return client;
 }
@@ -287,7 +291,7 @@ async function logAccess(username, action, details = {}) {
 // ── HEALTH ─────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({
     status: 'ok',
-    version: '4.3.3',
+    version: '4.4.0',
     timestamp: new Date().toISOString(),
     db: db ? 'connected' : 'disconnected',
     ia: {
@@ -591,31 +595,24 @@ app.post('/api/rh/movimientos',             requireAuth, requirePermiso('rh.movi
 app.put('/api/rh/movimientos/:id',          requireAuth, requirePermiso('rh.movimientos.gestionar'),async (req, res) => { try { const r=await db.collection('rh_movimientos').updateOne({_id:new ObjectId(req.params.id)},{$set:{...req.body,updatedAt:new Date(),updatedBy:req.usuario.username}}); if(!r.matchedCount) return res.status(404).json({error:'No encontrado'}); res.json({success:true}); } catch(e){res.status(500).json({error:'Error RH'})} });
 app.patch('/api/rh/movimientos/:id/estado', requireAuth, requirePermiso('rh.movimientos.gestionar'), async (req, res) => { try { const {estado,comentario}=req.body; await db.collection('rh_movimientos').updateOne({_id:new ObjectId(req.params.id)},{$set:{estado,comentario,updatedAt:new Date(),updatedBy:req.usuario.username}}); res.json({success:true}); } catch(e){res.status(500).json({error:'Error RH'})} });
 
-// ── ACTIVOS — VERSIÓN CORREGIDA v4.3.3 ─────────────────────────
-//
+// ================================================================
+// ACTIVOS — CRUD + BULK v4.4.0
+// ================================================================
+
 // [FIX-A2] GET: respeta ?limit=N y retorna { movimientos: [], total }
 app.get('/api/activos/movimientos', requireAuth, requirePermiso('activos.ver'), async (req, res) => {
     try {
         const limit  = Math.min(parseInt(req.query.limit) || 200, 1000);
         const filter = {};
-
-        // Filtros opcionales útiles para búsquedas futuras
         if (req.query.almacen)         filter['Almacen']              = req.query.almacen.toUpperCase();
         if (req.query.tipo_movimiento) filter['Tipo de Movimiento']   = req.query.tipo_movimiento.toUpperCase();
         if (req.query.confirmada !== undefined) {
             filter['Entrega Confirmada'] = req.query.confirmada === 'true';
         }
-
         const [movimientos, total] = await Promise.all([
-            db.collection('activos_movimientos')
-              .find(filter)
-              .sort({ createdAt: -1 })
-              .limit(limit)
-              .toArray(),
+            db.collection('activos_movimientos').find(filter).sort({ createdAt: -1 }).limit(limit).toArray(),
             db.collection('activos_movimientos').countDocuments(filter),
         ]);
-
-        // Respuesta envuelta: el frontend acepta { movimientos: [] } o []
         res.json({ movimientos, total });
     } catch (e) {
         console.error('Error GET activos:', e);
@@ -623,47 +620,83 @@ app.get('/api/activos/movimientos', requireAuth, requirePermiso('activos.ver'), 
     }
 });
 
-// [FIX-A1] POST: el frontend manda { movimientos: [...] }
-//          Se usa insertMany para crear un documento por activo.
-//          Si el body es plano (sin clave "movimientos"), compatibilidad
-//          con clientes que llamen el endpoint directamente.
+// [ACT-2] POST /bulk — ANTES del POST base para que Express no confunda con :id
+// Acepta { movimientos: [...] } con validación de campos obligatorios y límite 500.
+app.post('/api/activos/movimientos/bulk', requireAuth, requirePermiso('activos.registrar'), async (req, res) => {
+    try {
+        const { movimientos } = req.body;
+        if (!Array.isArray(movimientos) || movimientos.length === 0)
+            return res.status(400).json({ error: 'Se requiere un array "movimientos" no vacío' });
+        if (movimientos.length > 500)
+            return res.status(400).json({ error: 'Máximo 500 registros por carga masiva' });
+
+        const ahora    = new Date();
+        const errores  = [];
+        const docs     = [];
+
+        movimientos.forEach((m, i) => {
+            const serie = String(m['Número de Serie'] || m['Serie'] || '').trim();
+            const tipo  = String(m['Tipo de Activo']  || m['Tipo']  || '').trim();
+            if (!serie) { errores.push(`Fila ${i+1}: Número de serie requerido`); return; }
+            if (!tipo)  { errores.push(`Fila ${i+1}: Tipo de activo requerido`);  return; }
+
+            const { _id: _localId, ...rest } = m;
+            docs.push({
+                ...rest,
+                'Número de Serie':        serie.toUpperCase(),
+                'Tipo de Activo':         tipo,
+                'Tipo de Movimiento':     (rest['Tipo de Movimiento'] || '').toUpperCase(),
+                'Entrega Confirmada':     rest['Entrega Confirmada'] ?? false,
+                'Fecha Confirmacion Entrega': rest['Fecha Confirmacion Entrega'] || null,
+                'Confirmado Por':         rest['Confirmado Por'] || null,
+                'Carga Masiva':           true,
+                'Fecha Carga Masiva':     ahora.toISOString(),
+                creadoPor:                req.usuario.username,
+                createdAt:                ahora,
+            });
+        });
+
+        let insertados = 0;
+        if (docs.length > 0) {
+            const result = await db.collection('activos_movimientos').insertMany(docs, { ordered: false });
+            insertados = result.insertedCount;
+        }
+
+        console.log(`[Activos] Bulk: ${insertados} insertados, ${errores.length} errores — ${req.usuario.username}`);
+        res.status(201).json({ success: true, insertados, errores: errores.length, detallesError: errores });
+
+    } catch (e) {
+        if (e.name === 'MongoBulkWriteError') {
+            const insertados = e.result?.insertedCount || 0;
+            console.warn(`[Activos] BulkWrite parcial: ${insertados} insertados`);
+            return res.json({ success: true, insertados, errores: e.writeErrors?.length || 0 });
+        }
+        console.error('Error POST activos/bulk:', e);
+        res.status(500).json({ error: 'Error en carga masiva de activos' });
+    }
+});
+
+// [FIX-A1] POST base: acepta { movimientos: [...] } → insertMany, o body plano → insertOne
 app.post('/api/activos/movimientos', requireAuth, requirePermiso('activos.registrar'), async (req, res) => {
     try {
         const { movimientos } = req.body;
-
-        // ── Ruta normal: array de registros ─────────────────
         if (Array.isArray(movimientos) && movimientos.length > 0) {
-            // Sanitizar y enriquecer cada documento antes de persistir
             const docs = movimientos.map(m => {
-                // Eliminar el _id local generado por el frontend (Date.now + Math.random)
-                // MongoDB asignará su propio ObjectId
                 const { _id: _localId, ...rest } = m;
                 return {
                     ...rest,
                     creadoPor:  req.usuario.username,
                     createdAt:  new Date(),
-                    // Normalizar el tipo de movimiento a mayúsculas por consistencia
                     'Tipo de Movimiento': (rest['Tipo de Movimiento'] || '').toUpperCase(),
-                    // Asegurar que Entrega Confirmada empiece en false si no viene
                     'Entrega Confirmada': rest['Entrega Confirmada'] ?? false,
                     'Fecha Confirmacion Entrega': rest['Fecha Confirmacion Entrega'] || null,
                     'Confirmado Por': rest['Confirmado Por'] || null,
                 };
             });
-
             const result = await db.collection('activos_movimientos').insertMany(docs, { ordered: false });
-
             console.log(`[Activos] insertMany: ${result.insertedCount} docs por ${req.usuario.username}`);
-            return res.status(201).json({
-                success:       true,
-                insertedCount: result.insertedCount,
-                // Retornar los _id asignados para que el frontend pueda usarlos
-                insertedIds:   result.insertedIds,
-            });
+            return res.status(201).json({ success: true, insertedCount: result.insertedCount, insertedIds: result.insertedIds });
         }
-
-        // ── Compatibilidad hacia atrás: body plano ───────────
-        // Solo aplica si alguien llama el endpoint sin envolver en { movimientos }
         if (!movimientos && Object.keys(req.body).length > 0) {
             const doc = {
                 ...req.body,
@@ -677,74 +710,74 @@ app.post('/api/activos/movimientos', requireAuth, requirePermiso('activos.regist
             const result = await db.collection('activos_movimientos').insertOne(doc);
             return res.status(201).json({ success: true, insertedCount: 1, movimiento: { ...doc, _id: result.insertedId } });
         }
-
         return res.status(400).json({ error: 'El campo "movimientos" debe ser un array no vacío' });
-
     } catch (e) {
         console.error('Error POST activos:', e);
-        // insertMany con ordered:false puede fallar parcialmente
-        if (e.code === 11000) {
-            return res.status(409).json({ error: 'Algunos registros ya existen (clave duplicada)' });
-        }
+        if (e.code === 11000) return res.status(409).json({ error: 'Algunos registros ya existen (clave duplicada)' });
         res.status(500).json({ error: 'Error registrando activos' });
     }
 });
 
-// [FIX-A3] PATCH: editar o confirmar entrega de un movimiento existente
+// [FIX-A3] PATCH: editar o confirmar entrega
 app.patch('/api/activos/movimientos/:id', requireAuth, requirePermiso('activos.registrar'), async (req, res) => {
     try {
         const { id } = req.params;
+        if (!ObjectId.isValid(id))
+            return res.status(400).json({ error: `ID inválido: "${id}". Debe ser ObjectId de 24 caracteres.` });
 
-        // Validar que el id sea un ObjectId válido de MongoDB
-        if (!ObjectId.isValid(id)) {
-            return res.status(400).json({ error: `ID inválido: "${id}". Debe ser un ObjectId de MongoDB de 24 caracteres.` });
-        }
-
-        // Campos que el cliente NO puede sobreescribir a través de PATCH
         const CAMPOS_PROTEGIDOS = ['_id', 'creadoPor', 'createdAt'];
         const updates = { ...req.body };
         CAMPOS_PROTEGIDOS.forEach(c => delete updates[c]);
-
-        if (Object.keys(updates).length === 0) {
+        if (Object.keys(updates).length === 0)
             return res.status(400).json({ error: 'No se enviaron campos a actualizar' });
-        }
 
-        // Normalizar tipo de movimiento si viene en el body
-        if (updates['Tipo de Movimiento']) {
+        if (updates['Tipo de Movimiento'])
             updates['Tipo de Movimiento'] = updates['Tipo de Movimiento'].toUpperCase();
-        }
 
-        // Auditoría: registrar quién y cuándo modificó el documento
-        updates.updatedAt  = new Date();
-        updates.updatedBy  = req.usuario.username;
+        updates.updatedAt = new Date();
+        updates.updatedBy = req.usuario.username;
 
-        // Detectar si es una confirmación de entrega para loguearla aparte
         const esConfirmacion = updates['Entrega Confirmada'] === true;
-
-        const result = await db.collection('activos_movimientos').updateOne(
-            { _id: new ObjectId(id) },
-            { $set: updates }
-        );
-
-        if (result.matchedCount === 0) {
+        const result = await db.collection('activos_movimientos').updateOne({ _id: new ObjectId(id) }, { $set: updates });
+        if (result.matchedCount === 0)
             return res.status(404).json({ error: `Movimiento con id "${id}" no encontrado` });
-        }
 
-        if (esConfirmacion) {
-            console.log(`[Activos] Entrega confirmada: id=${id} por ${req.usuario.username} en ${updates['Fecha Confirmacion Entrega']}`);
-        } else {
-            console.log(`[Activos] Registro editado: id=${id} por ${req.usuario.username} — campos: ${Object.keys(req.body).filter(k => !CAMPOS_PROTEGIDOS.includes(k)).join(', ')}`);
-        }
+        if (esConfirmacion)
+            console.log(`[Activos] Entrega confirmada: id=${id} por ${req.usuario.username}`);
 
-        // Retornar el documento actualizado
-        const docActualizado = await db.collection('activos_movimientos')
-            .findOne({ _id: new ObjectId(id) });
-
+        const docActualizado = await db.collection('activos_movimientos').findOne({ _id: new ObjectId(id) });
         res.json({ success: true, movimiento: docActualizado });
-
     } catch (e) {
         console.error('Error PATCH activos:', e);
         res.status(500).json({ error: `Error actualizando activo: ${e.message}` });
+    }
+});
+
+// [ACT-1] DELETE: eliminar registro con validación de permisos
+app.delete('/api/activos/movimientos/:id', requireAuth, requirePermiso('activos.registrar'), async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id))
+            return res.status(400).json({ error: `ID inválido: "${id}"` });
+
+        const registro = await db.collection('activos_movimientos').findOne({ _id: new ObjectId(id) });
+        if (!registro)
+            return res.status(404).json({ error: 'Registro no encontrado' });
+
+        // ADMIN / COORDINADOR / GERENTE_OPERACIONES pueden borrar cualquiera
+        // ANALISTA solo puede borrar sus propios registros
+        const rolesPrivilegiados = ['ADMIN', 'COORDINADOR', 'GERENTE_OPERACIONES'];
+        if (!rolesPrivilegiados.includes(req.usuario.rol)) {
+            if (registro.creadoPor !== req.usuario.username)
+                return res.status(403).json({ error: 'Sin permisos para eliminar este registro. Solo puedes borrar tus propios registros.' });
+        }
+
+        await db.collection('activos_movimientos').deleteOne({ _id: new ObjectId(id) });
+        console.log(`[Activos] Eliminado: ${id} por ${req.usuario.username}`);
+        res.json({ success: true, eliminado: id });
+    } catch (e) {
+        console.error('Error DELETE activos:', e);
+        res.status(500).json({ error: 'Error eliminando activo' });
     }
 });
 
@@ -859,8 +892,48 @@ app.get('/api/hub/general', requireAuth, requirePermiso('hub.acceso'), async (re
     } catch (e) { res.status(500).json({ error: 'Error hub general' }); }
 });
 
-// ── Reuniones ──────────────────────────────────────────────────
-app.get('/api/hub/reuniones',        ...hubGet   ('hub_reuniones','hub.reuniones'));
+// ── Reuniones v4.4.0 — Filtro por privacidad ──────────────────
+// [REU-1] Reemplaza hubGet genérico. Lógica:
+//   ADMIN / GERENTE_OPERACIONES → ven todo (incluidas reuniones legacy sin invitados)
+//   COORDINADOR / ANALISTA / resto → solo donde:
+//     - son el organizador   (campo organizer o creadoPor)
+//     - están en la lista    (campo invitadoUsernames)
+//   Reuniones legacy sin invitadoUsernames → solo el organizador + ADMIN las ven
+app.get('/api/hub/reuniones', requireAuth, requirePermiso('hub.reuniones'), async (req, res) => {
+    try {
+        const { usuario } = req;
+        const limit  = Math.min(parseInt(req.query.limit) || 200, 500);
+        const verTodo = ['ADMIN', 'GERENTE_OPERACIONES'].includes(usuario.rol)
+                     || (usuario.permisos || []).includes('*');
+
+        let filter;
+        if (verTodo) {
+            // Sin restricción — ven todas las reuniones de todas las áreas
+            filter = {};
+        } else {
+            // Solo ven las reuniones donde participan
+            filter = {
+                $or: [
+                    { organizer:           usuario.username }, // organizador nuevo
+                    { creadoPor:           usuario.username }, // creador legacy
+                    { invitadoUsernames:   usuario.username }, // están en la lista
+                ],
+            };
+        }
+
+        const docs = await db.collection('hub_reuniones')
+            .find(filter)
+            .sort({ date: -1, time: -1 })
+            .limit(limit)
+            .toArray();
+
+        res.json(docs);
+    } catch (e) {
+        console.error('Error GET hub_reuniones:', e);
+        res.status(500).json({ error: 'Error obteniendo reuniones' });
+    }
+});
+
 app.post('/api/hub/reuniones',       ...hubPost  ('hub_reuniones','hub.reuniones'));
 app.patch('/api/hub/reuniones/:id',  ...hubPatch ('hub_reuniones','hub.reuniones'));
 app.delete('/api/hub/reuniones/:id', ...hubDelete('hub_reuniones','hub.reuniones'));
@@ -1165,6 +1238,180 @@ app.patch('/api/hub/minutas/:minutaId/acciones/:itemId', requireAuth, requirePer
     } catch (e) { res.status(500).json({ error: 'Error accion' }); }
 });
 
+// ================================================================
+// REPOSICIONES — CRUD completo v4.4.0
+// Colección: hub_reposiciones
+// Permisos: activos.ver (lectura) / activos.registrar (escritura)
+// ================================================================
+
+// [REP-1] GET — historial con filtros opcionales
+app.get('/api/reposiciones/movimientos', requireAuth, requirePermiso('activos.ver'), async (req, res) => {
+    try {
+        const limit  = Math.min(parseInt(req.query.limit) || 500, 1000);
+        const filter = {};
+        if (req.query.pdv)    filter['PDV']    = { $regex: req.query.pdv, $options: 'i' };
+        if (req.query.estado) filter['Estado'] = req.query.estado;
+        if (req.query.equipo) filter['Tipo de Equipo'] = { $regex: req.query.equipo, $options: 'i' };
+
+        const [registros, total] = await Promise.all([
+            db.collection('hub_reposiciones').find(filter).sort({ createdAt: -1 }).limit(limit).toArray(),
+            db.collection('hub_reposiciones').countDocuments(filter),
+        ]);
+        res.json({ registros, total });
+    } catch (e) {
+        console.error('Error GET reposiciones:', e);
+        res.status(500).json({ error: 'Error obteniendo reposiciones' });
+    }
+});
+
+// [REP-2] POST /bulk — ANTES del POST base (evitar colisión con :id)
+app.post('/api/reposiciones/movimientos/bulk', requireAuth, requirePermiso('activos.registrar'), async (req, res) => {
+    try {
+        const { registros } = req.body;
+        if (!Array.isArray(registros) || registros.length === 0)
+            return res.status(400).json({ error: 'Se requiere un array "registros" no vacío' });
+        if (registros.length > 500)
+            return res.status(400).json({ error: 'Máximo 500 registros por carga masiva' });
+
+        const ahora   = new Date();
+        const errores = [];
+        const docs    = [];
+
+        registros.forEach((r, i) => {
+            const serie = String(r['Número de Serie'] || r['Serie'] || '').trim();
+            const pdv   = String(r['PDV'] || '').trim();
+            if (!serie) { errores.push(`Fila ${i+1}: Número de serie requerido`); return; }
+            if (!pdv)   { errores.push(`Fila ${i+1}: PDV requerido`); return; }
+
+            const { _id: _localId, ...rest } = r;
+            docs.push({
+                ...rest,
+                'Número de Serie':    serie.toUpperCase(),
+                'PDV':                pdv,
+                'Registrado Por':     rest['Registrado Por'] || req.usuario.username,
+                'Fecha Registro':     rest['Fecha Registro'] || ahora.toISOString(),
+                'Carga Masiva':       true,
+                'Fecha Carga Masiva': ahora.toISOString(),
+                creadoPor:            req.usuario.username,
+                createdAt:            ahora,
+            });
+        });
+
+        let insertados = 0;
+        if (docs.length > 0) {
+            const result = await db.collection('hub_reposiciones').insertMany(docs, { ordered: false });
+            insertados = result.insertedCount;
+        }
+
+        console.log(`[Reposiciones] Bulk: ${insertados} insertados, ${errores.length} errores — ${req.usuario.username}`);
+        res.status(201).json({ success: true, insertados, errores: errores.length, detallesError: errores });
+
+    } catch (e) {
+        if (e.name === 'MongoBulkWriteError') {
+            return res.json({ success: true, insertados: e.result?.insertedCount || 0, errores: e.writeErrors?.length || 0 });
+        }
+        console.error('Error POST reposiciones/bulk:', e);
+        res.status(500).json({ error: 'Error en carga masiva de reposiciones' });
+    }
+});
+
+// [REP-3] POST — crear un registro individual
+app.post('/api/reposiciones/movimientos', requireAuth, requirePermiso('activos.registrar'), async (req, res) => {
+    try {
+        const { registro } = req.body;
+        const data = registro || req.body; // aceptar ambos formatos
+
+        const serie = String(data['Número de Serie'] || data['Serie'] || '').trim();
+        const pdv   = String(data['PDV'] || '').trim();
+        if (!serie) return res.status(400).json({ error: 'Número de serie requerido' });
+        if (!pdv)   return res.status(400).json({ error: 'PDV requerido' });
+
+        const { _id: _localId, ...rest } = data;
+        const doc = {
+            ...rest,
+            'Número de Serie': serie.toUpperCase(),
+            'PDV':             pdv,
+            'Registrado Por':  rest['Registrado Por'] || req.usuario.username,
+            creadoPor:         req.usuario.username,
+            createdAt:         new Date(),
+        };
+
+        const result = await db.collection('hub_reposiciones').insertOne(doc);
+        console.log(`[Reposiciones] Creada: ${result.insertedId} por ${req.usuario.username}`);
+        res.status(201).json({ success: true, id: result.insertedId, registro: { ...doc, _id: result.insertedId } });
+
+    } catch (e) {
+        console.error('Error POST reposiciones:', e);
+        res.status(500).json({ error: 'Error creando reposición' });
+    }
+});
+
+// [REP-4] PATCH — editar registro
+app.patch('/api/reposiciones/movimientos/:id', requireAuth, requirePermiso('activos.registrar'), async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id))
+            return res.status(400).json({ error: `ID inválido: "${id}"` });
+
+        const registro = await db.collection('hub_reposiciones').findOne({ _id: new ObjectId(id) });
+        if (!registro) return res.status(404).json({ error: 'Registro no encontrado' });
+
+        const rolesPrivilegiados = ['ADMIN', 'COORDINADOR', 'GERENTE_OPERACIONES'];
+        if (!rolesPrivilegiados.includes(req.usuario.rol)) {
+            if (registro.creadoPor !== req.usuario.username)
+                return res.status(403).json({ error: 'Sin permisos para editar este registro' });
+        }
+
+        // Filtrar campos vacíos para no sobreescribir datos existentes con vacíos
+        const updates = {};
+        Object.entries(req.body).forEach(([k, v]) => {
+            if (v !== '' && v !== null && v !== undefined) updates[k] = v;
+        });
+        // Campos protegidos
+        delete updates._id;
+        delete updates.creadoPor;
+        delete updates.createdAt;
+
+        updates.updatedAt    = new Date();
+        updates['Editado Por']   = req.usuario.username;
+        updates['Fecha Edicion'] = new Date().toISOString();
+
+        await db.collection('hub_reposiciones').updateOne({ _id: new ObjectId(id) }, { $set: updates });
+        console.log(`[Reposiciones] Editada: ${id} por ${req.usuario.username}`);
+        res.json({ success: true, id });
+
+    } catch (e) {
+        console.error('Error PATCH reposiciones:', e);
+        res.status(500).json({ error: 'Error actualizando reposición' });
+    }
+});
+
+// [REP-5] DELETE — eliminar registro
+app.delete('/api/reposiciones/movimientos/:id', requireAuth, requirePermiso('activos.registrar'), async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id))
+            return res.status(400).json({ error: `ID inválido: "${id}"` });
+
+        const registro = await db.collection('hub_reposiciones').findOne({ _id: new ObjectId(id) });
+        if (!registro) return res.status(404).json({ error: 'Registro no encontrado' });
+
+        const rolesPrivilegiados = ['ADMIN', 'COORDINADOR', 'GERENTE_OPERACIONES'];
+        if (!rolesPrivilegiados.includes(req.usuario.rol)) {
+            if (registro.creadoPor !== req.usuario.username)
+                return res.status(403).json({ error: 'Sin permisos para eliminar este registro' });
+        }
+
+        await db.collection('hub_reposiciones').deleteOne({ _id: new ObjectId(id) });
+        console.log(`[Reposiciones] Eliminada: ${id} por ${req.usuario.username}`);
+        res.json({ success: true, eliminado: id });
+
+    } catch (e) {
+        console.error('Error DELETE reposiciones:', e);
+        res.status(500).json({ error: 'Error eliminando reposición' });
+    }
+});
+
 // ── Mensajes ───────────────────────────────────────────────────
 app.get('/api/hub/mensajes/:canal', requireAuth, requirePermiso('hub.mensajes'), async (req, res) => {
     try {
@@ -1392,9 +1639,11 @@ async function start() {
     try {
         await connectDB();
         app.listen(PORT, () => {
-            console.log(`MYG API v4.3.3 en puerto ${PORT}`);
+            console.log(`MYG API v4.4.0 en puerto ${PORT}`);
             console.log(`IA Minutas: Groq=${!!process.env.GROQ_API_KEY ? '✅' : '❌'} | Gemini=${!!process.env.GEMINI_API_KEY ? '✅' : '❌'} | Local=✅`);
-            console.log(`Activos: GET(limit dinámico) POST(insertMany) PATCH(edición+confirmación) ✅`);
+            console.log(`Activos:      GET(limit) POST(insertMany) PATCH(edit) DELETE(permisos) BULK(500max) ✅`);
+            console.log(`Reposiciones: GET POST POST-bulk PATCH DELETE → hub_reposiciones ✅`);
+            console.log(`Reuniones:    GET con filtro de privacidad por invitadoUsernames ✅`);
         });
     } catch (err) { console.error('Error iniciando:', err); process.exit(1); }
 }
