@@ -2,30 +2,11 @@
 // MYG TELECOM — API SERVER v4.4.0
 // Render (Node.js) + MongoDB Atlas
 //
-// ── CAMBIOS v4.4.0 (sobre v4.3.3) ────────────────────────────
-// [REU-1] GET /api/hub/reuniones:
-//         Reemplaza hubGet genérico con filtro de privacidad.
-//         ADMIN / GERENTE_OPERACIONES → ven todas.
-//         COORDINADOR / ANALISTA     → solo reuniones donde
-//         son organizer, creadoPor o están en invitadoUsernames.
-//         Reuniones legacy (sin invitadoUsernames) → solo
-//         el organizador + ADMIN las ven.
-//
-// [ACT-1] DELETE /api/activos/movimientos/:id
-//         ADMIN/COORDINADOR/GERENTE_OPERACIONES → borran cualquiera.
-//         ANALISTA → solo sus propios registros (creadoPor).
-//
-// [ACT-2] POST /api/activos/movimientos/bulk
-//         Carga masiva con validación: máx 500 registros,
-//         campos requeridos y BulkWriteError parcial manejado.
-//         (El POST base ya usa insertMany — este endpoint
-//          agrega validación previa y reporting de errores.)
-//
-// [REP-1..5] CRUD completo de Reposiciones
-//         Colección: hub_reposiciones
-//         GET / POST / POST-bulk / PATCH / DELETE
-//
-// ── Sin otros cambios respecto a v4.3.3 ─────────────────────
+// CAMBIOS v4.5.0:
+//   [CAN-1..4] CRUD de canales dinámicos → hub_canales
+//   [BOL-1..5] CRUD de boletines semanales → hub_boletines
+//   [BOL-6]    Índice en connectDB para hub_boletines y hub_canales
+// ================================================================
 // ============================================================
 
 require('dotenv').config();
@@ -109,6 +90,11 @@ async function connectDB() {
     await idx('hub_reposiciones', { 'PDV': 1 },              { name: 'repos_pdv'             });
     await idx('hub_reposiciones', { 'Estado': 1 },           { name: 'repos_estado'          });
 
+    await idx('hub_boletines', { area: 1, semana: 1 },    { name: 'boletines_area_semana' });
+    await idx('hub_boletines', { createdAt: -1 },         { name: 'boletines_fecha'       });
+    await idx('hub_canales',   { area: 1 },               { name: 'canales_area'          });
+    await idx('hub_canales',   { id: 1 },                 { unique: true, name: 'canales_id_unique' });
+
     return client;
 }
 
@@ -132,6 +118,8 @@ const MODULOS_PERMISOS = [
     'rh.movimientos.crear','rh.movimientos.ver','rh.movimientos.gestionar',
     'activos.ver','activos.registrar','exportar_datos',
     'chatbot.usar','admin.panel','admin.usuarios','admin.permisos','admin.logs','admin.formularios',
+    'hub.coordinacion.acceso',
+    'hub.boletines','hub.boletines.subir','hub.boletines.ver','hub.canales.admin',
 ];
 
 const ROL_PERMISOS_DEFAULT = {
@@ -144,7 +132,8 @@ const ROL_PERMISOS_DEFAULT = {
         'hub.asistencia','hub.asistencia.registrar','hub.asistencia.admin_registro',
         'hub.peticiones.ver_todas','hub.peticiones.aprobar','hub.peticiones.crear',
         'hub.capacitacion','hub.capacitacion.ver',
-        'exportar_datos','chatbot.usar',
+        'exportar_datos','chatbot.usar','hub.coordinacion.acceso','hub.boletines',
+        'hub.boletines.subir','hub.boletines.ver','hub.canales.admin',
     ],
     COORDINADOR: [
         'dashboard.ver','dashboard.rh','dashboard.headcount','dashboard.activos',
@@ -159,6 +148,8 @@ const ROL_PERMISOS_DEFAULT = {
         'formatos.generar',
         'rh.movimientos.crear','rh.movimientos.ver','rh.movimientos.gestionar',
         'activos.ver','activos.registrar','exportar_datos','chatbot.usar',
+        'hub.coordinacion.acceso','hub.boletines','hub.boletines.subir',
+        'hub.boletines.ver','hub.canales.admin',
     ],
     ANALISTA: [
         'dashboard.ver','dashboard.rh','dashboard.headcount','dashboard.activos',
@@ -1630,7 +1621,392 @@ app.delete('/api/hub/peticiones/:id', requireAuth, requirePermiso('hub.peticione
     try { await db.collection('hub_peticiones').deleteOne({_id:new ObjectId(req.params.id)}); res.json({success:true}); }
     catch (e) { res.status(500).json({ error: 'Error peticion' }); }
 });
-
+// ================================================================
+// [CAN-1] GET /api/hub/canales — lista de canales por área
+// Fallback: si no hay canales en DB para un área, devuelve []
+// (el frontend usa sus defaults en ese caso)
+// ================================================================
+app.get('/api/hub/canales', requireAuth, requirePermiso('hub.mensajes'), async (req, res) => {
+    try {
+        const { area } = req.query;
+        const filter   = area ? { area } : {};
+        const docs     = await db.collection('hub_canales')
+            .find(filter)
+            .sort({ pinned: -1, createdAt: 1 })
+            .toArray();
+        res.json(docs);
+    } catch (e) {
+        console.error('Error GET canales:', e);
+        res.status(500).json({ error: 'Error obteniendo canales' });
+    }
+});
+ 
+// ================================================================
+// [CAN-2] POST /api/hub/canales — crear canal
+// ================================================================
+app.post('/api/hub/canales', requireAuth, requirePermiso('hub.mensajes'), async (req, res) => {
+    try {
+        const { nombre, emoji, desc, area, pinned = false } = req.body;
+ 
+        // Solo ADMIN, GERENTE_OPERACIONES y COORDINADOR pueden crear canales
+        const rolesPermitidos = ['ADMIN', 'GERENTE_OPERACIONES', 'COORDINADOR'];
+        if (!rolesPermitidos.includes(req.usuario.rol)) {
+            return res.status(403).json({ error: 'Sin permisos para crear canales' });
+        }
+ 
+        if (!nombre || !nombre.trim()) {
+            return res.status(400).json({ error: 'nombre requerido' });
+        }
+ 
+        // ID único legible basado en área + nombre + timestamp
+        const areaSlug   = (area || 'hub').toLowerCase().replace(/[^a-z0-9]/g, '_');
+        const nombreSlug = nombre.toLowerCase().replace(/[^a-z0-9]/g, '_');
+        const id         = `${areaSlug}_${nombreSlug}_${Date.now()}`;
+ 
+        // Verificar que el nombre no esté duplicado en esa área
+        const existe = await db.collection('hub_canales').findOne({ area, nombre: nombre.trim() });
+        if (existe) {
+            return res.status(409).json({ error: `Ya existe un canal "${nombre}" en esa área` });
+        }
+ 
+        const doc = {
+            id,
+            nombre:    nombre.trim(),
+            emoji:     emoji || '💬',
+            desc:      desc  || '',
+            area:      area  || 'general',
+            pinned:    !!pinned,
+            creadoPor: req.usuario.username,
+            createdAt: new Date(),
+        };
+ 
+        await db.collection('hub_canales').insertOne(doc);
+        console.log(`[Canales] Creado: ${id} por ${req.usuario.username}`);
+        res.status(201).json({ success: true, canal: doc });
+ 
+    } catch (e) {
+        if (e.code === 11000) {
+            return res.status(409).json({ error: 'ID de canal duplicado, intenta de nuevo' });
+        }
+        console.error('Error POST canales:', e);
+        res.status(500).json({ error: 'Error creando canal' });
+    }
+});
+ 
+// ================================================================
+// [CAN-3] PATCH /api/hub/canales/:id — editar canal
+// :id es el campo id (string), no ObjectId
+// ================================================================
+app.patch('/api/hub/canales/:id', requireAuth, requirePermiso('hub.mensajes'), async (req, res) => {
+    try {
+        const { id } = req.params;
+ 
+        const rolesPermitidos = ['ADMIN', 'GERENTE_OPERACIONES', 'COORDINADOR'];
+        if (!rolesPermitidos.includes(req.usuario.rol)) {
+            return res.status(403).json({ error: 'Sin permisos para editar canales' });
+        }
+ 
+        const canal = await db.collection('hub_canales').findOne({ id });
+        if (!canal) {
+            // Canal podría ser un canal de default no persistido aún — responder OK sin error
+            return res.json({ success: true, note: 'Canal no encontrado en DB (puede ser default)' });
+        }
+ 
+        const { nombre, emoji, desc, pinned } = req.body;
+        const updates = { updatedAt: new Date(), updatedBy: req.usuario.username };
+        if (nombre    !== undefined) updates.nombre = nombre.trim();
+        if (emoji     !== undefined) updates.emoji  = emoji;
+        if (desc      !== undefined) updates.desc   = desc;
+        if (pinned    !== undefined) updates.pinned = !!pinned;
+ 
+        await db.collection('hub_canales').updateOne({ id }, { $set: updates });
+        res.json({ success: true });
+ 
+    } catch (e) {
+        console.error('Error PATCH canales:', e);
+        res.status(500).json({ error: 'Error actualizando canal' });
+    }
+});
+ 
+// ================================================================
+// [CAN-4] DELETE /api/hub/canales/:id — eliminar canal y sus mensajes
+// ================================================================
+app.delete('/api/hub/canales/:id', requireAuth, requirePermiso('hub.mensajes'), async (req, res) => {
+    try {
+        const { id } = req.params;
+ 
+        const rolesPermitidos = ['ADMIN', 'GERENTE_OPERACIONES', 'COORDINADOR'];
+        if (!rolesPermitidos.includes(req.usuario.rol)) {
+            return res.status(403).json({ error: 'Sin permisos para eliminar canales' });
+        }
+ 
+        const canal = await db.collection('hub_canales').findOne({ id });
+        if (!canal) {
+            return res.status(404).json({ error: 'Canal no encontrado' });
+        }
+ 
+        // No permitir eliminar canales anclados (pinned: true)
+        if (canal.pinned) {
+            return res.status(400).json({ error: 'No se puede eliminar un canal anclado (pinned)' });
+        }
+ 
+        // Eliminar mensajes del canal + el canal mismo
+        const [mensajesResult] = await Promise.all([
+            db.collection('hub_mensajes').deleteMany({ canal: id }),
+            db.collection('hub_canales').deleteOne({ id }),
+        ]);
+ 
+        console.log(`[Canales] Eliminado: ${id} (${mensajesResult.deletedCount} mensajes) por ${req.usuario.username}`);
+        res.json({ success: true, mensajesEliminados: mensajesResult.deletedCount });
+ 
+    } catch (e) {
+        console.error('Error DELETE canales:', e);
+        res.status(500).json({ error: 'Error eliminando canal' });
+    }
+});
+// ================================================================
+// [BOL-1] GET /api/hub/boletines — lista con filtros opcionales
+// GERENTE_OPERACIONES / ADMIN ven todas las áreas
+// COORDINADOR ve solo su área
+// ================================================================
+app.get('/api/hub/boletines', requireAuth, async (req, res) => {
+    try {
+        const { usuario } = req;
+ 
+        // Verificar permiso de acceso básico al hub de coordinación
+        const rolesPermitidos = ['ADMIN', 'GERENTE_OPERACIONES', 'COORDINADOR'];
+        if (!rolesPermitidos.includes(usuario.rol)) {
+            return res.status(403).json({ error: 'Sin acceso al módulo de boletines' });
+        }
+ 
+        const limit  = Math.min(parseInt(req.query.limit) || 100, 500);
+        const filter = {};
+ 
+        // Filtro por área — COORDINADOR solo ve la suya
+        if (req.query.area) {
+            filter.area = req.query.area;
+        }
+        if (usuario.rol === 'COORDINADOR') {
+            // Fuerza el área propia independientemente del query param
+            filter.area = usuario.area;
+        }
+ 
+        if (req.query.semana) filter.semana = req.query.semana;
+ 
+        // Excluir datos binarios de archivos para el listado (aligerar respuesta)
+        // Solo incluimos nombre, tipo y tamanio — no el base64
+        const docs = await db.collection('hub_boletines')
+            .find(filter)
+            .sort({ createdAt: -1 })
+            .limit(limit)
+            .project({ 'archivos.data': 0 }) // excluir base64 del listado
+            .toArray();
+ 
+        res.json(docs);
+ 
+    } catch (e) {
+        console.error('Error GET boletines:', e);
+        res.status(500).json({ error: 'Error obteniendo boletines' });
+    }
+});
+ 
+// ================================================================
+// [BOL-2] GET /api/hub/boletines/:id — detalle con archivos completos
+// ================================================================
+app.get('/api/hub/boletines/:id', requireAuth, async (req, res) => {
+    try {
+        const { usuario } = req;
+        const rolesPermitidos = ['ADMIN', 'GERENTE_OPERACIONES', 'COORDINADOR'];
+        if (!rolesPermitidos.includes(usuario.rol)) {
+            return res.status(403).json({ error: 'Sin acceso' });
+        }
+ 
+        if (!ObjectId.isValid(req.params.id)) {
+            return res.status(400).json({ error: 'ID inválido' });
+        }
+ 
+        const doc = await db.collection('hub_boletines').findOne({ _id: new ObjectId(req.params.id) });
+        if (!doc) return res.status(404).json({ error: 'Boletín no encontrado' });
+ 
+        // COORDINADOR solo puede ver boletines de su área
+        if (usuario.rol === 'COORDINADOR' && doc.area !== usuario.area) {
+            return res.status(403).json({ error: 'Sin acceso a este boletín' });
+        }
+ 
+        res.json(doc); // incluye base64 de archivos
+ 
+    } catch (e) {
+        console.error('Error GET boletín:', e);
+        res.status(500).json({ error: 'Error obteniendo boletín' });
+    }
+});
+ 
+// ================================================================
+// [BOL-3] POST /api/hub/boletines — crear boletín
+// ================================================================
+app.post('/api/hub/boletines', requireAuth, async (req, res) => {
+    try {
+        const { usuario } = req;
+        const rolesPermitidos = ['ADMIN', 'GERENTE_OPERACIONES', 'COORDINADOR'];
+        if (!rolesPermitidos.includes(usuario.rol)) {
+            return res.status(403).json({ error: 'Sin permisos para crear boletines' });
+        }
+ 
+        const {
+            area, semana, semanaLabel, titulo, descripcion,
+            archivos, fechaLimiteSabado, lunesPublicacion,
+        } = req.body;
+ 
+        if (!area || !titulo) {
+            return res.status(400).json({ error: 'area y titulo son requeridos' });
+        }
+ 
+        // COORDINADOR solo puede subir boletín de su propia área
+        if (usuario.rol === 'COORDINADOR' && usuario.area !== area) {
+            return res.status(403).json({ error: `Solo puedes subir boletines del área ${usuario.area}` });
+        }
+ 
+        // Validar deadline — no se puede subir después del sábado (salvo ADMIN/GERENTE)
+        const privilegiados = ['ADMIN', 'GERENTE_OPERACIONES'];
+        const hoy = new Date().toISOString().split('T')[0];
+        if (!privilegiados.includes(usuario.rol) && fechaLimiteSabado && hoy > fechaLimiteSabado) {
+            return res.status(400).json({
+                error: `La fecha límite de entrega (${fechaLimiteSabado}) ya pasó. Solo ADMIN o Gerente pueden subir fuera de plazo.`
+            });
+        }
+ 
+        // Validar tamaño de archivos (max 3 MB cada uno)
+        const MAX_FILE_BYTES = 3 * 1024 * 1024;
+        for (const arch of (archivos || [])) {
+            if (!arch.data) continue;
+            const bytes = Buffer.from(arch.data, 'base64').length;
+            if (bytes > MAX_FILE_BYTES) {
+                return res.status(400).json({ error: `Archivo "${arch.nombre}" excede el límite de 3 MB` });
+            }
+        }
+ 
+        const doc = {
+            area,
+            semana:            semana        || '',
+            semanaLabel:       semanaLabel   || semana || '',
+            titulo:            titulo.trim(),
+            descripcion:       (descripcion  || '').trim(),
+            archivos:          archivos      || [],
+            fechaLimiteSabado: fechaLimiteSabado || null,
+            lunesPublicacion:  lunesPublicacion  || null,
+            creadoPor:         usuario.username,
+            createdAt:         new Date(),
+        };
+ 
+        const result = await db.collection('hub_boletines').insertOne(doc);
+        console.log(`[Boletines] Creado: ${result.insertedId} área=${area} semana=${semana} por ${usuario.username}`);
+ 
+        // Responder sin base64 para aligerar la respuesta
+        const { archivos: _arch, ...sinArchivos } = doc;
+        const archMetadata = (archivos || []).map(({ nombre, tipo, tamanio }) => ({ nombre, tipo, tamanio }));
+        res.status(201).json({
+            success:  true,
+            id:       result.insertedId,
+            boletin:  { ...sinArchivos, archivos: archMetadata, _id: result.insertedId },
+        });
+ 
+    } catch (e) {
+        console.error('Error POST boletines:', e);
+        res.status(500).json({ error: 'Error creando boletín' });
+    }
+});
+ 
+// ================================================================
+// [BOL-4] PATCH /api/hub/boletines/:id — actualizar boletín
+// ================================================================
+app.patch('/api/hub/boletines/:id', requireAuth, async (req, res) => {
+    try {
+        const { usuario } = req;
+        const rolesPermitidos = ['ADMIN', 'GERENTE_OPERACIONES', 'COORDINADOR'];
+        if (!rolesPermitidos.includes(usuario.rol)) {
+            return res.status(403).json({ error: 'Sin permisos' });
+        }
+ 
+        if (!ObjectId.isValid(req.params.id)) {
+            return res.status(400).json({ error: 'ID inválido' });
+        }
+ 
+        const doc = await db.collection('hub_boletines').findOne({ _id: new ObjectId(req.params.id) });
+        if (!doc) return res.status(404).json({ error: 'Boletín no encontrado' });
+ 
+        // COORDINADOR: solo su área y solo antes del deadline
+        if (usuario.rol === 'COORDINADOR') {
+            if (doc.area !== usuario.area) {
+                return res.status(403).json({ error: 'Solo puedes editar boletines de tu área' });
+            }
+            const hoy = new Date().toISOString().split('T')[0];
+            if (doc.fechaLimiteSabado && hoy > doc.fechaLimiteSabado) {
+                return res.status(400).json({ error: 'La fecha límite de entrega ya pasó. No puedes editar este boletín.' });
+            }
+        }
+ 
+        const { titulo, descripcion, archivos } = req.body;
+        const updates = { updatedAt: new Date(), updatedBy: usuario.username };
+        if (titulo      !== undefined) updates.titulo      = titulo.trim();
+        if (descripcion !== undefined) updates.descripcion = descripcion.trim();
+        if (archivos    !== undefined) {
+            // Validar archivos nuevos
+            const MAX_FILE_BYTES = 3 * 1024 * 1024;
+            for (const arch of archivos) {
+                if (!arch.data) continue;
+                const bytes = Buffer.from(arch.data, 'base64').length;
+                if (bytes > MAX_FILE_BYTES) {
+                    return res.status(400).json({ error: `Archivo "${arch.nombre}" excede 3 MB` });
+                }
+            }
+            updates.archivos = archivos;
+        }
+ 
+        await db.collection('hub_boletines').updateOne({ _id: new ObjectId(req.params.id) }, { $set: updates });
+        console.log(`[Boletines] Actualizado: ${req.params.id} por ${usuario.username}`);
+        res.json({ success: true });
+ 
+    } catch (e) {
+        console.error('Error PATCH boletines:', e);
+        res.status(500).json({ error: 'Error actualizando boletín' });
+    }
+});
+ 
+// ================================================================
+// [BOL-5] DELETE /api/hub/boletines/:id — eliminar boletín
+// ================================================================
+app.delete('/api/hub/boletines/:id', requireAuth, async (req, res) => {
+    try {
+        const { usuario } = req;
+        const rolesPermitidos = ['ADMIN', 'GERENTE_OPERACIONES', 'COORDINADOR'];
+        if (!rolesPermitidos.includes(usuario.rol)) {
+            return res.status(403).json({ error: 'Sin permisos' });
+        }
+ 
+        if (!ObjectId.isValid(req.params.id)) {
+            return res.status(400).json({ error: 'ID inválido' });
+        }
+ 
+        const doc = await db.collection('hub_boletines').findOne({ _id: new ObjectId(req.params.id) });
+        if (!doc) return res.status(404).json({ error: 'Boletín no encontrado' });
+ 
+        // COORDINADOR solo puede eliminar de su área y antes del deadline
+        if (usuario.rol === 'COORDINADOR') {
+            if (doc.area !== usuario.area) {
+                return res.status(403).json({ error: 'Solo puedes eliminar boletines de tu área' });
+            }
+        }
+        // GERENTE y ADMIN pueden eliminar cualquiera
+ 
+        await db.collection('hub_boletines').deleteOne({ _id: new ObjectId(req.params.id) });
+        console.log(`[Boletines] Eliminado: ${req.params.id} por ${usuario.username}`);
+        res.json({ success: true });
+ 
+    } catch (e) {
+        console.error('Error DELETE boletines:', e);
+        res.status(500).json({ error: 'Error eliminando boletín' });
+    }
+});
 // ── 404 / Error handler ────────────────────────────────────────
 app.use('*', (req, res) => res.status(404).json({ error: `Endpoint no encontrado: ${req.originalUrl}` }));
 app.use((err, req, res, next) => { console.error('Error no manejado:', err); res.status(500).json({ error: 'Error interno' }); });
