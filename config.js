@@ -203,7 +203,7 @@ var CONFIG = {
     rolesConArea: ['COORDINADOR', 'ANALISTA', 'GERENTE_RH', 'ANALISTA_RH'], // v4.1
 
     // Roles que ven el selector de áreas al iniciar
-    rolesConAreaSelector: ['ADMIN', 'GERENTE_OPERACIONES','COORDINADOR'],
+    rolesConAreaSelector: ['ADMIN', 'GERENTE_OPERACIONES'],
 };
 
 // Paginación global
