@@ -187,6 +187,14 @@ var CONFIG = {
             label:      'Logística',
             descripcion:'Logística, Distribución y Cadena de Suministro',
             tabs:       ['hub_logistica']      // v4.2 — Hub propio de área
+        },
+        CoordinacionATT: {
+            emoji:      '📡',
+            color:      'purple',
+            colorHex:   '#7C3AED',
+            label:      'Coordinación AT&T',
+            descripcion:'Hub de Coordinación AT&T Operaciones',
+            tabs:       ['hub_coordinacion_att'] // v4.2 — Hub propio de área
         }
     },
 
