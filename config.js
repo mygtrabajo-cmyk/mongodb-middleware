@@ -55,6 +55,7 @@ var CONFIG = {
             adminSubmissions:   '/api/admin/form-submissions',
             adminRolePerms:     '/api/admin/permissions/roles',
             adminUserPerms:     '/api/admin/permissions/users',
+           
         },
 
         timeout: 30000,
@@ -202,7 +203,7 @@ var CONFIG = {
     rolesConArea: ['COORDINADOR', 'ANALISTA', 'GERENTE_RH', 'ANALISTA_RH'], // v4.1
 
     // Roles que ven el selector de áreas al iniciar
-    rolesConAreaSelector: ['ADMIN', 'GERENTE_OPERACIONES'],
+    rolesConAreaSelector: ['ADMIN', 'GERENTE_OPERACIONES','COORDINADOR'],
 };
 
 // Paginación global
