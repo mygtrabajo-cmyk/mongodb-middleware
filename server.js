@@ -99,7 +99,7 @@ async function connectDB() {
 }
 
 const ROLES_VALIDOS  = ['ADMIN','GERENTE_OPERACIONES','COORDINADOR','ANALISTA','GERENTE_COMERCIAL','EJECUTIVO_COMERCIAL','GERENTE_RH','ANALISTA_RH','USUARIO'];
-const AREAS_VALIDAS  = ['Sistemas','Mantenimiento','Credito','Logistica'];
+const AREAS_VALIDAS  = ['Sistemas','Mantenimiento','Credito','Logistica','CoordinacionATT'];
 const ROLES_CON_AREA = ['COORDINADOR','ANALISTA','GERENTE_RH','ANALISTA_RH'];
 const LEGACY_ROLE_MAP = { 'RH':'ANALISTA_RH','SISTEMAS':'COORDINADOR','GERENTE':'GERENTE_OPERACIONES','USUARIO':'USUARIO','ADMIN':'ADMIN' };
 
@@ -247,6 +247,31 @@ function requireAuth(req, res, next) {
         if (!header?.startsWith('Bearer '))
             return res.status(401).json({ error: 'Token no proporcionado' });
         const token = header.slice(7);
+        const payload = jwt.verify(token, process.env.JWT_SECRET);
+        payload.rol = normalizarRol(payload.rol);
+        req.usuario = payload;
+        next();
+    } catch (error) {
+        if (error.name === 'TokenExpiredError')
+            return res.status(401).json({ error: 'Token expirado', code: 'TOKEN_EXPIRED' });
+        return res.status(401).json({ error: 'Token invalido' });
+    }
+}
+
+function requireAuthSSE(req, res, next) {
+    try {
+        let token;
+        const header = req.headers.authorization;
+        if (header?.startsWith('Bearer ')) {
+            // Conexión normal (fetch, axios, etc.)
+            token = header.slice(7);
+        } else if (req.query.token) {
+            // Conexión SSE via EventSource (no soporta headers)
+            token = req.query.token;
+        }
+        if (!token) {
+            return res.status(401).json({ error: 'Token no proporcionado' });
+        }
         const payload = jwt.verify(token, process.env.JWT_SECRET);
         payload.rol = normalizarRol(payload.rol);
         req.usuario = payload;
@@ -526,7 +551,7 @@ function ssePush(username, evento, datos) {
     targets.forEach(r => { try { r.write(payload); } catch { } });
 }
 
-app.get('/api/notificaciones/sse', requireAuth, (req, res) => {
+app.get('/api/notificaciones/sse', requireAuthSSE, (req, res) => {
     res.setHeader('Content-Type','text/event-stream');
     res.setHeader('Cache-Control','no-cache');
     res.setHeader('Connection','keep-alive');
