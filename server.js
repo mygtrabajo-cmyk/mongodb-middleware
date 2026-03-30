@@ -5,7 +5,7 @@
 // CAMBIOS v4.5.0:
 //   [CAN-1..4] CRUD de canales dinámicos → hub_canales
 //   [BOL-1..5] CRUD de boletines semanales → hub_boletines
-//   [BOL-6]    Índice en connectDB para hub_boletines y hub_canales
+//   [BOL-6]   Índice en connectDB para hub_boletines y hub_canales
 // ================================================================
 // ============================================================
 
