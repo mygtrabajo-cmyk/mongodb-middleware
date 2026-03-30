@@ -19,6 +19,7 @@ const bcrypt    = require('bcryptjs');
 const Joi       = require('joi');
 const rateLimit = require('express-rate-limit');
 const morgan    = require('morgan');
+const nebulaRoutes = require('./nebula_agents');
 
 // IA Minutas — SDK opcional (fallback a REST si no están instalados)
 let GoogleGenerativeAI;
@@ -55,6 +56,10 @@ async function connectDB() {
     db = client.db(DB_NAME);
     console.log(`MongoDB conectado: ${DB_NAME}`);
 
+    await nebulaRoutes.init(app, db, ssePush, requireAuth, requireAdmin);
+        nebulaRoutes.startOfflineWatcher(db, ssePush);
+        console.log('[Nebula] Agente backend inicializado ✅');
+    
     const idx = async (col, spec, opts={}) => {
         try {
             await db.collection(col).createIndex(spec, opts);
