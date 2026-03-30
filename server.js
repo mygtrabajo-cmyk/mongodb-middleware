@@ -19,7 +19,7 @@ const bcrypt    = require('bcryptjs');
 const Joi       = require('joi');
 const rateLimit = require('express-rate-limit');
 const morgan    = require('morgan');
-const nebulaRoutes = require('./nebula_agents');
+const nebulaRoutes = require('nebula_agents');
 
 // IA Minutas — SDK opcional (fallback a REST si no están instalados)
 let GoogleGenerativeAI;
