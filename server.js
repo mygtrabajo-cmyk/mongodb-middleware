@@ -954,7 +954,153 @@ app.get('/api/hub/reuniones', requireAuth, requirePermiso('hub.reuniones'), asyn
         res.status(500).json({ error: 'Error obteniendo reuniones' });
     }
 });
-
+// ================================================================
+// [NEW-2] AGREGA: Crear serie de reuniones de seguimiento
+// POST /api/hub/reuniones/serie
+// Crea N instancias vinculadas a la reunión origen con recurrencia.
+// ⚠ IMPORTANTE: Coloca esta ruta ANTES de app.patch('/api/hub/reuniones/:id', ...)
+//   para que Express no confunda 'serie' con un :id.
+// ================================================================
+app.post('/api/hub/reuniones/serie', requireAuth, requirePermiso('hub.reuniones'), async (req, res) => {
+  try {
+    const {
+      reunionOrigenId,       // string ObjectId — reunión de la que nace la serie
+      nuevaFecha,            // 'YYYY-MM-DD' — fecha del primer seguimiento
+      nuevaHora,             // 'HH:MM'
+      recurrencia,           // null | { tipo: 'semanal'|'mensual'|'dias', intervalo: N }
+      cantidadOcurrencias,   // 1–52
+      titulo,                // Título opcional; si no se da, hereda del origen
+      agenda,                // Agenda opcional
+    } = req.body;
+ 
+    if (!nuevaFecha || !nuevaHora) {
+      return res.status(400).json({ error: 'nuevaFecha y nuevaHora son requeridos' });
+    }
+ 
+    const cantidad = Math.min(Math.max(parseInt(cantidadOcurrencias) || 1, 1), 52);
+ 
+    // Buscar reunión origen si existe
+    let reunionOrigen = null;
+    if (reunionOrigenId && ObjectId.isValid(reunionOrigenId)) {
+      reunionOrigen = await db.collection('hub_reuniones').findOne({ _id: new ObjectId(reunionOrigenId) });
+    }
+ 
+    // Generar o reutilizar serieId
+    const serieId = reunionOrigen?.serieId
+      || `serie_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+ 
+    // Marcar la reunión origen como cabeza de serie (si no está marcada)
+    if (reunionOrigen && !reunionOrigen.serieId) {
+      await db.collection('hub_reuniones').updateOne(
+        { _id: new ObjectId(reunionOrigenId) },
+        { $set: { serieId, esOrigenSerie: true, updatedAt: new Date() } }
+      );
+    }
+ 
+    // Construir documentos de las reuniones de seguimiento
+    const { _id: _oid, grabandoPor: _gp, grabacionInicio: _gi, ...baseFields } = reunionOrigen || {};
+ 
+    const docs = [];
+    for (let i = 0; i < cantidad; i++) {
+      const fecha = new Date(nuevaFecha + 'T00:00:00');
+      const { tipo = 'semanal', intervalo = 1 } = recurrencia || {};
+ 
+      if (i > 0) {
+        if (tipo === 'semanal')   fecha.setDate(fecha.getDate() + 7 * i);
+        else if (tipo === 'mensual') fecha.setMonth(fecha.getMonth() + i);
+        else if (tipo === 'dias')  fecha.setDate(fecha.getDate() + intervalo * i);
+      }
+ 
+      const fechaStr = fecha.toISOString().split('T')[0];
+ 
+      docs.push({
+        ...baseFields,
+        title:            titulo || `${baseFields.title || 'Reunión'} — Seguimiento ${i + 1}`,
+        date:             fechaStr,
+        time:             nuevaHora,
+        agenda:           agenda  || baseFields.agenda || '',
+        status:           'programada',
+        serieId,
+        reunionOrigenId:  reunionOrigenId || null,
+        recurrencia:      recurrencia || null,
+        numeracionSerie:  i + 1,
+        totalSerie:       cantidad,
+        organizer:        req.usuario.username,
+        creadoPor:        req.usuario.username,
+        organizerArea:    req.usuario.area || baseFields.organizerArea || null,
+        invitadoUsernames: baseFields.invitadoUsernames || [],
+        attendees:        baseFields.attendees        || [],
+        createdAt:        new Date(),
+      });
+    }
+ 
+    const result = await db.collection('hub_reuniones').insertMany(docs, { ordered: true });
+ 
+    // Notificar a invitados de la serie
+    const todosInvitados = [...new Set((baseFields.invitadoUsernames || []))];
+    todosInvitados.forEach(uname => {
+      if (uname === req.usuario.username) return;
+      ssePush(uname, 'notificacion', {
+        titulo:      '📅 Nueva serie de reuniones',
+        mensaje:     `${cantidad} reunión(es) de seguimiento programadas desde ${nuevaFecha}`,
+        tipo:        'reunion',
+        icono:       '🔄',
+        tab_destino: 'hub',
+        subtab:      'meetings',
+      });
+    });
+ 
+    console.log(`[Serie] Creada: ${serieId} — ${result.insertedCount} reuniones por ${req.usuario.username}`);
+ 
+    res.status(201).json({
+      success:   true,
+      serieId,
+      creadas:   result.insertedCount,
+      reuniones: docs.map((d, i) => ({ ...d, _id: result.insertedIds[i] })),
+    });
+ 
+  } catch (e) {
+    console.error('Error POST reuniones/serie:', e);
+    res.status(500).json({ error: 'Error creando serie de reuniones' });
+  }
+});
+ 
+ 
+// ================================================================
+// [NEW-3] AGREGA: Obtener todas las reuniones de una serie
+// GET /api/hub/reuniones/serie/:serieId
+// ⚠ IMPORTANTE: Coloca ANTES de app.patch('/api/hub/reuniones/:id', ...)
+// ================================================================
+app.get('/api/hub/reuniones/serie/:serieId', requireAuth, requirePermiso('hub.reuniones'), async (req, res) => {
+  try {
+    const { serieId } = req.params;
+ 
+    const { usuario } = req;
+    const verTodo = ['ADMIN', 'GERENTE_OPERACIONES'].includes(usuario.rol) || (usuario.permisos || []).includes('*');
+ 
+    const filter = { serieId };
+    if (!verTodo) {
+      filter.$or = [
+        { organizer:         usuario.username },
+        { creadoPor:         usuario.username },
+        { invitadoUsernames: usuario.username },
+      ];
+    }
+ 
+    const reuniones = await db.collection('hub_reuniones')
+      .find(filter)
+      .sort({ date: 1, numeracionSerie: 1 })
+      .toArray();
+ 
+    res.json(reuniones);
+ 
+  } catch (e) {
+    console.error('Error GET serie:', e);
+    res.status(500).json({ error: 'Error obteniendo serie de reuniones' });
+  }
+});
+ 
+ 
 app.post('/api/hub/reuniones',       ...hubPost  ('hub_reuniones','hub.reuniones'));
 app.patch('/api/hub/reuniones/:id',  ...hubPatch ('hub_reuniones','hub.reuniones'));
 app.delete('/api/hub/reuniones/:id', ...hubDelete('hub_reuniones','hub.reuniones'));
@@ -1252,13 +1398,126 @@ app.post('/api/hub/minutas/:minutaId/comentarios', requireAuth, requirePermiso('
     } catch (e) { res.status(500).json({ error: 'Error comentario' }); }
 });
 app.patch('/api/hub/minutas/:minutaId/acciones/:itemId', requireAuth, requirePermiso('hub.minutas'), async (req, res) => {
-    try {
-        const fields = {}; Object.entries(req.body).forEach(([k,v])=>{fields[`acciones.$.${k}`]=v;}); fields['acciones.$.updatedAt']=new Date();
-        await db.collection('hub_minutas').updateOne({ _id:new ObjectId(req.params.minutaId),'acciones._id':req.params.itemId }, { $set:fields });
-        res.json({ success:true });
-    } catch (e) { res.status(500).json({ error: 'Error accion' }); }
+  try {
+    const { minutaId, itemId } = req.params;
+ 
+    if (!ObjectId.isValid(minutaId)) {
+      return res.status(400).json({ error: 'minutaId inválido' });
+    }
+ 
+    const minuta = await db.collection('hub_minutas').findOne({ _id: new ObjectId(minutaId) });
+    if (!minuta) return res.status(404).json({ error: 'Minuta no encontrada' });
+ 
+    // Soporta tanto 'actionItems' (campo del recorder) como 'acciones' (campo del form manual)
+    const useField   = minuta.actionItems ? 'actionItems' : 'acciones';
+    const items      = (minuta.actionItems || minuta.acciones || []);
+    let   found      = false;
+ 
+    const updated = items.map(a => {
+      // Matcheo por 'id' (string generado por frontend) O '_id' (ObjectId, legacy)
+      const matchId = a.id === itemId || a._id?.toString() === itemId;
+      if (!matchId) return a;
+ 
+      found = true;
+      const bodyKeys = Object.keys(req.body || {});
+      if (bodyKeys.length > 0) {
+        // PATCH con campos específicos (ej. { done: true, responsable: '...' })
+        return { ...a, ...req.body, updatedAt: new Date() };
+      }
+      // Sin body → toggle done (comportamiento por defecto)
+      return { ...a, done: !a.done, updatedAt: new Date() };
+    });
+ 
+    if (!found) {
+      return res.status(404).json({ error: `Acción con id "${itemId}" no encontrada en esta minuta` });
+    }
+ 
+    await db.collection('hub_minutas').updateOne(
+      { _id: new ObjectId(minutaId) },
+      { $set: { [useField]: updated, updatedAt: new Date(), updatedBy: req.usuario.username } }
+    );
+ 
+    console.log(`[Minutas] Acción ${itemId} actualizada en ${minutaId} por ${req.usuario.username}`);
+    res.json({ success: true, updated: updated.find(a => a.id === itemId || a._id?.toString() === itemId) });
+ 
+  } catch (e) {
+    console.error('Error toggleAccion:', e);
+    res.status(500).json({ error: 'Error actualizando acción de minuta' });
+  }
 });
-
+// ================================================================
+// [NEW-1] AGREGA: Mutex de grabación por reunión
+// PATCH /api/hub/reuniones/:id/grabacion
+// Evita que múltiples participantes graben simultáneamente la misma reunión.
+// ================================================================
+app.patch('/api/hub/reuniones/:id/grabacion', requireAuth, requirePermiso('hub.reuniones'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { accion } = req.body;   // 'iniciar' | 'finalizar'
+    const { username, rol } = req.usuario;
+ 
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ error: 'ID de reunión inválido' });
+    }
+    if (!['iniciar', 'finalizar'].includes(accion)) {
+      return res.status(400).json({ error: 'accion debe ser "iniciar" o "finalizar"' });
+    }
+ 
+    const reunion = await db.collection('hub_reuniones').findOne({ _id: new ObjectId(id) });
+    if (!reunion) return res.status(404).json({ error: 'Reunión no encontrada' });
+ 
+    // Verificar que el usuario es participante (organizador, invitado o rol privilegiado)
+    const esParticipante =
+      reunion.organizer          === username ||
+      reunion.creadoPor          === username ||
+      (reunion.invitadoUsernames || []).includes(username) ||
+      ['ADMIN', 'GERENTE_OPERACIONES'].includes(rol);
+ 
+    if (!esParticipante) {
+      return res.status(403).json({ error: 'No eres participante de esta reunión' });
+    }
+ 
+    if (accion === 'iniciar') {
+      // ¿Alguien más ya está grabando?
+      if (reunion.grabandoPor && reunion.grabandoPor !== username) {
+        return res.status(409).json({
+          error: `${reunion.grabandoPor} ya está grabando esta reunión. Espera a que finalice.`,
+          grabandoPor: reunion.grabandoPor,
+          grabacionInicio: reunion.grabacionInicio,
+        });
+      }
+ 
+      await db.collection('hub_reuniones').updateOne(
+        { _id: new ObjectId(id) },
+        { $set: { grabandoPor: username, grabacionInicio: new Date(), updatedAt: new Date() } }
+      );
+ 
+      console.log(`[Reuniones] Grabación iniciada: reunión=${id} por ${username}`);
+      return res.json({ success: true, grabandoPor: username, grabacionInicio: new Date() });
+    }
+ 
+    if (accion === 'finalizar') {
+      // Solo quien inició puede finalizar (o ADMIN)
+      if (reunion.grabandoPor && reunion.grabandoPor !== username && rol !== 'ADMIN') {
+        return res.status(403).json({
+          error: `Solo ${reunion.grabandoPor} puede finalizar esta grabación`,
+        });
+      }
+ 
+      await db.collection('hub_reuniones').updateOne(
+        { _id: new ObjectId(id) },
+        { $unset: { grabandoPor: '', grabacionInicio: '' }, $set: { updatedAt: new Date() } }
+      );
+ 
+      console.log(`[Reuniones] Grabación finalizada: reunión=${id} por ${username}`);
+      return res.json({ success: true });
+    }
+ 
+  } catch (e) {
+    console.error('Error mutex grabacion:', e);
+    res.status(500).json({ error: 'Error en mutex de grabación' });
+  }
+});
 // ================================================================
 // REPOSICIONES — CRUD completo v4.4.0
 // Colección: hub_reposiciones
