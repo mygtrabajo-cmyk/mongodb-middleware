@@ -70,6 +70,7 @@ async function initIndexes(db) {
     await idx('nebula_files',    { uploaded_by: 1, created_at: -1 }, { name: 'nebula_files_user_fecha' });
     await idx('nebula_files',    { created_at: 1 }, { expireAfterSeconds: 7 * 24 * 3600, name: 'nebula_files_ttl_7d' });
     await idx('nebula_zones',  { area: 1, name: 1 }, { name: 'nebula_zones_area_name' });
+    await idx('nebula_zones',  { created_at: -1 },   { name: 'nebula_zones_fecha' });
     await idx('nebula_agents', { area: 1, zone: 1 }, { name: 'nebula_agents_area_zone' });
 
     console.log('[Nebula] Índices MongoDB inicializados ✅');
@@ -223,6 +224,186 @@ module.exports = {
                 res.send(fileBuffer);
                 console.log(`[Nebula] Archivo descargado: ${fileDoc.filename} por ${req.agent.machine_id.substring(0,16)}...`);
             } catch (e) { console.error('[Nebula] Error file download:', e); res.status(500).json({ error: 'Error descargando archivo' }); }
+        });
+        // ─────────────────────────────────────────────────────────────
+        // [ZON-1] GET /api/nebula/zones — lista todas las zonas
+        // ─────────────────────────────────────────────────────────────
+        app.get('/api/nebula/zones', requireAuth, async (req, res) => {
+            try {
+                const filter = {};
+                if (req.query.area) filter.area = req.query.area;
+                const zones = await db.collection('nebula_zones')
+                    .find(filter)
+                    .sort({ area: 1, name: 1 })
+                    .toArray();
+                res.json({ zones, total: zones.length });
+            } catch (e) {
+                console.error('[Nebula] Error GET zones:', e);
+                res.status(500).json({ error: 'Error obteniendo zonas' });
+            }
+        });
+         
+        // ─────────────────────────────────────────────────────────────
+        // [ZON-2] POST /api/nebula/zones — crear zona
+        // Requiere ADMIN o COORDINADOR
+        // ─────────────────────────────────────────────────────────────
+        app.post('/api/nebula/zones', requireAuth, async (req, res) => {
+            try {
+                const { name, area, description } = req.body;
+                if (!name?.trim()) return res.status(400).json({ error: 'name requerido' });
+         
+                // Solo roles privilegiados pueden crear zonas
+                const rolesPermitidos = ['ADMIN', 'COORDINADOR', 'GERENTE_OPERACIONES'];
+                if (!rolesPermitidos.includes(req.usuario.rol))
+                    return res.status(403).json({ error: 'Sin permisos para crear zonas' });
+         
+                // Verificar duplicado
+                const existe = await db.collection('nebula_zones').findOne({ name: name.trim(), area });
+                if (existe) return res.status(409).json({ error: `La zona "${name}" ya existe en ${area}` });
+         
+                const doc = {
+                    name:        name.trim(),
+                    area:        area || 'Sistemas',
+                    description: description?.trim() || '',
+                    created_by:  req.usuario.username,
+                    created_at:  new Date(),
+                };
+                const result = await db.collection('nebula_zones').insertOne(doc);
+                console.log(`[Nebula] Zona creada: ${name} (${area}) por ${req.usuario.username}`);
+                res.status(201).json({ success: true, zone: { ...doc, _id: result.insertedId } });
+         
+            } catch (e) {
+                console.error('[Nebula] Error POST zones:', e);
+                res.status(500).json({ error: 'Error creando zona' });
+            }
+        });
+         
+        // ─────────────────────────────────────────────────────────────
+        // [ZON-3] DELETE /api/nebula/zones/:id — eliminar zona
+        // ─────────────────────────────────────────────────────────────
+        app.delete('/api/nebula/zones/:id', requireAuth, async (req, res) => {
+            try {
+                const { id } = req.params;
+                if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'ID inválido' });
+         
+                const rolesPermitidos = ['ADMIN', 'COORDINADOR', 'GERENTE_OPERACIONES'];
+                if (!rolesPermitidos.includes(req.usuario.rol))
+                    return res.status(403).json({ error: 'Sin permisos' });
+         
+                const zone = await db.collection('nebula_zones').findOne({ _id: new ObjectId(id) });
+                if (!zone) return res.status(404).json({ error: 'Zona no encontrada' });
+         
+                // Quitar la zona de todos los agentes que la tenían asignada
+                const updated = await db.collection('nebula_agents').updateMany(
+                    { zone: zone.name },
+                    { $unset: { zone: '' } }
+                );
+         
+                await db.collection('nebula_zones').deleteOne({ _id: new ObjectId(id) });
+                console.log(`[Nebula] Zona eliminada: ${zone.name} (${updated.modifiedCount} agentes actualizados)`);
+                res.json({ success: true, agents_updated: updated.modifiedCount });
+         
+            } catch (e) {
+                console.error('[Nebula] Error DELETE zones:', e);
+                res.status(500).json({ error: 'Error eliminando zona' });
+            }
+        });
+         
+        // ─────────────────────────────────────────────────────────────
+        // [ZON-4] PATCH /api/nebula/agents/:machine_id/zone
+        // Asignar área y zona a un agente desde el dashboard
+        // ─────────────────────────────────────────────────────────────
+        app.patch('/api/nebula/agents/:machine_id/zone', requireAuth, async (req, res) => {
+            try {
+                const { machine_id } = req.params;
+                const { area, zone }  = req.body;
+         
+                const rolesPermitidos = ['ADMIN', 'COORDINADOR', 'GERENTE_OPERACIONES'];
+                if (!rolesPermitidos.includes(req.usuario.rol))
+                    return res.status(403).json({ error: 'Sin permisos para asignar zona' });
+         
+                const AREAS_VALIDAS = ['Sistemas','Mantenimiento','Credito','Logistica','CoordinacionATT','Sin área'];
+                if (area && !AREAS_VALIDAS.includes(area))
+                    return res.status(400).json({ error: `Área inválida: ${area}` });
+         
+                const updates = { updated_at: new Date(), updated_by: req.usuario.username };
+                if (area !== undefined) updates.area = area;
+                if (zone !== undefined) updates.zone = zone?.trim() || null;
+         
+                const result = await db.collection('nebula_agents').updateOne(
+                    { machine_id },
+                    { $set: updates }
+                );
+                if (result.matchedCount === 0)
+                    return res.status(404).json({ error: 'Agente no encontrado' });
+         
+                // Notificar al dashboard vía SSE
+                ssePush('*', 'nebula_agent_zone_updated', { machine_id, area, zone, updated_by: req.usuario.username });
+         
+                console.log(`[Nebula] Zona asignada: ${machine_id.substring(0,16)} → ${area} / ${zone} por ${req.usuario.username}`);
+                res.json({ success: true });
+         
+            } catch (e) {
+                console.error('[Nebula] Error PATCH zone:', e);
+                res.status(500).json({ error: 'Error asignando zona' });
+            }
+        });
+         
+        // ─────────────────────────────────────────────────────────────
+        // [ZON-5] GET /api/nebula/agents/by-zone — agrupar agentes
+        // Retorna agentes agrupados por área + zona para el panel
+        // ─────────────────────────────────────────────────────────────
+        app.get('/api/nebula/agents/by-zone', requireAuth, async (req, res) => {
+            try {
+                const TEN_MIN_AGO = new Date(Date.now() - 10 * 60 * 1000);
+                const agents = await db.collection('nebula_agents')
+                    .find({}, { projection: { _id:1, machine_id:1, hostname:1, ip_address:1,
+                                              os_system:1, agent_version:1, status:1,
+                                              last_seen:1, last_stats:1, active_alerts:1,
+                                              area:1, zone:1, registered_at:1 } })
+                    .sort({ area: 1, zone: 1, hostname: 1 })
+                    .toArray();
+         
+                // Normalizar status
+                const normalized = agents.map(a => ({
+                    ...a,
+                    status: a.last_seen > TEN_MIN_AGO ? 'online' : 'offline',
+                    area:   a.area || 'Sin área',
+                    zone:   a.zone || 'Sin zona',
+                }));
+         
+                // Agrupar
+                const grouped = {};
+                for (const agent of normalized) {
+                    const key = `${agent.area}||${agent.zone}`;
+                    if (!grouped[key]) {
+                        grouped[key] = {
+                            area:    agent.area,
+                            zone:    agent.zone,
+                            agents:  [],
+                            online:  0,
+                            offline: 0,
+                        };
+                    }
+                    grouped[key].agents.push(agent);
+                    agent.status === 'online' ? grouped[key].online++ : grouped[key].offline++;
+                }
+         
+                const groups = Object.values(grouped).sort((a, b) =>
+                    a.area.localeCompare(b.area) || a.zone.localeCompare(b.zone)
+                );
+         
+                res.json({
+                    groups,
+                    total_agents:  normalized.length,
+                    total_online:  normalized.filter(a => a.status === 'online').length,
+                    total_offline: normalized.filter(a => a.status === 'offline').length,
+                });
+         
+            } catch (e) {
+                console.error('[Nebula] Error agents/by-zone:', e);
+                res.status(500).json({ error: 'Error obteniendo agentes por zona' });
+            }
         });
 
         // ═══════════════════════════════════════════════════
