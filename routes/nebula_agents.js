@@ -69,6 +69,8 @@ async function initIndexes(db) {
     // [FILE-1] Índices para archivos deployables
     await idx('nebula_files',    { uploaded_by: 1, created_at: -1 }, { name: 'nebula_files_user_fecha' });
     await idx('nebula_files',    { created_at: 1 }, { expireAfterSeconds: 7 * 24 * 3600, name: 'nebula_files_ttl_7d' });
+    await idx('nebula_zones',  { area: 1, name: 1 }, { name: 'nebula_zones_area_name' });
+    await idx('nebula_agents', { area: 1, zone: 1 }, { name: 'nebula_agents_area_zone' });
 
     console.log('[Nebula] Índices MongoDB inicializados ✅');
 }
