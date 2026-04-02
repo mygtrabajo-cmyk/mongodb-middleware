@@ -2297,20 +2297,28 @@ app.delete('/api/hub/boletines/:id', requireAuth, async (req, res) => {
     }
 });
 // ── 404 / Error handler ────────────────────────────────────────
-app.use('*', (req, res) => res.status(404).json({ error: `Endpoint no encontrado: ${req.originalUrl}` }));
-app.use((err, req, res, next) => { console.error('Error no manejado:', err); res.status(500).json({ error: 'Error interno' }); });
 
 async function start() {
     try {
         await connectDB();
+        app.use('*', (req, res) => res.status(404).json({ error: `Endpoint no encontrado: ${req.originalUrl}` }));
+        app.use((err, req, res, next) => {
+            console.error('Error no manejado:', err);
+            res.status(500).json({ error: 'Error interno' });
+        });
+ 
         app.listen(PORT, () => {
-            console.log(`MYG API v4.4.0 en puerto ${PORT}`);
+            console.log(`MYG API v4.5.0 en puerto ${PORT}`);
             console.log(`IA Minutas: Groq=${!!process.env.GROQ_API_KEY ? '✅' : '❌'} | Gemini=${!!process.env.GEMINI_API_KEY ? '✅' : '❌'} | Local=✅`);
             console.log(`Activos:      GET(limit) POST(insertMany) PATCH(edit) DELETE(permisos) BULK(500max) ✅`);
             console.log(`Reposiciones: GET POST POST-bulk PATCH DELETE → hub_reposiciones ✅`);
             console.log(`Reuniones:    GET con filtro de privacidad por invitadoUsernames ✅`);
+            console.log(`Nebula Agent: /api/nebula/* y /api/agents/* ✅`);
         });
-    } catch (err) { console.error('Error iniciando:', err); process.exit(1); }
+    } catch (err) {
+        console.error('Error iniciando:', err);
+        process.exit(1);
+    }
 }
 
 start();
