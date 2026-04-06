@@ -24,10 +24,12 @@ function requireAgentAuth(req, res, next) {
     if (!header.startsWith('Agent '))
         return res.status(401).json({ error: 'Token de agente no proporcionado' });
 
-    const credentials = header.slice(6);
+    const credentials = header.slice(6); // quita "Agent "
     const sepIdx = credentials.indexOf(':');
     if (sepIdx === -1)
-        return res.status(401).json({ error: 'Formato inválido. Esperado: Agent {machine_id}:{token}' });
+        return res.status(401).json({
+            error: 'Formato inválido. Esperado: Agent {machine_id}:{token}'
+        });
 
     const machine_id = credentials.slice(0, sepIdx);
     const token      = credentials.slice(sepIdx + 1);
@@ -36,13 +38,34 @@ function requireAgentAuth(req, res, next) {
     if (!UUID_RE.test(machine_id))
         return res.status(401).json({ error: 'machine_id con formato inválido' });
 
+    // Calcular token esperado
     const expectedToken = crypto
         .createHmac('sha256', NEBULA_AGENT_SECRET)
         .update(machine_id)
         .digest('hex');
 
-    if (!crypto.timingSafeEqual(Buffer.from(token), Buffer.from(expectedToken))) {
-        console.warn(`[Nebula] Auth fallida: ${machine_id.substring(0, 16)}...`);
+    // [FIX] timingSafeEqual LANZA excepción si los buffers tienen distinta longitud.
+    // Verificar longitud ANTES para evitar crash no capturado → 500 en lugar de 401.
+    let tokenValid = false;
+    try {
+        const bufToken    = Buffer.from(token,         'hex');
+        const bufExpected = Buffer.from(expectedToken, 'hex');
+
+        // Doble check: longitud + valor (timing-safe)
+        tokenValid = bufToken.length === bufExpected.length &&
+                     crypto.timingSafeEqual(bufToken, bufExpected);
+    } catch (e) {
+        // token tiene caracteres no-hex → inválido
+        tokenValid = false;
+    }
+
+    if (!tokenValid) {
+        console.warn(
+            `[Nebula] ❌ Auth fallida: machine_id=${machine_id.substring(0, 16)}... ` +
+            `token_prefix=${token.substring(0, 8)}... ` +
+            `expected_prefix=${expectedToken.substring(0, 8)}... ` +
+            `secret_hint=${NEBULA_AGENT_SECRET.substring(0, 8)}...`
+        );
         return res.status(401).json({ error: 'Token de agente inválido' });
     }
 
