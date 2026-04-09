@@ -144,26 +144,72 @@ module.exports = {
         });
 
         // POST /api/agents/heartbeat
+        // [ZONE-FIX-2] POST /api/agents/heartbeat — devuelve config en la respuesta
         app.post('/api/agents/heartbeat', requireAgentAuth, async (req, res) => {
             try {
                 const { machine_id } = req.agent;
                 const { hostname, stats } = req.body;
                 const now    = new Date();
                 const alerts = detectAlerts(stats);
-                await db.collection('nebula_agents').updateOne(
+         
+                // [ZONE-FIX-2] returnDocument: 'after' para obtener area/zone
+                // que fueron guardados por PATCH /api/nebula/agents/:id/zone.
+                // El documento retornado ya contiene los valores actualizados.
+                const agentResult = await db.collection('nebula_agents').findOneAndUpdate(
                     { machine_id },
-                    { $set: { last_seen: now, status: 'online', last_stats: stats||{}, active_alerts: alerts } },
-                    { upsert: true }
+                    { $set: { last_seen: now, status: 'online', last_stats: stats || {}, active_alerts: alerts } },
+                    { upsert: true, returnDocument: 'after' }
                 );
-                ssePush('*', 'nebula_heartbeat', { machine_id, hostname: hostname||machine_id.substring(0,8), stats, alerts, timestamp: now.toISOString() });
+         
+                // Compatibilidad MongoDB driver v3 (agentResult.value) y v4 (agentResult directo)
+                const agentDoc = agentResult?.value ?? agentResult ?? {};
+         
+                ssePush('*', 'nebula_heartbeat', {
+                    machine_id,
+                    hostname: hostname || machine_id.substring(0, 8),
+                    stats,
+                    alerts,
+                    timestamp: now.toISOString()
+                });
+         
                 if (alerts.length > 0) {
                     for (const alert of alerts) {
-                        await db.collection('notificaciones').insertOne({ titulo: `⚠️ Nebula: ${hostname}`, mensaje: alert.message, tipo: alert.severity, usuario_destino: '*', creadaPor: 'nebula_agent', leida: false, createdAt: now, meta: { machine_id, alert_type: alert.type } });
-                        ssePush('*', 'notificacion', { titulo: `⚠️ Nebula: ${hostname}`, mensaje: alert.message, tipo: alert.severity });
+                        await db.collection('notificaciones').insertOne({
+                            titulo:          `⚠️ Nebula: ${hostname}`,
+                            mensaje:         alert.message,
+                            tipo:            alert.severity,
+                            usuario_destino: '*',
+                            creadaPor:       'nebula_agent',
+                            leida:           false,
+                            createdAt:       now,
+                            meta:            { machine_id, alert_type: alert.type }
+                        });
+                        ssePush('*', 'notificacion', {
+                            titulo:  `⚠️ Nebula: ${hostname}`,
+                            mensaje: alert.message,
+                            tipo:    alert.severity
+                        });
                     }
                 }
-                res.json({ success: true, server_time: now.toISOString(), alerts_detected: alerts.length });
-            } catch (e) { console.error('[Nebula] Error heartbeat:', e); res.status(500).json({ error: 'Error heartbeat' }); }
+         
+                // [ZONE-FIX-2] Incluir config en respuesta.
+                // El agente Python leerá response.config en _heartbeat_loop()
+                // y actualizará su estado local de área/zona en ≤ 30 segundos.
+                res.json({
+                    success:         true,
+                    server_time:     now.toISOString(),
+                    alerts_detected: alerts.length,
+                    config: {
+                        area:     agentDoc.area     || null,
+                        zone:     agentDoc.zone     || null,
+                        settings: agentDoc.settings || {},
+                    },
+                });
+         
+            } catch (e) {
+                console.error('[Nebula] Error heartbeat:', e);
+                res.status(500).json({ error: 'Error heartbeat' });
+            }
         });
 
         // GET /api/nebula/commands/pending/:machine_id
@@ -458,6 +504,58 @@ module.exports = {
             } catch (e) { res.status(500).json({ error: 'Error obteniendo agente' }); }
         });
 
+        // [ZONE-FIX-1] GET /api/nebula/agents/:machine_id/config
+        // Endpoint de fallback: el agente lee su config explícitamente
+        // desde sync_loop cuando el heartbeat no trae config (backend v1.1).
+        // Auth: Agent HMAC — NO requiere Bearer JWT.
+        app.get('/api/nebula/agents/:machine_id/config', requireAgentAuth, async (req, res) => {
+            try {
+                const { machine_id } = req.params;
+         
+                // El agente solo puede consultar su propia config
+                if (machine_id !== req.agent.machine_id) {
+                    return res.status(403).json({
+                        error: 'No puedes consultar la configuración de otro agente'
+                    });
+                }
+         
+                const agent = await db.collection('nebula_agents').findOne(
+                    { machine_id },
+                    {
+                        projection: {
+                            area:     1,
+                            zone:     1,
+                            settings: 1,
+                            hostname: 1,
+                            status:   1,
+                        }
+                    }
+                );
+         
+                if (!agent) {
+                    return res.status(404).json({ error: 'Agente no registrado' });
+                }
+         
+                console.log(
+                    `[Nebula] Config solicitada: ${machine_id.substring(0, 16)}...` +
+                    ` → area=${agent.area || null} zone=${agent.zone || null}`
+                );
+         
+                res.json({
+                    machine_id,
+                    area:      agent.area     || null,
+                    zone:      agent.zone     || null,
+                    settings:  agent.settings || {},
+                    hostname:  agent.hostname || null,
+                    config_ts: new Date().toISOString(),
+                });
+         
+            } catch (e) {
+                console.error('[Nebula] Error GET agent config:', e);
+                res.status(500).json({ error: 'Error obteniendo configuración del agente' });
+            }
+        });
+        
         // POST /api/nebula/commands — enviar comando desde dashboard
         app.post('/api/nebula/commands', requireAuth, async (req, res) => {
             try {
@@ -467,7 +565,7 @@ module.exports = {
                 const agent = await db.collection('nebula_agents').findOne({ machine_id });
                 if (!agent) return res.status(404).json({ error: `Agente '${machine_id}' no encontrado` });
 
-                const HIGH_COMMANDS = new Set(['reset_password','disable_user','enable_bitlocker','install_updates','run_script','reboot','shutdown','deploy_file']);
+                const HIGH_COMMANDS = new Set(['reset_password','disable_user','enable_bitlocker','install_updates','run_script','reboot','shutdown','deploy_file','deploy_zip',]);
                 if (HIGH_COMMANDS.has(command) && (!justification || justification.trim().length < 10))
                     return res.status(400).json({ error: `'${command}' requiere justification de al menos 10 caracteres` });
 
