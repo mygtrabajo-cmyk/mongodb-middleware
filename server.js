@@ -2296,6 +2296,228 @@ app.delete('/api/hub/boletines/:id', requireAuth, async (req, res) => {
         res.status(500).json({ error: 'Error eliminando boletín' });
     }
 });
+
+// GET /api/hc/usuarios
+// Devuelve el HC almacenado en MongoDB.
+// Campos retornados: rows[] + meta (filename, total, uploadedAt, uploadedBy)
+// ──────────────────────────────────────────────────────────────
+app.get('/api/hc/usuarios', async (req, res) => {
+    try {
+        const db   = client.db('iqu_telecom');
+        const meta = await db.collection('hub_hc_meta').findOne({ _type: 'hc_usuarios' });
+        const rows = await db.collection('hub_hc_usuarios').find({}).toArray();
+ 
+        // Limpiar _id de Mongo de cada fila antes de enviar
+        const rowsLimpias = rows.map(({ _id, _type, ...rest }) => rest);
+ 
+        res.json({
+            ok:   true,
+            meta: meta ? {
+                filename:   meta.filename,
+                total:      meta.total,
+                uploadedAt: meta.uploadedAt,
+                uploadedBy: meta.uploadedBy,
+            } : null,
+            rows: rowsLimpias,
+        });
+    } catch (err) {
+        console.error('GET /api/hc/usuarios error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+ 
+// ──────────────────────────────────────────────────────────────
+// POST /api/hc/upload
+// Reemplaza la colección hub_hc_usuarios con las filas enviadas.
+// Solo ADMIN o COORDINADOR pueden usarlo.
+// Body: { rows: [...], filename: "HC_2026.xlsx" }
+// ──────────────────────────────────────────────────────────────
+app.post('/api/hc/upload', async (req, res) => {
+    try {
+        // req.usuario viene del middleware de autenticación JWT
+        const usuario = req.usuario;
+        const rolesPermitidos = ['ADMIN', 'COORDINADOR', 'GERENTE_OPERACIONES'];
+        if (!usuario || !rolesPermitidos.includes(usuario.rol)) {
+            return res.status(403).json({ error: 'Sin permisos para cargar HC' });
+        }
+ 
+        const { rows, filename } = req.body;
+        if (!Array.isArray(rows) || rows.length === 0) {
+            return res.status(400).json({ error: 'rows debe ser un array no vacío' });
+        }
+ 
+        const db = client.db('iqu_telecom');
+ 
+        // Reemplazar colección completa (drop + insertMany en transacción lógica)
+        await db.collection('hub_hc_usuarios').deleteMany({});
+ 
+        // Agregar _type para facilitar filtros futuros
+        const rowsConTipo = rows.map(r => ({ ...r, _type: 'hc_row' }));
+ 
+        // insertMany en lotes de 500 para evitar límite de documento BSON
+        const BATCH_SIZE = 500;
+        for (let i = 0; i < rowsConTipo.length; i += BATCH_SIZE) {
+            await db.collection('hub_hc_usuarios').insertMany(rowsConTipo.slice(i, i + BATCH_SIZE));
+        }
+ 
+        // Guardar metadata
+        const meta = {
+            _type:      'hc_usuarios',
+            filename:   filename || 'desconocido',
+            total:      rows.length,
+            uploadedAt: new Date().toISOString(),
+            uploadedBy: usuario.username || usuario.nombre || 'desconocido',
+        };
+        await db.collection('hub_hc_meta').updateOne(
+            { _type: 'hc_usuarios' },
+            { $set: meta },
+            { upsert: true }
+        );
+ 
+        console.log(`✅ HC Upload: ${rows.length} registros por ${usuario.username}`);
+        res.json({ ok: true, total: rows.length, meta });
+ 
+    } catch (err) {
+        console.error('POST /api/hc/upload error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+ 
+// ──────────────────────────────────────────────────────────────
+// PATCH /api/hc/usuarios/aplicar-movimiento
+// Aplica una baja o cambio RH al HC en tiempo real.
+// Body: { tipo, attuid, nombre, pdv, puesto, motivo }
+//   tipo: 'BAJA' | 'CAMBIO_PDV' | 'CAMBIO_PUESTO' | 'CAMBIO_COMBINADO'
+// ──────────────────────────────────────────────────────────────
+app.patch('/api/hc/usuarios/aplicar-movimiento', async (req, res) => {
+    try {
+        const usuario = req.usuario;
+        const rolesPermitidos = ['ADMIN', 'COORDINADOR', 'GERENTE_OPERACIONES', 'GERENTE_RH', 'ANALISTA_RH'];
+        if (!usuario || !rolesPermitidos.includes(usuario.rol)) {
+            return res.status(403).json({ error: 'Sin permisos para modificar HC' });
+        }
+ 
+        const { tipo, attuid, nombre, pdv, puesto, motivo } = req.body;
+        if (!tipo) return res.status(400).json({ error: 'tipo es requerido' });
+ 
+        const db  = client.db('iqu_telecom');
+        const col = db.collection('hub_hc_usuarios');
+ 
+        // Construir query de búsqueda — ATTUID es el identificador principal
+        const buildQuery = () => {
+            if (attuid && attuid.trim()) {
+                return {
+                    $or: [
+                        { ATTUID:   attuid.trim() },
+                        { attuid:   attuid.trim() },
+                        { 'ATTUID': attuid.trim() },
+                    ]
+                };
+            }
+            // Fallback: buscar por nombre
+            if (nombre) {
+                const nombreNorm = nombre.toUpperCase().trim();
+                return {
+                    $or: [
+                        { NOMBRE: { $regex: nombreNorm, $options: 'i' } },
+                        { 'Nombre Completo': { $regex: nombreNorm, $options: 'i' } },
+                        { nombre: { $regex: nombreNorm, $options: 'i' } },
+                    ]
+                };
+            }
+            return null;
+        };
+ 
+        const query = buildQuery();
+        if (!query) {
+            return res.status(400).json({ error: 'Se requiere attuid o nombre para identificar al colaborador' });
+        }
+ 
+        let updateOp  = {};
+        let historial = {
+            tipo,
+            fecha: new Date().toISOString(),
+            aplicadoPor: usuario.username,
+            ...(pdv    ? { pdv    } : {}),
+            ...(puesto ? { puesto } : {}),
+            ...(motivo ? { motivo } : {}),
+        };
+ 
+        switch (tipo) {
+            case 'BAJA':
+                updateOp = {
+                    $set: {
+                        ESTATUS: 'BAJA',
+                        estatus: 'BAJA',
+                        FECHA_BAJA: new Date().toISOString().slice(0, 10),
+                        MOTIVO_BAJA: motivo || '',
+                        _ultimaActualizacion: new Date().toISOString(),
+                    },
+                    $push: { _historialMovimientos: historial }
+                };
+                break;
+ 
+            case 'CAMBIO_PDV':
+                updateOp = {
+                    $set: {
+                        PDV:    pdv    || '',
+                        'NOMBRE PDV': pdv || '',
+                        _ultimaActualizacion: new Date().toISOString(),
+                    },
+                    $push: { _historialMovimientos: historial }
+                };
+                break;
+ 
+            case 'CAMBIO_PUESTO':
+                updateOp = {
+                    $set: {
+                        PUESTO: puesto || '',
+                        Puesto: puesto || '',
+                        _ultimaActualizacion: new Date().toISOString(),
+                    },
+                    $push: { _historialMovimientos: historial }
+                };
+                break;
+ 
+            case 'CAMBIO_COMBINADO':
+                updateOp = {
+                    $set: {
+                        PDV:    pdv    || '',
+                        'NOMBRE PDV': pdv || '',
+                        PUESTO: puesto || '',
+                        Puesto: puesto || '',
+                        _ultimaActualizacion: new Date().toISOString(),
+                    },
+                    $push: { _historialMovimientos: historial }
+                };
+                break;
+ 
+            default:
+                return res.status(400).json({ error: `Tipo de movimiento no soportado: ${tipo}` });
+        }
+ 
+        const result = await col.updateOne(query, updateOp);
+ 
+        if (result.matchedCount === 0) {
+            // No es error crítico — puede que el HC no esté cargado en DB aún
+            console.warn(`⚠️  HC aplicar-movimiento: ningún registro coincidió. tipo=${tipo} attuid=${attuid} nombre=${nombre}`);
+            return res.json({
+                ok:      false,
+                warning: 'No se encontró el colaborador en el HC de la base de datos. El movimiento RH sí se guardó.',
+                matched: 0,
+                modified: 0,
+            });
+        }
+ 
+        console.log(`✅ HC movimiento aplicado: ${tipo} → ${attuid || nombre} por ${usuario.username}`);
+        res.json({ ok: true, matched: result.matchedCount, modified: result.modifiedCount });
+ 
+    } catch (err) {
+        console.error('PATCH /api/hc/usuarios/aplicar-movimiento error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // ── 404 / Error handler ────────────────────────────────────────
 
 async function start() {
