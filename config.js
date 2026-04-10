@@ -27,7 +27,8 @@ var CONFIG = {
         correosDetallados: '12sZGOsKCpyHpc6poigKdc2KjalpYcWUo',
         ticketsConteo:     '1jxDODo8aVGoy1uhotLS2E4Lq5ogQTA_rlfTZxn1Yo38',
         rhPOC:             '15WKfjBVel38DKRdHO1EtjOqi9EGRTB1cuhCnqAGb1V0',
-        rhHistorico:       '14ei47FFgK5ZRgCHEtZ_eMToKZqZ6XZZtr8U6PGlJsY8'
+        rhHistorico:       '14ei47FFgK5ZRgCHEtZ_eMToKZqZ6XZZtr8U6PGlJsY8',
+        seguimientoAltas:  '1mHZOE8fsoYbZtlWXJJAx3SQBDyVLE9nj3Ng3hRujDwQ'
     },
 
     // ========== API Backend Unificado v4.0 ==========
@@ -55,7 +56,6 @@ var CONFIG = {
             adminSubmissions:   '/api/admin/form-submissions',
             adminRolePerms:     '/api/admin/permissions/roles',
             adminUserPerms:     '/api/admin/permissions/users',
-           
         },
 
         timeout: 30000,
