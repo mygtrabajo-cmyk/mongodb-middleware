@@ -35,6 +35,7 @@ app.use(cors({
         'http://localhost:3000',
         'http://localhost:5500',
         'http://127.0.0.1:5500',
+        'https://mygtelecom.netlify.app',
     ],
     methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
     allowedHeaders: ['Content-Type','Authorization']
