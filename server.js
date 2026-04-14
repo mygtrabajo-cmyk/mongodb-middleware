@@ -20,7 +20,130 @@ const Joi       = require('joi');
 const rateLimit = require('express-rate-limit');
 const morgan    = require('morgan');
 const nebulaRoutes = require('./routes/nebula_agents');
-
+let _nodemailer = null;
+let _smtpTransporter = null;
+function _getTransporter() {
+    if (_smtpTransporter) return _smtpTransporter;
+    try {
+        if (!_nodemailer) _nodemailer = require('nodemailer');
+        const host = process.env.SMTP_HOST;
+        const port = parseInt(process.env.SMTP_PORT || '587', 10);
+        const user = process.env.SMTP_USER;
+        const pass = process.env.SMTP_PASS;
+        if (!host || !user || !pass) {
+            console.warn('[Email] SMTP_HOST/SMTP_USER/SMTP_PASS no configurados — emails desactivados');
+            return null;
+        }
+        _smtpTransporter = _nodemailer.createTransport({
+            host,
+            port,
+            secure: port === 465,
+            auth: { user, pass },
+            tls: { rejectUnauthorized: false },
+        });
+        console.log(`[Email] Transporter SMTP listo → ${host}:${port}`);
+        return _smtpTransporter;
+    } catch (err) {
+        console.error('[Email] No se pudo inicializar Nodemailer:', err.message);
+        return null;
+    }
+}
+ 
+const RH_TIPO_LABELS = {
+    ALTA:             '➕ Alta de Colaborador',
+    ALTA_UDP:         '👪 Alta UDP (Beneficiario)',
+    BAJA:             '➖ Baja de Colaborador',
+    CAMBIO_PDV:       '🏪 Cambio de PDV',
+    CAMBIO_PUESTO:    '📋 Cambio de Puesto',
+    CAMBIO_COMBINADO: '🔀 Cambio Combinado (PDV + Puesto)',
+};
+ 
+async function enviarEmailMovimientoRH(movimiento, destinatario) {
+    if (!destinatario) return;
+    const transporter = _getTransporter();
+    if (!transporter) return;
+ 
+    try {
+        const tipo       = movimiento.tipo || 'MOVIMIENTO';
+        const tipoLabel  = RH_TIPO_LABELS[tipo] || tipo;
+        const empleado   = movimiento.empleado         || {};
+        const dm         = movimiento.datos_movimiento || {};
+        const nombre     = [empleado.nombre, empleado.apellido_paterno, empleado.apellido_materno]
+                             .filter(Boolean).join(' ') || '—';
+        const attuid     = empleado.attuid || empleado.numero_empleado || '—';
+        const puesto     = dm.puesto || empleado.puesto_actual || '—';
+        const pdv        = dm.pdv   || '—';
+        const ahora      = new Date().toLocaleString('es-MX', { timeZone: 'America/Mexico_City' });
+        const id         = movimiento._id ? String(movimiento._id) : '—';
+ 
+        // Filas de detalle extra según tipo
+        const detallesExtra = [];
+        if (tipo === 'BAJA') {
+            if (dm.motivo)     detallesExtra.push(`<tr><td style="padding:4px 12px 4px 0;color:#6B7280;font-size:13px;">Motivo</td><td style="padding:4px;font-size:13px;font-weight:600;">${dm.motivo}</td></tr>`);
+            if (dm.fecha_baja) detallesExtra.push(`<tr><td style="padding:4px 12px 4px 0;color:#6B7280;font-size:13px;">Fecha baja</td><td style="padding:4px;font-size:13px;">${dm.fecha_baja}</td></tr>`);
+        }
+        if (['CAMBIO_PDV','CAMBIO_COMBINADO'].includes(tipo) && pdv !== '—')
+            detallesExtra.push(`<tr><td style="padding:4px 12px 4px 0;color:#6B7280;font-size:13px;">PDV destino</td><td style="padding:4px;font-size:13px;">${pdv}</td></tr>`);
+        if (['CAMBIO_PUESTO','CAMBIO_COMBINADO'].includes(tipo) && puesto !== '—')
+            detallesExtra.push(`<tr><td style="padding:4px 12px 4px 0;color:#6B7280;font-size:13px;">Puesto nuevo</td><td style="padding:4px;font-size:13px;">${puesto}</td></tr>`);
+ 
+        const colores = { ALTA:'#10B981', ALTA_UDP:'#14B8A6', BAJA:'#EF4444', CAMBIO_PDV:'#3B82F6', CAMBIO_PUESTO:'#6366F1', CAMBIO_COMBINADO:'#8B5CF6' };
+        const colorTipo = colores[tipo] || '#3B82F6';
+ 
+        const html = `<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;background:#F3F4F6;font-family:Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#F3F4F6;padding:32px 16px;">
+    <tr><td align="center">
+      <table width="600" cellpadding="0" cellspacing="0" style="background:#FFFFFF;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.10);">
+        <tr><td style="background:linear-gradient(135deg,#3B82F6,#8B5CF6);padding:28px 32px;">
+          <h1 style="margin:0;color:#fff;font-size:22px;font-weight:700;">✅ Movimiento RH Registrado</h1>
+          <p style="margin:6px 0 0;color:#BFDBFE;font-size:14px;">Dashboard MYG Telecom — Sistemas</p>
+        </td></tr>
+        <tr><td style="padding:24px 32px 8px;">
+          <span style="display:inline-block;background:${colorTipo}18;color:${colorTipo};border:1px solid ${colorTipo}40;border-radius:999px;padding:6px 16px;font-size:14px;font-weight:700;">${tipoLabel}</span>
+        </td></tr>
+        <tr><td style="padding:16px 32px 24px;">
+          <p style="margin:0 0 16px;color:#374151;font-size:14px;">Tu solicitud ha sido registrada correctamente. Resumen:</p>
+          <table cellpadding="0" cellspacing="0" style="width:100%;border-top:1px solid #E5E7EB;">
+            <tr><td style="padding:12px 12px 4px 0;color:#6B7280;font-size:13px;">Colaborador</td>
+                <td style="padding:12px 0 4px;font-size:15px;font-weight:700;color:#111827;">${nombre}</td></tr>
+            <tr><td style="padding:4px 12px 4px 0;color:#6B7280;font-size:13px;">ATTUID / N° Empleado</td>
+                <td style="padding:4px;font-size:13px;">${attuid}</td></tr>
+            ${detallesExtra.join('')}
+            <tr><td style="padding:4px 12px 4px 0;color:#6B7280;font-size:13px;">ID Solicitud</td>
+                <td style="padding:4px;font-size:11px;color:#9CA3AF;font-family:monospace;">${id}</td></tr>
+            <tr><td style="padding:4px 12px 4px 0;color:#6B7280;font-size:13px;">Registrado</td>
+                <td style="padding:4px;font-size:13px;">${ahora} (MX)</td></tr>
+            <tr><td style="padding:4px 12px 4px 0;color:#6B7280;font-size:13px;">Estado</td>
+                <td style="padding:4px;"><span style="background:#FEF3C7;color:#92400E;padding:2px 8px;border-radius:4px;font-weight:600;font-size:12px;">PENDIENTE</span></td></tr>
+          </table>
+        </td></tr>
+        <tr><td style="padding:0 32px 24px;">
+          <div style="background:#EFF6FF;border-left:4px solid #3B82F6;border-radius:4px;padding:12px 16px;">
+            <p style="margin:0;color:#1E40AF;font-size:13px;">📌 Sigue el estado de esta solicitud en la pestaña <strong>RH</strong> del Dashboard MYG.</p>
+          </div>
+        </td></tr>
+        <tr><td style="background:#F9FAFB;padding:16px 32px;border-top:1px solid #E5E7EB;">
+          <p style="margin:0;color:#9CA3AF;font-size:12px;text-align:center;">Dashboard MYG Telecom · Correo automático, no responder.</p>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body></html>`;
+ 
+        await transporter.sendMail({
+            from:    `"MYG Dashboard" <${process.env.SMTP_USER}>`,
+            to:      destinatario,
+            subject: `[MYG RH] ${tipoLabel} — ${nombre}`,
+            html,
+        });
+        console.log(`[Email] ✅ Enviado a ${destinatario} — ${tipo} (${nombre})`);
+ 
+    } catch (err) {
+        // Best-effort — no relanzar para no cancelar la operación principal
+        console.error(`[Email] ❌ Error enviando a ${destinatario}:`, err.message);
+    }
+}
 // IA Minutas — SDK opcional (fallback a REST si no están instalados)
 let GoogleGenerativeAI;
 try { ({ GoogleGenerativeAI } = require('@google/generative-ai')); } catch (_) { console.warn('⚠️  @google/generative-ai no instalado — Gemini usará REST'); }
@@ -613,7 +736,34 @@ app.delete('/api/notificaciones', requireAuth, async (req, res) => {
 
 // ── RH ──────────────────────────────────────────────────────────
 app.get('/api/rh/movimientos',              requireAuth, requirePermiso('rh.movimientos.ver'),      async (req, res) => { try { const q={}; if(req.query.tipo) q.tipo=req.query.tipo; res.json(await db.collection('rh_movimientos').find(q).sort({createdAt:-1}).limit(200).toArray()); } catch(e){res.status(500).json({error:'Error RH'})} });
-app.post('/api/rh/movimientos',             requireAuth, requirePermiso('rh.movimientos.crear'),    async (req, res) => { try { const m={...req.body,creadoPor:req.usuario.username,createdAt:new Date(),estado:'pendiente'}; await db.collection('rh_movimientos').insertOne(m); res.status(201).json({success:true,movimiento:m}); } catch(e){res.status(500).json({error:'Error RH'})} });
+app.post('/api/rh/movimientos', requireAuth, requirePermiso('rh.movimientos.crear'), async (req, res) => {
+    try {
+        const m = {
+            ...req.body,
+            creadoPor: req.usuario.username,
+            createdAt: new Date(),
+            estado:    'pendiente',
+        };
+        await db.collection('rh_movimientos').insertOne(m);
+ 
+        // Email best-effort: usa el email del usuario logueado (guardado en JWT)
+        // Si el usuario no tiene email en su perfil el correo simplemente no se envía.
+        const emailDestino = req.usuario.email || '';
+        if (emailDestino) {
+            // No await — no bloquear la respuesta HTTP por el email
+            enviarEmailMovimientoRH(m, emailDestino).catch(err =>
+                console.error('[Email] Error async:', err.message)
+            );
+        } else {
+            console.warn(`[Email] Usuario ${req.usuario.username} no tiene email registrado — correo omitido`);
+        }
+ 
+        res.status(201).json({ success: true, movimiento: m });
+    } catch (e) {
+        console.error('Error POST rh/movimientos:', e);
+        res.status(500).json({ error: 'Error RH' });
+    }
+});
 app.put('/api/rh/movimientos/:id',          requireAuth, requirePermiso('rh.movimientos.gestionar'),async (req, res) => { try { const r=await db.collection('rh_movimientos').updateOne({_id:new ObjectId(req.params.id)},{$set:{...req.body,updatedAt:new Date(),updatedBy:req.usuario.username}}); if(!r.matchedCount) return res.status(404).json({error:'No encontrado'}); res.json({success:true}); } catch(e){res.status(500).json({error:'Error RH'})} });
 app.patch('/api/rh/movimientos/:id/estado', requireAuth, requirePermiso('rh.movimientos.gestionar'), async (req, res) => { try { const {estado,comentario}=req.body; await db.collection('rh_movimientos').updateOne({_id:new ObjectId(req.params.id)},{$set:{estado,comentario,updatedAt:new Date(),updatedBy:req.usuario.username}}); res.json({success:true}); } catch(e){res.status(500).json({error:'Error RH'})} });
 
@@ -2508,6 +2658,7 @@ async function start() {
             console.log(`Reposiciones: GET POST POST-bulk PATCH DELETE → hub_reposiciones ✅`);
             console.log(`Reuniones:    GET con filtro de privacidad por invitadoUsernames ✅`);
             console.log(`Nebula Agent: /api/nebula/* y /api/agents/* ✅`);
+            console.log(`Email SMTP: ${process.env.SMTP_HOST ? '✅ ' + process.env.SMTP_HOST : '❌ no configurado'}`);
         });
     } catch (err) {
         console.error('Error iniciando:', err);
