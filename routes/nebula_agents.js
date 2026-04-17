@@ -591,11 +591,23 @@ module.exports = {
                 const fileResult = await db.collection('nebula_files').insertOne(fileDoc);
                 const file_id  = fileResult.insertedId.toString();
 
+                const { command_type, extract_path, post_script, post_args } = req.body;
+                const isZipDeploy = command_type === 'deploy_zip' || filename.toLowerCase().endsWith('.zip');
+                const cmdName   = isZipDeploy ? 'deploy_zip' : 'deploy_file';
+                const cmdParams = isZipDeploy
+                    ? { file_id, filename, extract_path: extract_path || target_path, post_script: post_script || '', post_args: post_args || '', sha256: sha256_actual, approved: true, justification: justification.trim() }
+                    : { file_id, filename, target_path, sha256: sha256_actual, execute_after: !!execute_after, run_as_admin: !!run_as_admin, script_args: script_args || '', approved: true, justification: justification.trim() };
+ 
                 const cmds = machine_ids.map(machine_id => ({
-                    machine_id, command: 'deploy_file',
-                    parameters: { file_id, filename, target_path, sha256: sha256_actual, execute_after: !!execute_after, run_as_admin: !!run_as_admin, script_args: script_args||'', approved: true, justification: justification.trim() },
-                    status: 'pending', created_by: req.usuario.username, created_by_rol: req.usuario.rol, justification: justification.trim(), created_at: now,
-                    hostname: agents.find(a => a.machine_id === machine_id)?.hostname || machine_id.substring(0,8),
+                    machine_id,
+                    command:        cmdName,
+                    parameters:     cmdParams,
+                    status:         'pending',
+                    created_by:     req.usuario.username,
+                    created_by_rol: req.usuario.rol,
+                    justification:  justification.trim(),
+                    created_at:     now,
+                    hostname:       agents.find(a => a.machine_id === machine_id)?.hostname || machine_id.substring(0, 8),
                 }));
 
                 const insertResult = await db.collection('nebula_commands').insertMany(cmds);
@@ -608,7 +620,7 @@ module.exports = {
                     });
                 }
 
-                console.log(`[Nebula] Deploy: ${filename} (${fileMB.toFixed(2)}MB) → ${machine_ids.length} equipo(s) por ${req.usuario.username}`);
+                console.log(`[Nebula] ${cmdName}: ${filename} (${fileMB.toFixed(2)}MB) → ${machine_ids.length} equipo(s) por ${req.usuario.username}${isZipDeploy ? ' [ZIP → ' + (extract_path || target_path) + ']' : ''}`);
                 res.status(201).json({
                     success: true, file_id, filename,
                     size_mb: parseFloat(fileMB.toFixed(2)), sha256: sha256_actual,
