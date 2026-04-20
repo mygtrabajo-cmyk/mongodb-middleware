@@ -399,7 +399,7 @@ function requireAuth(req, res, next) {
         if (!header?.startsWith('Bearer '))
             return res.status(401).json({ error: 'Token no proporcionado' });
         const token = header.slice(7);
-        const payload = jwt.verify(token, process.env.JWT_SECRET);
+        const payload = jwt.verify(token, JWT_SECRET);
         payload.rol = normalizarRol(payload.rol);
         req.usuario = payload;
         next();
@@ -424,7 +424,7 @@ function requireAuthSSE(req, res, next) {
         if (!token) {
             return res.status(401).json({ error: 'Token no proporcionado' });
         }
-        const payload = jwt.verify(token, process.env.JWT_SECRET);
+        const payload = jwt.verify(token, JWT_SECRET);
         payload.rol = normalizarRol(payload.rol);
         req.usuario = payload;
         next();
@@ -486,7 +486,7 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
             rol: rolNormalizado, area: usuarioDoc.area||null, rolSecundario: usuarioDoc.rolSecundario||null,
             permisos, preferencias: usuarioDoc.preferencias||{},
         };
-        const token = jwt.sign(tokenPayload, process.env.JWT_SECRET, { expiresIn: '8h' });
+        const token = jwt.sign(tokenPayload, JWT_SECRET, { expiresIn: '8h' });
         await db.collection('users').updateOne({ username: usuarioDoc.username }, { $set: { ultimoLogin: new Date(), rol: rolNormalizado } });
         await logAccess(usuarioDoc.username,'LOGIN_SUCCESS',{ip:req.ip,rol:rolNormalizado});
         res.json({ success: true, token, user: { ...tokenPayload } });
