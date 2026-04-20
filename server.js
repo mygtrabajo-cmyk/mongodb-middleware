@@ -164,7 +164,59 @@ async function enviarEmailMovimientoRH(movimiento, destinatario) {
 let GoogleGenerativeAI;
 try { ({ GoogleGenerativeAI } = require('@google/generative-ai')); } catch (_) { console.warn('⚠️  @google/generative-ai no instalado — Gemini usará REST'); }
 
-const app = express();
+const helmet = require('helmet');
+
+/**
+ * Configuración de helmet adaptada al stack:
+ *   - React JSX sin bundler (inline scripts necesarios)
+ *   - Google Fonts / CDN externos posibles
+ *   - SSE endpoint (/api/sse) requiere no-buffering
+ *   - HSTS solo en producción (no romper localhost)
+ */
+app.use(
+  helmet({
+    // Content-Security-Policy
+    // IMPORTANTE: 'unsafe-inline' es temporal.
+    // Migrar a nonces cuando se adopte bundler (FEAT futuro).
+    // -----------------------------------------------------------
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc:     ["'self'"],
+        scriptSrc:      ["'self'", "'unsafe-inline'", "'unsafe-eval'"],
+        // ↑ unsafe-eval necesario si algún componente usa new Function() o eval()
+        // Remover unsafe-eval cuando se confirme que no se usa
+        styleSrc:       ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+        fontSrc:        ["'self'", "https://fonts.gstatic.com"],
+        imgSrc:         ["'self'", "data:", "blob:", "https:"],
+        // ↑ data: para base64 (hub-coordinacion-att), blob: para meeting-recorder
+        connectSrc:     ["'self'", process.env.CLOUDFLARE_WORKER_URL || ""],
+        // ↑ Agregar dominio del Cloudflare Worker en .env como CLOUDFLARE_WORKER_URL
+        frameSrc:       ["'none'"],
+        objectSrc:      ["'none'"],
+        upgradeInsecureRequests: process.env.NODE_ENV === 'production' ? [] : null,
+      },
+      // Modo report-only en staging para detectar violaciones sin bloquear.
+      // Cambiar a false en producción después de validar 24 h.
+      reportOnly: process.env.CSP_REPORT_ONLY === 'true',
+    },
+
+    // HSTS — Solo producción. Evita cachear HTTPS en localhost.
+    // maxAge: 1 año (31536000 s) es el estándar recomendado.
+    // -----------------------------------------------------------
+    strictTransportSecurity: process.env.NODE_ENV === 'production'
+      ? { maxAge: 31536000, includeSubDomains: true }
+      : false,
+
+    // crossOriginEmbedderPolicy: puede romper recursos de terceros
+    // (Google Maps, iframes, CDNs). Desactivar si hay embeds.
+    // -----------------------------------------------------------
+    crossOriginEmbedderPolicy: false,
+
+    // Ocultar "X-Powered-By: Express" — siempre activado.
+    // -----------------------------------------------------------
+    hidePoweredBy: true,
+  })
+);
 
 app.use(cors({
     origin: [
