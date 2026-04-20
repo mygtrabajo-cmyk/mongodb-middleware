@@ -1,8 +1,6 @@
 /**
  * env-validator.test.js
  * ─────────────────────────────────────────────────────────────────
- * Jest — [SEC-001] Validación de variables de entorno
- * Ejecutar: npx jest env-validator.test.js
  *
  * Cobertura:
  *  ✅ Happy path (todas las vars presentes y válidas)
