@@ -172,7 +172,6 @@ let GoogleGenerativeAI;
 try { ({ GoogleGenerativeAI } = require('@google/generative-ai')); } catch (_) { console.warn('⚠️  @google/generative-ai no instalado — Gemini usará REST'); }
 
 const app  = express();
-const PORT = process.env.PORT || 5500;
 
 app.use(cors({
     origin: [
@@ -194,7 +193,7 @@ const apiLimiter   = rateLimit({ windowMs: 1*60*1000,  max: 200, message: { erro
 app.use('/api/', apiLimiter);
 
 let db;
-const MONGO_URI = process.env.MONGODB_URI || 'mongodb+srv://...';
+const MONGO_URI = MONGODB_URI;
 const DB_NAME   = 'iqu_telecom';
 
 async function connectDB() {
