@@ -166,13 +166,6 @@ try { ({ GoogleGenerativeAI } = require('@google/generative-ai')); } catch (_) {
 
 const helmet = require('helmet');
 
-/**
- * Configuración de helmet adaptada al stack:
- *   - React JSX sin bundler (inline scripts necesarios)
- *   - Google Fonts / CDN externos posibles
- *   - SSE endpoint (/api/sse) requiere no-buffering
- *   - HSTS solo en producción (no romper localhost)
- */
 app.use(
   helmet({
     // Content-Security-Policy
@@ -230,7 +223,7 @@ app.use(cors({
     methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
     allowedHeaders: ['Content-Type','Authorization']
 }));
-app.use(express.json({ limit: '10mb' }));
+app.use(helmet.json({ limit: '10mb' }));
 app.use(morgan('combined'));
 
 const loginLimiter = rateLimit({ windowMs: 15*60*1000, max: 10, message: { error: 'Demasiados intentos. Espera 15 minutos.' } });
