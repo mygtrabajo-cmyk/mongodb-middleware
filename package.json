@@ -1,6 +1,6 @@
 {
   "name": "myg-servidor-unificado",
-  "version": "3.6.1",
+  "version": "4.5.0",
   "description": "Servidor unificado MYG Telecom con Google Drive",
   "main": "server.js",
   "scripts": {
