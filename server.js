@@ -10,6 +10,29 @@
 // ============================================================
 
 require('dotenv').config();
+const { validateEnv, getRequired, getOptional } = require('./env-validator');
+// Ejecutar validación fail-fast. Si falta alguna var crítica, process.exit(1)
+// Render capturará el log y marcará el deploy como fallido (comportamiento deseado)
+validateEnv();
+
+// ─── DESPUÉS de validateEnv(), usar getRequired() en lugar de process.env.X || 'fallback' ──
+
+// ❌ ANTES (peligroso):
+// const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
+// const NEBULA_SECRET = process.env.NEBULA_AGENT_SECRET || 'fallback-inseguro-hardcodeado';
+
+// ✅ DESPUÉS (seguro):
+const JWT_SECRET = getRequired('JWT_SECRET');
+const NEBULA_AGENT_SECRET = getRequired('NEBULA_AGENT_SECRET');
+const MONGODB_URI = getRequired('MONGODB_URI');
+
+// Opcionales con defaults explícitos y documentados
+const PORT = parseInt(getOptional('PORT', '3000'), 10);
+const NODE_ENV = getOptional('NODE_ENV', 'production');
+const FRONTEND_URL = getOptional('FRONTEND_URL', '*');
+const GROQ_API_KEY = getOptional('GROQ_API_KEY', '');          // minuta IA degradada si vacío
+const GEMINI_API_KEY = getOptional('GEMINI_API_KEY', '');       // fallback IA opcional
+const GOOGLE_SHEETS_KEY = getOptional('GOOGLE_SHEETS_KEY', ''); // sheets degradado si vacío
 
 const express   = require('express');
 const cors      = require('cors');
