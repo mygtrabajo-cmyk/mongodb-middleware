@@ -1008,6 +1008,7 @@ app.post('/api/chat', requireAuth, requirePermiso('chatbot.usar'), async (req, r
 const COLECCIONES_CON_AREA = new Set([
     'hub_tareas','hub_minutas','hub_anuncios','hub_recursos','hub_guias','hub_plantillas',
 ]);
+const ROLES_GESTORES_HUB = new Set(['ADMIN', 'GERENTE_OPERACIONES', 'COORDINADOR']);
 
 function hubGet(col, perm) {
     return [requireAuth, requirePermiso(perm), async (req, res) => {
@@ -1049,22 +1050,85 @@ function hubPost(col, perm) {
 function hubPatch(col, perm) {
     return [requireAuth, requirePermiso(perm), async (req, res) => {
         try {
-            const result = await db.collection(col).updateOne(
-                { _id: new ObjectId(req.params.id) },
-                { $set: { ...req.body, updatedAt: new Date(), updatedBy: req.usuario.username } }
+            const { id } = req.params;
+
+            // [SEC-003-A] Validar ObjectId antes de cualquier query
+            if (!ObjectId.isValid(id))
+                return res.status(400).json({ error: `ID inválido: "${id}"` });
+
+            // [SEC-003-B] Leer solo los campos de control para ownership check
+            //   projection mínimo → no trae datos innecesarios al app server
+            const doc = await db.collection(col).findOne(
+                { _id: new ObjectId(id) },
+                { projection: { creadoPor: 1 } }
             );
-            if (!result.matchedCount) return res.status(404).json({ error: 'No encontrado' });
+            if (!doc)
+                return res.status(404).json({ error: 'Registro no encontrado' });
+
+            // [SEC-003-C] Ownership: ANALISTA/USUARIO solo editan los suyos
+            if (!ROLES_GESTORES_HUB.has(req.usuario.rol) &&
+                doc.creadoPor !== req.usuario.username) {
+                return res.status(403).json({
+                    error: 'No tienes permiso para editar registros de otros usuarios.'
+                });
+            }
+
+            // [SEC-003-D] Campos protegidos — nunca sobreescribir con datos del cliente
+            const updates = { ...req.body };
+            delete updates._id;
+            delete updates.creadoPor;
+            delete updates.createdAt;
+
+            if (Object.keys(updates).length === 0)
+                return res.status(400).json({ error: 'No se enviaron campos a actualizar' });
+
+            await db.collection(col).updateOne(
+                { _id: new ObjectId(id) },
+                { $set: { ...updates, updatedAt: new Date(), updatedBy: req.usuario.username } }
+            );
+
             res.json({ success: true });
-        } catch (e) { res.status(500).json({ error: `Error ${col}` }); }
+
+        } catch (e) {
+            console.error(`[hubPatch] ${col} — ${e.message}`);
+            res.status(500).json({ error: `Error actualizando en ${col}` });
+        }
     }];
 }
 
 function hubDelete(col, perm) {
     return [requireAuth, requirePermiso(perm), async (req, res) => {
         try {
-            await db.collection(col).deleteOne({ _id: new ObjectId(req.params.id) });
+            const { id } = req.params;
+
+            // [SEC-003-A] Validar ObjectId
+            if (!ObjectId.isValid(id))
+                return res.status(400).json({ error: `ID inválido: "${id}"` });
+
+            // [SEC-003-B] Fetch del doc — necesario para ownership check y 404 real
+            const doc = await db.collection(col).findOne(
+                { _id: new ObjectId(id) },
+                { projection: { creadoPor: 1 } }
+            );
+            if (!doc)
+                return res.status(404).json({ error: 'Registro no encontrado' });
+
+            // [SEC-003-C] Ownership check
+            if (!ROLES_GESTORES_HUB.has(req.usuario.rol) &&
+                doc.creadoPor !== req.usuario.username) {
+                return res.status(403).json({
+                    error: 'No tienes permiso para eliminar registros de otros usuarios.'
+                });
+            }
+
+            await db.collection(col).deleteOne({ _id: new ObjectId(id) });
+            console.log(`[${col}] Eliminado: ${id} por ${req.usuario.username}`);
             res.json({ success: true });
-        } catch (e) { res.status(500).json({ error: `Error ${col}` }); }
+
+        } catch (e) {
+            console.error(`[hubDelete] ${col} — ${e.message}`);
+            res.status(500).json({ error: `Error eliminando en ${col}` });
+        }
     }];
 }
 
