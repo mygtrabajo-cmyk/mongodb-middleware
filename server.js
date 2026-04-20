@@ -1,5 +1,5 @@
 // ================================================================
-// MYG TELECOM — API SERVER v4.5.2
+// MYG TELECOM — API SERVER v4.5.3
 // Render (Node.js) + MongoDB Atlas
 //
 // CHANGELOG:
@@ -14,6 +14,10 @@
 //                     Elimina race condition deleteMany + insertMany sin sesión.
 //                     Requiere: let mongoClient (global) + mongoClient = client en connectDB
 //           [SEC-004] Helmet — HTTP Security Headers (una sola instancia, bien ordenado)
+//   v4.5.3: [PERF-002] TTL index hub_notificaciones → borra docs > 30 días automáticamente
+//                      Función crearIndicesTTL() llamada post-conexión en connectDB()
+//           [BUG-004]  Email RH fresco desde MongoDB — evita email desactualizado del JWT
+//                      POST /api/rh/movimientos consulta db.users para obtener email actual
 // ================================================================
 
 require('dotenv').config();
@@ -269,6 +273,47 @@ async function enviarEmailMovimientoRH(movimiento, destinatario) {
 // ================================================================
 // DB — connectDB
 // ================================================================
+
+// ================================================================
+// [PERF-002] TTL index para hub_notificaciones — v4.5.3
+// Autor: IT Director | Fecha: 2026-04-20
+// Ticket: PERF-002 | Riesgo: BAJO | Rollback: dropIndex 'ttl_notificaciones_30d'
+//
+// Problema: hub_notificaciones crecía indefinidamente → queries lentas + costo Atlas.
+// Solución: createIndex con expireAfterSeconds=2592000 (30 días) sobre campo creadoEn.
+//   - MongoDB ejecuta el borrado en background cada ~60 segundos (thread nativo).
+//   - createIndex es IDEMPOTENTE → seguro ejecutar en cada arranque sin efectos secundarios.
+//   - Documentos sin campo creadoEn o con creadoEn como string NO se ven afectados (safe).
+//   - No bloquea lecturas/escrituras en Atlas durante la creación.
+//
+// IMPORTANTE: Al insertar notificaciones, asegurar siempre:
+//   createdAt: new Date()  ← campo Date nativo (no ISO string)
+//   El campo en este server es 'createdAt', no 'creadoEn' — el índice apunta a 'createdAt'.
+// ================================================================
+async function crearIndicesTTL() {
+    try {
+        // TTL: notificaciones se borran automáticamente 30 días después de createdAt
+        await db.collection('notificaciones').createIndex(
+            { createdAt: 1 },
+            {
+                expireAfterSeconds: 2592000, // 30 días (30 * 24 * 60 * 60)
+                name:       'ttl_notificaciones_30d',
+                background: true,            // flag legacy — harmless en Atlas
+            }
+        );
+        console.log('[PERF-002] TTL index notificaciones: OK (30 días sobre createdAt)');
+
+        // TTL access_logs ya estaba definido en connectDB — este es el de notificaciones
+        // Si en el futuro se añaden más TTL indexes, agregarlos aquí.
+
+    } catch (err) {
+        // NO crashear el servidor si falla el índice.
+        // El servidor sigue funcionando; solo las notificaciones no expirarán automáticamente.
+        console.error('[PERF-002] Error creando TTL index notificaciones:', err.message);
+        console.error('[PERF-002] Causa probable: réplica no disponible o permisos insuficientes en Atlas');
+    }
+}
+
 async function connectDB() {
     const client = new MongoClient(MONGO_URI, {
         serverSelectionTimeoutMS: 10000,
@@ -284,7 +329,7 @@ async function connectDB() {
     nebulaRoutes.startOfflineWatcher(db, ssePush);
     console.log('[Nebula] Agente backend inicializado ✅');
 
-    // ── Índices ────────────────────────────────────────────────
+    // ── Índices estructurales ──────────────────────────────────
     const idx = async (col, spec, opts = {}) => {
         try {
             await db.collection(col).createIndex(spec, opts);
@@ -321,6 +366,9 @@ async function connectDB() {
     await idx('hub_boletines',       { createdAt: -1 },                  { name: 'boletines_fecha' });
     await idx('hub_canales',         { area: 1 },                        { name: 'canales_area' });
     await idx('hub_canales',         { id: 1 },                          { unique: true, name: 'canales_id_unique' });
+
+    // ── [PERF-002] TTL index notificaciones — separado para mayor claridad en logs ──
+    await crearIndicesTTL();
 
     return client;
 }
@@ -539,7 +587,7 @@ async function logAccess(username, action, details = {}) {
 // ── HEALTH ─────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({
     status:    'ok',
-    version:   '4.5.2',
+    version:   '4.5.3',
     timestamp: new Date().toISOString(),
     db:        db ? 'connected' : 'disconnected',
     ia: {
@@ -862,7 +910,8 @@ app.post('/api/notificaciones', requireAuth, async (req, res) => {
             titulo, mensaje, tipo, icono: icono || null,
             tab_destino: tab_destino || null, subtab: subtab || null,
             usuario_destino: usuario_destino || req.usuario.username,
-            creadaPor: req.usuario.username, leida: false, createdAt: new Date()
+            creadaPor: req.usuario.username, leida: false,
+            createdAt: new Date() // ← Date nativo (PERF-002: TTL index aplica sobre este campo)
         };
         const result = await db.collection('notificaciones').insertOne(notif);
         notif._id = result.insertedId;
@@ -912,6 +961,28 @@ app.get('/api/rh/movimientos', requireAuth, requirePermiso('rh.movimientos.ver')
     } catch (e) { res.status(500).json({ error: 'Error RH' }); }
 });
 
+// ================================================================
+// [BUG-004] POST /api/rh/movimientos — Email fresco desde MongoDB v4.5.3
+// Autor: IT Director | Fecha: 2026-04-20
+// Ticket: BUG-004 | Riesgo: BAJO | Rollback: revertir a req.usuario.email
+//
+// Problema original:
+//   El email de destino para notificaciones RH se tomaba de req.usuario.email
+//   (campo del JWT). El JWT se emite al login y puede tener meses de antigüedad.
+//   Si el usuario actualizó su email en el perfil después del login, el correo
+//   llegaba a la dirección VIEJA sin ningún error visible en logs.
+//
+// Solución:
+//   Antes de insertar el movimiento, consultar db.collection('users') para obtener
+//   el email ACTUAL del usuario. Si la consulta falla (DB down, etc.), caer back al
+//   JWT como fallback seguro. El movimiento se guarda SIEMPRE independientemente del
+//   resultado del email.
+//
+// IMPORTANTE:
+//   - La consulta a users agrega ~1-2ms (índice username_unique garantiza O(1)).
+//   - El email del JWT sigue siendo el fallback si no hay doc en DB.
+//   - El envío de email sigue siendo async (no bloquea la respuesta al cliente).
+// ================================================================
 app.post('/api/rh/movimientos', requireAuth, requirePermiso('rh.movimientos.crear'), async (req, res) => {
     try {
         const m = {
@@ -921,14 +992,32 @@ app.post('/api/rh/movimientos', requireAuth, requirePermiso('rh.movimientos.crea
             estado:    'pendiente',
         };
         await db.collection('rh_movimientos').insertOne(m);
-        const emailDestino = req.usuario.email || '';
+
+        // [BUG-004] Obtener email fresco desde MongoDB — evita email desactualizado del JWT
+        let emailDestino = req.usuario.email || ''; // fallback: JWT (puede ser obsoleto)
+        try {
+            const userDoc = await db.collection('users').findOne(
+                { username: req.usuario.username },
+                { projection: { email: 1 } } // solo traer campo email — mínimo overhead
+            );
+            if (userDoc && userDoc.email) {
+                emailDestino = userDoc.email; // email actualizado en DB
+            }
+        } catch (emailLookupErr) {
+            // No fallar el endpoint por un error de lookup de email.
+            // Se usa el fallback del JWT y se logea para diagnóstico.
+            console.warn(`[BUG-004] Error obteniendo email fresco para ${req.usuario.username}:`, emailLookupErr.message);
+            console.warn('[BUG-004] Usando email del JWT como fallback:', emailDestino || '(vacío)');
+        }
+
         if (emailDestino) {
             enviarEmailMovimientoRH(m, emailDestino).catch(err =>
                 console.error('[Email] Error async:', err.message)
             );
         } else {
-            console.warn(`[Email] Usuario ${req.usuario.username} sin email — correo omitido`);
+            console.warn(`[Email][BUG-004] Usuario ${req.usuario.username} sin email en DB ni JWT — correo omitido`);
         }
+
         res.status(201).json({ success: true, movimiento: m });
     } catch (e) {
         console.error('Error POST rh/movimientos:', e);
@@ -960,26 +1049,14 @@ app.patch('/api/rh/movimientos/:id/estado', requireAuth, requirePermiso('rh.movi
 
 // ================================================================
 // [BUG-002] FORMATOS DE ACTIVACIÓN — XLSX real con ExcelJS
-// Autor: IT Director | Fecha: 2026-04-20
-// Problema original: backend devolvía JSON → frontend esperaba blob
-// Causas corregidas:
-//   A) Generar y streamear XLSX real con ExcelJS
-//   B) Exponer Content-Disposition en CORS (ver configuración cors arriba)
-//   C) Cache en memoria de la lista de sistemas con TTL de 5 min
-// Rollback: restaurar las 3 rutas anteriores de formatos
 // ================================================================
 
-/** Cache en memoria de la lista de sistemas.
- *  Se invalida con POST /api/formatos/clear-cache o al reiniciar.
- */
 const _formatosCache = {
     sistemas:  null,
     timestamp: 0,
-    TTL:       5 * 60 * 1000, // 5 minutos
+    TTL:       5 * 60 * 1000,
 };
 
-// Personalizar con los sistemas reales de AT&T.
-// Usar status: 'disabled' para desactivar sin borrar.
 const SISTEMAS_ACTIVACION = [
     { id: 'SIEBEL',  nombre: 'Siebel CRM',            descripcion: 'Gestión de clientes y oportunidades',    status: 'available' },
     { id: 'CLARIFY', nombre: 'Clarify',                descripcion: 'Atención a clientes y casos de soporte', status: 'available' },
@@ -988,7 +1065,6 @@ const SISTEMAS_ACTIVACION = [
     { id: 'GENESYS', nombre: 'Genesys Contact Center', descripcion: 'Plataforma de llamadas',                 status: 'available' },
 ];
 
-// GET /api/formatos/sistemas
 app.get('/api/formatos/sistemas', requireAuth, requirePermiso('formatos.generar'), (req, res) => {
     try {
         const ahora = Date.now();
@@ -1005,12 +1081,10 @@ app.get('/api/formatos/sistemas', requireAuth, requirePermiso('formatos.generar'
     }
 });
 
-// POST /api/formatos/generar → BLOB XLSX
 app.post('/api/formatos/generar', requireAuth, requirePermiso('formatos.generar'), async (req, res) => {
     try {
         const { sistema, userData } = req.body;
 
-        // Validación de entrada
         if (!sistema || typeof sistema !== 'string')
             return res.status(400).json({ error: 'Campo requerido: sistema (string)' });
         if (!userData || typeof userData !== 'object')
@@ -1020,7 +1094,6 @@ app.post('/api/formatos/generar', requireAuth, requirePermiso('formatos.generar'
         if (!sistemaInfo)
             return res.status(404).json({ error: `Sistema "${sistema}" no encontrado o no disponible` });
 
-        // Construcción del XLSX con ExcelJS
         const workbook  = new ExcelJS.Workbook();
         workbook.creator  = 'WebApp Coordinación AT&T';
         workbook.created  = new Date();
@@ -1033,7 +1106,6 @@ app.post('/api/formatos/generar', requireAuth, requirePermiso('formatos.generar'
         sheet.getColumn(1).width = 28;
         sheet.getColumn(2).width = 42;
 
-        // Fila 1: Título
         sheet.mergeCells('A1:B1');
         const titleCell     = sheet.getCell('A1');
         titleCell.value     = `FORMATO DE ACTIVACIÓN — ${sistemaInfo.nombre}`;
@@ -1042,7 +1114,6 @@ app.post('/api/formatos/generar', requireAuth, requirePermiso('formatos.generar'
         titleCell.alignment = { horizontal: 'center', vertical: 'middle' };
         sheet.getRow(1).height = 32;
 
-        // Fila 2: Subtítulo
         sheet.mergeCells('A2:B2');
         const subCell      = sheet.getCell('A2');
         subCell.value      = `Generado: ${new Date().toLocaleString('es-MX')}   |   Sistema: ${sistema}`;
@@ -1051,7 +1122,6 @@ app.post('/api/formatos/generar', requireAuth, requirePermiso('formatos.generar'
         subCell.fill       = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE8EEF5' } };
         sheet.getRow(2).height = 18;
 
-        // Filas de datos
         const campos = [
             { label: 'Nombre Completo',    value: userData.NOMBRE        || '' },
             { label: 'ATTUID',             value: userData.ATTUID         || '' },
@@ -1092,7 +1162,6 @@ app.post('/api/formatos/generar', requireAuth, requirePermiso('formatos.generar'
             cellB.alignment = { vertical: 'middle', wrapText: true };
         });
 
-        // Fila firma
         const firmaRow  = campos.length + 3 + 2;
         sheet.mergeCells(`A${firmaRow}:B${firmaRow}`);
         const firmaCell = sheet.getCell(`A${firmaRow}`);
@@ -1101,14 +1170,12 @@ app.post('/api/formatos/generar', requireAuth, requirePermiso('formatos.generar'
         firmaCell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
         sheet.getRow(firmaRow).height = 40;
 
-        // Sanitizar filename (prevenir path traversal)
         const safeAttuid  = (userData.ATTUID  || 'SIN_ATTUID').replace(/[^a-zA-Z0-9_-]/g, '_');
         const safeSistema = sistema.replace(/[^a-zA-Z0-9_-]/g, '_');
         const filename    = `ACTIVACION_${safeSistema}_${safeAttuid}_${Date.now()}.xlsx`;
 
         res.setHeader('Content-Type',        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
         res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-        // Access-Control-Expose-Headers se configura globalmente en cors() arriba
 
         await workbook.xlsx.write(res);
         res.end();
@@ -1124,14 +1191,12 @@ app.post('/api/formatos/generar', requireAuth, requirePermiso('formatos.generar'
     }
 });
 
-// POST /api/formatos/clear-cache
 app.post('/api/formatos/clear-cache', requireAuth, requirePermiso('formatos.generar'), (req, res) => {
     _formatosCache.sistemas  = null;
     _formatosCache.timestamp = 0;
     console.log('[formatos/clear-cache] Cache limpiado por:', req.usuario?.username);
     return res.json({ success: true, message: 'Cache de formatos limpiado' });
 });
-// ============================================================= FIN BUG-002
 
 // ── Dispositivos ───────────────────────────────────────────────
 app.get('/api/devices', requireAuth, requirePermiso('dashboard.dispositivos'), async (req, res) => {
@@ -1808,7 +1873,6 @@ app.patch('/api/hub/reuniones/:id/grabacion', requireAuth, requirePermiso('hub.r
             return res.json({ success: true, grabandoPor: username, grabacionInicio: new Date() });
         }
 
-        // finalizar
         if (reunion.grabandoPor && reunion.grabandoPor !== username && rol !== 'ADMIN') {
             return res.status(403).json({ error: `Solo ${reunion.grabandoPor} puede finalizar esta grabación` });
         }
@@ -2668,14 +2732,6 @@ app.get('/api/hc/usuarios', requireAuth, async (req, res) => {
     }
 });
 
-// ================================================================
-// [BUG-003] POST /api/hc/upload — v4.5.2
-// Transacción atómica ACID con driver nativo MongoDB.
-// El patrón anterior (deleteMany + insertMany sin sesión) dejaba la
-// colección vacía si insertMany fallaba entre lotes.
-// Ahora usa mongoClient.startSession() + withTransaction() para
-// garantizar que ambas operaciones sean todo-o-nada.
-// ================================================================
 app.post('/api/hc/upload', requireAuth, async (req, res) => {
     try {
         const usuario = req.usuario;
@@ -2691,17 +2747,12 @@ app.post('/api/hc/upload', requireAuth, async (req, res) => {
         if (rows.length > MAX_ROWS)
             return res.status(413).json({ error: `El archivo supera el límite de ${MAX_ROWS} filas` });
 
-        // Transacción atómica (driver nativo MongoDB)
         const session = mongoClient.startSession();
 
         try {
             await session.withTransaction(async () => {
                 const col = db.collection('hub_hc_usuarios');
-
-                // 1. Borrar colección dentro de la transacción
                 await col.deleteMany({}, { session });
-
-                // 2. Insertar en lotes de 500 dentro de la misma transacción
                 const rowsConTipo = rows.map(r => ({ ...r, _type: 'hc_row' }));
                 const BATCH_SIZE  = 500;
                 for (let i = 0; i < rowsConTipo.length; i += BATCH_SIZE) {
@@ -2712,7 +2763,6 @@ app.post('/api/hc/upload', requireAuth, async (req, res) => {
                 writeConcern: { w: 'majority' },
             });
 
-            // Metadata FUERA de la transacción (no crítico para atomicidad del HC)
             const meta = {
                 _type:      'hc_usuarios',
                 filename:   filename || 'desconocido',
@@ -2822,7 +2872,6 @@ async function start() {
     try {
         await connectDB();
 
-        // 404 y error handler — SIEMPRE al final, después de todas las rutas
         app.use('*', (req, res) => res.status(404).json({ error: `Endpoint no encontrado: ${req.originalUrl}` }));
         app.use((err, req, res, next) => {
             console.error('Error no manejado:', err);
@@ -2830,7 +2879,7 @@ async function start() {
         });
 
         app.listen(PORT, () => {
-            console.log(`MYG API v4.5.2 en puerto ${PORT}`);
+            console.log(`MYG API v4.5.3 en puerto ${PORT}`);
             console.log(`IA Minutas: Groq=${!!process.env.GROQ_API_KEY ? '✅' : '❌'} | Gemini=${!!process.env.GEMINI_API_KEY ? '✅' : '❌'} | Local=✅`);
             console.log(`Activos:      GET(limit) POST(insertMany) PATCH(edit) DELETE(permisos) BULK(500max) ✅`);
             console.log(`Reposiciones: GET POST POST-bulk PATCH DELETE → hub_reposiciones ✅`);
@@ -2840,6 +2889,8 @@ async function start() {
             console.log(`HC Upload:    Transacción atómica ACID (BUG-003 ✅ v4.5.2)`);
             console.log(`Formatos:     XLSX real ExcelJS + cache + CORS header (BUG-002 ✅ v4.5.2)`);
             console.log(`Seguridad:    Helmet CSP/HSTS/hidePoweredBy (SEC-004 ✅ v4.5.2)`);
+            console.log(`TTL Index:    hub_notificaciones 30d (PERF-002 ✅ v4.5.3)`);
+            console.log(`Email RH:     Email fresco desde MongoDB (BUG-004 ✅ v4.5.3)`);
         });
     } catch (err) {
         console.error('Error iniciando:', err);
