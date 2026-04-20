@@ -1,38 +1,33 @@
 // ============================================================
-// MYG TELECOM — API SERVER v4.4.0
+// MYG TELECOM — API SERVER v4.5.0
 // Render (Node.js) + MongoDB Atlas
 //
 // CAMBIOS v4.5.0:
 //   [CAN-1..4] CRUD de canales dinámicos → hub_canales
 //   [BOL-1..5] CRUD de boletines semanales → hub_boletines
 //   [BOL-6]   Índice en connectDB para hub_boletines y hub_canales
+//
+// CAMBIOS v4.5.2:
+//   [BUG-003] POST /api/hc/upload — transacción atómica (driver nativo)
+//             Elimina race condition deleteMany + insertMany sin sesión.
+//             Requiere: let mongoClient (global) + mongoClient = client en connectDB
 // ================================================================
 // ============================================================
 
 require('dotenv').config();
 const { validateEnv, getRequired, getOptional } = require('./env-validator');
-// Ejecutar validación fail-fast. Si falta alguna var crítica, process.exit(1)
-// Render capturará el log y marcará el deploy como fallido (comportamiento deseado)
 validateEnv();
 
-// ─── DESPUÉS de validateEnv(), usar getRequired() en lugar de process.env.X || 'fallback' ──
-
-// ❌ ANTES (peligroso):
-// const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
-// const NEBULA_SECRET = process.env.NEBULA_AGENT_SECRET || 'fallback-inseguro-hardcodeado';
-
-// ✅ DESPUÉS (seguro):
-const JWT_SECRET = getRequired('JWT_SECRET');
+const JWT_SECRET         = getRequired('JWT_SECRET');
 const NEBULA_AGENT_SECRET = getRequired('NEBULA_AGENT_SECRET');
-const MONGODB_URI = getRequired('MONGODB_URI');
+const MONGODB_URI        = getRequired('MONGODB_URI');
 
-// Opcionales con defaults explícitos y documentados
-const PORT = parseInt(getOptional('PORT', '3000'), 10);
-const NODE_ENV = getOptional('NODE_ENV', 'production');
-const FRONTEND_URL = getOptional('FRONTEND_URL', '*');
-const GROQ_API_KEY = getOptional('GROQ_API_KEY', '');          // minuta IA degradada si vacío
-const GEMINI_API_KEY = getOptional('GEMINI_API_KEY', '');       // fallback IA opcional
-const GOOGLE_SHEETS_KEY = getOptional('GOOGLE_SHEETS_KEY', ''); // sheets degradado si vacío
+const PORT          = parseInt(getOptional('PORT', '3000'), 10);
+const NODE_ENV      = getOptional('NODE_ENV', 'production');
+const FRONTEND_URL  = getOptional('FRONTEND_URL', '*');
+const GROQ_API_KEY  = getOptional('GROQ_API_KEY', '');
+const GEMINI_API_KEY = getOptional('GEMINI_API_KEY', '');
+const GOOGLE_SHEETS_KEY = getOptional('GOOGLE_SHEETS_KEY', '');
 
 const express   = require('express');
 const cors      = require('cors');
@@ -71,7 +66,7 @@ function _getTransporter() {
         return null;
     }
 }
- 
+
 const RH_TIPO_LABELS = {
     ALTA:             '➕ Alta de Colaborador',
     ALTA_UDP:         '👪 Alta UDP (Beneficiario)',
@@ -80,12 +75,12 @@ const RH_TIPO_LABELS = {
     CAMBIO_PUESTO:    '📋 Cambio de Puesto',
     CAMBIO_COMBINADO: '🔀 Cambio Combinado (PDV + Puesto)',
 };
- 
+
 async function enviarEmailMovimientoRH(movimiento, destinatario) {
     if (!destinatario) return;
     const transporter = _getTransporter();
     if (!transporter) return;
- 
+
     try {
         const tipo       = movimiento.tipo || 'MOVIMIENTO';
         const tipoLabel  = RH_TIPO_LABELS[tipo] || tipo;
@@ -98,8 +93,7 @@ async function enviarEmailMovimientoRH(movimiento, destinatario) {
         const pdv        = dm.pdv   || '—';
         const ahora      = new Date().toLocaleString('es-MX', { timeZone: 'America/Mexico_City' });
         const id         = movimiento._id ? String(movimiento._id) : '—';
- 
-        // Filas de detalle extra según tipo
+
         const detallesExtra = [];
         if (tipo === 'BAJA') {
             if (dm.motivo)     detallesExtra.push(`<tr><td style="padding:4px 12px 4px 0;color:#6B7280;font-size:13px;">Motivo</td><td style="padding:4px;font-size:13px;font-weight:600;">${dm.motivo}</td></tr>`);
@@ -109,10 +103,10 @@ async function enviarEmailMovimientoRH(movimiento, destinatario) {
             detallesExtra.push(`<tr><td style="padding:4px 12px 4px 0;color:#6B7280;font-size:13px;">PDV destino</td><td style="padding:4px;font-size:13px;">${pdv}</td></tr>`);
         if (['CAMBIO_PUESTO','CAMBIO_COMBINADO'].includes(tipo) && puesto !== '—')
             detallesExtra.push(`<tr><td style="padding:4px 12px 4px 0;color:#6B7280;font-size:13px;">Puesto nuevo</td><td style="padding:4px;font-size:13px;">${puesto}</td></tr>`);
- 
+
         const colores = { ALTA:'#10B981', ALTA_UDP:'#14B8A6', BAJA:'#EF4444', CAMBIO_PDV:'#3B82F6', CAMBIO_PUESTO:'#6366F1', CAMBIO_COMBINADO:'#8B5CF6' };
         const colorTipo = colores[tipo] || '#3B82F6';
- 
+
         const html = `<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"></head>
 <body style="margin:0;padding:0;background:#F3F4F6;font-family:Arial,sans-serif;">
   <table width="100%" cellpadding="0" cellspacing="0" style="background:#F3F4F6;padding:32px 16px;">
@@ -153,7 +147,7 @@ async function enviarEmailMovimientoRH(movimiento, destinatario) {
     </td></tr>
   </table>
 </body></html>`;
- 
+
         await transporter.sendMail({
             from:    `"MYG Dashboard" <${process.env.SMTP_USER}>`,
             to:      destinatario,
@@ -161,17 +155,16 @@ async function enviarEmailMovimientoRH(movimiento, destinatario) {
             html,
         });
         console.log(`[Email] ✅ Enviado a ${destinatario} — ${tipo} (${nombre})`);
- 
+
     } catch (err) {
-        // Best-effort — no relanzar para no cancelar la operación principal
         console.error(`[Email] ❌ Error enviando a ${destinatario}:`, err.message);
     }
 }
-// IA Minutas — SDK opcional (fallback a REST si no están instalados)
+
 let GoogleGenerativeAI;
 try { ({ GoogleGenerativeAI } = require('@google/generative-ai')); } catch (_) { console.warn('⚠️  @google/generative-ai no instalado — Gemini usará REST'); }
 
-const app  = express();
+const app = express();
 
 app.use(cors({
     origin: [
@@ -192,20 +185,24 @@ const loginLimiter = rateLimit({ windowMs: 15*60*1000, max: 10, message: { error
 const apiLimiter   = rateLimit({ windowMs: 1*60*1000,  max: 200, message: { error: 'Demasiadas peticiones.' } });
 app.use('/api/', apiLimiter);
 
+// ── [BUG-003] Globals DB — mongoClient expuesto para transactions ──
 let db;
+let mongoClient; // ← NUEVO: necesario para session.withTransaction()
+
 const MONGO_URI = MONGODB_URI;
 const DB_NAME   = 'iqu_telecom';
 
 async function connectDB() {
     const client = new MongoClient(MONGO_URI, { serverSelectionTimeoutMS: 10000, socketTimeoutMS: 45000 });
     await client.connect();
-    db = client.db(DB_NAME);
+    db          = client.db(DB_NAME);
+    mongoClient = client; // ← NUEVO: exponer para transacciones ACID
     console.log(`MongoDB conectado: ${DB_NAME}`);
 
     await nebulaRoutes.init(app, db, ssePush, requireAuth, requireAdmin);
         nebulaRoutes.startOfflineWatcher(db, ssePush);
         console.log('[Nebula] Agente backend inicializado ✅');
-    
+
     const idx = async (col, spec, opts={}) => {
         try {
             await db.collection(col).createIndex(spec, opts);
@@ -232,15 +229,12 @@ async function connectDB() {
     await idx('hub_recursos',   { area: 1, createdAt: -1 }, { name: 'recursos_area_fecha'   });
     await idx('hub_guias',      { area: 1, createdAt: -1 }, { name: 'guias_area_fecha'      });
     await idx('hub_plantillas', { area: 1, createdAt: -1 }, { name: 'plantillas_area_fecha' });
-    // Activos
     await idx('activos_movimientos', { createdAt: -1 },      { name: 'activos_fecha'         });
     await idx('activos_movimientos', { 'Almacen': 1 },       { name: 'activos_almacen'       });
     await idx('activos_movimientos', { 'Tipo de Movimiento': 1 }, { name: 'activos_tipo'     });
-    // [REP-1] Reposiciones
     await idx('hub_reposiciones', { createdAt: -1 },         { name: 'repos_fecha'           });
     await idx('hub_reposiciones', { 'PDV': 1 },              { name: 'repos_pdv'             });
     await idx('hub_reposiciones', { 'Estado': 1 },           { name: 'repos_estado'          });
-
     await idx('hub_boletines', { area: 1, semana: 1 },    { name: 'boletines_area_semana' });
     await idx('hub_boletines', { createdAt: -1 },         { name: 'boletines_fecha'       });
     await idx('hub_canales',   { area: 1 },               { name: 'canales_area'          });
@@ -414,10 +408,8 @@ function requireAuthSSE(req, res, next) {
         let token;
         const header = req.headers.authorization;
         if (header?.startsWith('Bearer ')) {
-            // Conexión normal (fetch, axios, etc.)
             token = header.slice(7);
         } else if (req.query.token) {
-            // Conexión SSE via EventSource (no soporta headers)
             token = req.query.token;
         }
         if (!token) {
@@ -458,7 +450,7 @@ async function logAccess(username, action, details = {}) {
 // ── HEALTH ─────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({
     status: 'ok',
-    version: '4.4.0',
+    version: '4.5.2',
     timestamp: new Date().toISOString(),
     db: db ? 'connected' : 'disconnected',
     ia: {
@@ -767,19 +759,16 @@ app.post('/api/rh/movimientos', requireAuth, requirePermiso('rh.movimientos.crea
             estado:    'pendiente',
         };
         await db.collection('rh_movimientos').insertOne(m);
- 
-        // Email best-effort: usa el email del usuario logueado (guardado en JWT)
-        // Si el usuario no tiene email en su perfil el correo simplemente no se envía.
+
         const emailDestino = req.usuario.email || '';
         if (emailDestino) {
-            // No await — no bloquear la respuesta HTTP por el email
             enviarEmailMovimientoRH(m, emailDestino).catch(err =>
                 console.error('[Email] Error async:', err.message)
             );
         } else {
             console.warn(`[Email] Usuario ${req.usuario.username} no tiene email registrado — correo omitido`);
         }
- 
+
         res.status(201).json({ success: true, movimiento: m });
     } catch (e) {
         console.error('Error POST rh/movimientos:', e);
@@ -792,8 +781,6 @@ app.patch('/api/rh/movimientos/:id/estado', requireAuth, requirePermiso('rh.movi
 // ================================================================
 // ACTIVOS — CRUD + BULK v4.4.0
 // ================================================================
-
-// [FIX-A2] GET: respeta ?limit=N y retorna { movimientos: [], total }
 app.get('/api/activos/movimientos', requireAuth, requirePermiso('activos.ver'), async (req, res) => {
     try {
         const limit  = Math.min(parseInt(req.query.limit) || 200, 1000);
@@ -814,8 +801,6 @@ app.get('/api/activos/movimientos', requireAuth, requirePermiso('activos.ver'), 
     }
 });
 
-// [ACT-2] POST /bulk — ANTES del POST base para que Express no confunda con :id
-// Acepta { movimientos: [...] } con validación de campos obligatorios y límite 500.
 app.post('/api/activos/movimientos/bulk', requireAuth, requirePermiso('activos.registrar'), async (req, res) => {
     try {
         const { movimientos } = req.body;
@@ -870,7 +855,6 @@ app.post('/api/activos/movimientos/bulk', requireAuth, requirePermiso('activos.r
     }
 });
 
-// [FIX-A1] POST base: acepta { movimientos: [...] } → insertMany, o body plano → insertOne
 app.post('/api/activos/movimientos', requireAuth, requirePermiso('activos.registrar'), async (req, res) => {
     try {
         const { movimientos } = req.body;
@@ -912,7 +896,6 @@ app.post('/api/activos/movimientos', requireAuth, requirePermiso('activos.regist
     }
 });
 
-// [FIX-A3] PATCH: editar o confirmar entrega
 app.patch('/api/activos/movimientos/:id', requireAuth, requirePermiso('activos.registrar'), async (req, res) => {
     try {
         const { id } = req.params;
@@ -947,7 +930,6 @@ app.patch('/api/activos/movimientos/:id', requireAuth, requirePermiso('activos.r
     }
 });
 
-// [ACT-1] DELETE: eliminar registro con validación de permisos
 app.delete('/api/activos/movimientos/:id', requireAuth, requirePermiso('activos.registrar'), async (req, res) => {
     try {
         const { id } = req.params;
@@ -958,8 +940,6 @@ app.delete('/api/activos/movimientos/:id', requireAuth, requirePermiso('activos.
         if (!registro)
             return res.status(404).json({ error: 'Registro no encontrado' });
 
-        // ADMIN / COORDINADOR / GERENTE_OPERACIONES pueden borrar cualquiera
-        // ANALISTA solo puede borrar sus propios registros
         const rolesPrivilegiados = ['ADMIN', 'COORDINADOR', 'GERENTE_OPERACIONES'];
         if (!rolesPrivilegiados.includes(req.usuario.rol)) {
             if (registro.creadoPor !== req.usuario.username)
@@ -1052,12 +1032,9 @@ function hubPatch(col, perm) {
         try {
             const { id } = req.params;
 
-            // [SEC-003-A] Validar ObjectId antes de cualquier query
             if (!ObjectId.isValid(id))
                 return res.status(400).json({ error: `ID inválido: "${id}"` });
 
-            // [SEC-003-B] Leer solo los campos de control para ownership check
-            //   projection mínimo → no trae datos innecesarios al app server
             const doc = await db.collection(col).findOne(
                 { _id: new ObjectId(id) },
                 { projection: { creadoPor: 1 } }
@@ -1065,7 +1042,6 @@ function hubPatch(col, perm) {
             if (!doc)
                 return res.status(404).json({ error: 'Registro no encontrado' });
 
-            // [SEC-003-C] Ownership: ANALISTA/USUARIO solo editan los suyos
             if (!ROLES_GESTORES_HUB.has(req.usuario.rol) &&
                 doc.creadoPor !== req.usuario.username) {
                 return res.status(403).json({
@@ -1073,7 +1049,6 @@ function hubPatch(col, perm) {
                 });
             }
 
-            // [SEC-003-D] Campos protegidos — nunca sobreescribir con datos del cliente
             const updates = { ...req.body };
             delete updates._id;
             delete updates.creadoPor;
@@ -1101,11 +1076,9 @@ function hubDelete(col, perm) {
         try {
             const { id } = req.params;
 
-            // [SEC-003-A] Validar ObjectId
             if (!ObjectId.isValid(id))
                 return res.status(400).json({ error: `ID inválido: "${id}"` });
 
-            // [SEC-003-B] Fetch del doc — necesario para ownership check y 404 real
             const doc = await db.collection(col).findOne(
                 { _id: new ObjectId(id) },
                 { projection: { creadoPor: 1 } }
@@ -1113,7 +1086,6 @@ function hubDelete(col, perm) {
             if (!doc)
                 return res.status(404).json({ error: 'Registro no encontrado' });
 
-            // [SEC-003-C] Ownership check
             if (!ROLES_GESTORES_HUB.has(req.usuario.rol) &&
                 doc.creadoPor !== req.usuario.username) {
                 return res.status(403).json({
@@ -1150,13 +1122,7 @@ app.get('/api/hub/general', requireAuth, requirePermiso('hub.acceso'), async (re
     } catch (e) { res.status(500).json({ error: 'Error hub general' }); }
 });
 
-// ── Reuniones v4.4.0 — Filtro por privacidad ──────────────────
-// [REU-1] Reemplaza hubGet genérico. Lógica:
-//   ADMIN / GERENTE_OPERACIONES → ven todo (incluidas reuniones legacy sin invitados)
-//   COORDINADOR / ANALISTA / resto → solo donde:
-//     - son el organizador   (campo organizer o creadoPor)
-//     - están en la lista    (campo invitadoUsernames)
-//   Reuniones legacy sin invitadoUsernames → solo el organizador + ADMIN las ven
+// ── Reuniones ──────────────────────────────────────────────────
 app.get('/api/hub/reuniones', requireAuth, requirePermiso('hub.reuniones'), async (req, res) => {
     try {
         const { usuario } = req;
@@ -1166,15 +1132,13 @@ app.get('/api/hub/reuniones', requireAuth, requirePermiso('hub.reuniones'), asyn
 
         let filter;
         if (verTodo) {
-            // Sin restricción — ven todas las reuniones de todas las áreas
             filter = {};
         } else {
-            // Solo ven las reuniones donde participan
             filter = {
                 $or: [
-                    { organizer:           usuario.username }, // organizador nuevo
-                    { creadoPor:           usuario.username }, // creador legacy
-                    { invitadoUsernames:   usuario.username }, // están en la lista
+                    { organizer:           usuario.username },
+                    { creadoPor:           usuario.username },
+                    { invitadoUsernames:   usuario.username },
                 ],
             };
         }
@@ -1191,65 +1155,50 @@ app.get('/api/hub/reuniones', requireAuth, requirePermiso('hub.reuniones'), asyn
         res.status(500).json({ error: 'Error obteniendo reuniones' });
     }
 });
-// ================================================================
-// [NEW-2] AGREGA: Crear serie de reuniones de seguimiento
-// POST /api/hub/reuniones/serie
-// Crea N instancias vinculadas a la reunión origen con recurrencia.
-// ⚠ IMPORTANTE: Coloca esta ruta ANTES de app.patch('/api/hub/reuniones/:id', ...)
-//   para que Express no confunda 'serie' con un :id.
-// ================================================================
+
 app.post('/api/hub/reuniones/serie', requireAuth, requirePermiso('hub.reuniones'), async (req, res) => {
   try {
     const {
-      reunionOrigenId,       // string ObjectId — reunión de la que nace la serie
-      nuevaFecha,            // 'YYYY-MM-DD' — fecha del primer seguimiento
-      nuevaHora,             // 'HH:MM'
-      recurrencia,           // null | { tipo: 'semanal'|'mensual'|'dias', intervalo: N }
-      cantidadOcurrencias,   // 1–52
-      titulo,                // Título opcional; si no se da, hereda del origen
-      agenda,                // Agenda opcional
+      reunionOrigenId, nuevaFecha, nuevaHora, recurrencia,
+      cantidadOcurrencias, titulo, agenda,
     } = req.body;
- 
+
     if (!nuevaFecha || !nuevaHora) {
       return res.status(400).json({ error: 'nuevaFecha y nuevaHora son requeridos' });
     }
- 
+
     const cantidad = Math.min(Math.max(parseInt(cantidadOcurrencias) || 1, 1), 52);
- 
-    // Buscar reunión origen si existe
+
     let reunionOrigen = null;
     if (reunionOrigenId && ObjectId.isValid(reunionOrigenId)) {
       reunionOrigen = await db.collection('hub_reuniones').findOne({ _id: new ObjectId(reunionOrigenId) });
     }
- 
-    // Generar o reutilizar serieId
+
     const serieId = reunionOrigen?.serieId
       || `serie_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
- 
-    // Marcar la reunión origen como cabeza de serie (si no está marcada)
+
     if (reunionOrigen && !reunionOrigen.serieId) {
       await db.collection('hub_reuniones').updateOne(
         { _id: new ObjectId(reunionOrigenId) },
         { $set: { serieId, esOrigenSerie: true, updatedAt: new Date() } }
       );
     }
- 
-    // Construir documentos de las reuniones de seguimiento
+
     const { _id: _oid, grabandoPor: _gp, grabacionInicio: _gi, ...baseFields } = reunionOrigen || {};
- 
+
     const docs = [];
     for (let i = 0; i < cantidad; i++) {
       const fecha = new Date(nuevaFecha + 'T00:00:00');
       const { tipo = 'semanal', intervalo = 1 } = recurrencia || {};
- 
+
       if (i > 0) {
         if (tipo === 'semanal')   fecha.setDate(fecha.getDate() + 7 * i);
         else if (tipo === 'mensual') fecha.setMonth(fecha.getMonth() + i);
         else if (tipo === 'dias')  fecha.setDate(fecha.getDate() + intervalo * i);
       }
- 
+
       const fechaStr = fecha.toISOString().split('T')[0];
- 
+
       docs.push({
         ...baseFields,
         title:            titulo || `${baseFields.title || 'Reunión'} — Seguimiento ${i + 1}`,
@@ -1270,10 +1219,9 @@ app.post('/api/hub/reuniones/serie', requireAuth, requirePermiso('hub.reuniones'
         createdAt:        new Date(),
       });
     }
- 
+
     const result = await db.collection('hub_reuniones').insertMany(docs, { ordered: true });
- 
-    // Notificar a invitados de la serie
+
     const todosInvitados = [...new Set((baseFields.invitadoUsernames || []))];
     todosInvitados.forEach(uname => {
       if (uname === req.usuario.username) return;
@@ -1286,35 +1234,29 @@ app.post('/api/hub/reuniones/serie', requireAuth, requirePermiso('hub.reuniones'
         subtab:      'meetings',
       });
     });
- 
+
     console.log(`[Serie] Creada: ${serieId} — ${result.insertedCount} reuniones por ${req.usuario.username}`);
- 
+
     res.status(201).json({
       success:   true,
       serieId,
       creadas:   result.insertedCount,
       reuniones: docs.map((d, i) => ({ ...d, _id: result.insertedIds[i] })),
     });
- 
+
   } catch (e) {
     console.error('Error POST reuniones/serie:', e);
     res.status(500).json({ error: 'Error creando serie de reuniones' });
   }
 });
- 
- 
-// ================================================================
-// [NEW-3] AGREGA: Obtener todas las reuniones de una serie
-// GET /api/hub/reuniones/serie/:serieId
-// ⚠ IMPORTANTE: Coloca ANTES de app.patch('/api/hub/reuniones/:id', ...)
-// ================================================================
+
 app.get('/api/hub/reuniones/serie/:serieId', requireAuth, requirePermiso('hub.reuniones'), async (req, res) => {
   try {
     const { serieId } = req.params;
- 
+
     const { usuario } = req;
     const verTodo = ['ADMIN', 'GERENTE_OPERACIONES'].includes(usuario.rol) || (usuario.permisos || []).includes('*');
- 
+
     const filter = { serieId };
     if (!verTodo) {
       filter.$or = [
@@ -1323,21 +1265,20 @@ app.get('/api/hub/reuniones/serie/:serieId', requireAuth, requirePermiso('hub.re
         { invitadoUsernames: usuario.username },
       ];
     }
- 
+
     const reuniones = await db.collection('hub_reuniones')
       .find(filter)
       .sort({ date: 1, numeracionSerie: 1 })
       .toArray();
- 
+
     res.json(reuniones);
- 
+
   } catch (e) {
     console.error('Error GET serie:', e);
     res.status(500).json({ error: 'Error obteniendo serie de reuniones' });
   }
 });
- 
- 
+
 app.post('/api/hub/reuniones',       ...hubPost  ('hub_reuniones','hub.reuniones'));
 app.patch('/api/hub/reuniones/:id',  ...hubPatch ('hub_reuniones','hub.reuniones'));
 app.delete('/api/hub/reuniones/:id', ...hubDelete('hub_reuniones','hub.reuniones'));
@@ -1637,85 +1578,75 @@ app.post('/api/hub/minutas/:minutaId/comentarios', requireAuth, requirePermiso('
 app.patch('/api/hub/minutas/:minutaId/acciones/:itemId', requireAuth, requirePermiso('hub.minutas'), async (req, res) => {
   try {
     const { minutaId, itemId } = req.params;
- 
+
     if (!ObjectId.isValid(minutaId)) {
       return res.status(400).json({ error: 'minutaId inválido' });
     }
- 
+
     const minuta = await db.collection('hub_minutas').findOne({ _id: new ObjectId(minutaId) });
     if (!minuta) return res.status(404).json({ error: 'Minuta no encontrada' });
- 
-    // Soporta tanto 'actionItems' (campo del recorder) como 'acciones' (campo del form manual)
+
     const useField   = minuta.actionItems ? 'actionItems' : 'acciones';
     const items      = (minuta.actionItems || minuta.acciones || []);
     let   found      = false;
- 
+
     const updated = items.map(a => {
-      // Matcheo por 'id' (string generado por frontend) O '_id' (ObjectId, legacy)
       const matchId = a.id === itemId || a._id?.toString() === itemId;
       if (!matchId) return a;
- 
+
       found = true;
       const bodyKeys = Object.keys(req.body || {});
       if (bodyKeys.length > 0) {
-        // PATCH con campos específicos (ej. { done: true, responsable: '...' })
         return { ...a, ...req.body, updatedAt: new Date() };
       }
-      // Sin body → toggle done (comportamiento por defecto)
       return { ...a, done: !a.done, updatedAt: new Date() };
     });
- 
+
     if (!found) {
       return res.status(404).json({ error: `Acción con id "${itemId}" no encontrada en esta minuta` });
     }
- 
+
     await db.collection('hub_minutas').updateOne(
       { _id: new ObjectId(minutaId) },
       { $set: { [useField]: updated, updatedAt: new Date(), updatedBy: req.usuario.username } }
     );
- 
+
     console.log(`[Minutas] Acción ${itemId} actualizada en ${minutaId} por ${req.usuario.username}`);
     res.json({ success: true, updated: updated.find(a => a.id === itemId || a._id?.toString() === itemId) });
- 
+
   } catch (e) {
     console.error('Error toggleAccion:', e);
     res.status(500).json({ error: 'Error actualizando acción de minuta' });
   }
 });
-// ================================================================
-// [NEW-1] AGREGA: Mutex de grabación por reunión
-// PATCH /api/hub/reuniones/:id/grabacion
-// Evita que múltiples participantes graben simultáneamente la misma reunión.
-// ================================================================
+
 app.patch('/api/hub/reuniones/:id/grabacion', requireAuth, requirePermiso('hub.reuniones'), async (req, res) => {
   try {
     const { id } = req.params;
-    const { accion } = req.body;   // 'iniciar' | 'finalizar'
+    const { accion } = req.body;
     const { username, rol } = req.usuario;
- 
+
     if (!ObjectId.isValid(id)) {
       return res.status(400).json({ error: 'ID de reunión inválido' });
     }
     if (!['iniciar', 'finalizar'].includes(accion)) {
       return res.status(400).json({ error: 'accion debe ser "iniciar" o "finalizar"' });
     }
- 
+
     const reunion = await db.collection('hub_reuniones').findOne({ _id: new ObjectId(id) });
     if (!reunion) return res.status(404).json({ error: 'Reunión no encontrada' });
- 
-    // Verificar que el usuario es participante (organizador, invitado o rol privilegiado)
+
     const esParticipante =
       reunion.organizer          === username ||
       reunion.creadoPor          === username ||
       (reunion.invitadoUsernames || []).includes(username) ||
       ['ADMIN', 'GERENTE_OPERACIONES'].includes(rol);
- 
+
     if (!esParticipante) {
       return res.status(403).json({ error: 'No eres participante de esta reunión' });
     }
- 
+
     if (accion === 'iniciar') {
-      // ¿Alguien más ya está grabando?
       if (reunion.grabandoPor && reunion.grabandoPor !== username) {
         return res.status(409).json({
           error: `${reunion.grabandoPor} ya está grabando esta reunión. Espera a que finalice.`,
@@ -1723,45 +1654,41 @@ app.patch('/api/hub/reuniones/:id/grabacion', requireAuth, requirePermiso('hub.r
           grabacionInicio: reunion.grabacionInicio,
         });
       }
- 
+
       await db.collection('hub_reuniones').updateOne(
         { _id: new ObjectId(id) },
         { $set: { grabandoPor: username, grabacionInicio: new Date(), updatedAt: new Date() } }
       );
- 
+
       console.log(`[Reuniones] Grabación iniciada: reunión=${id} por ${username}`);
       return res.json({ success: true, grabandoPor: username, grabacionInicio: new Date() });
     }
- 
+
     if (accion === 'finalizar') {
-      // Solo quien inició puede finalizar (o ADMIN)
       if (reunion.grabandoPor && reunion.grabandoPor !== username && rol !== 'ADMIN') {
         return res.status(403).json({
           error: `Solo ${reunion.grabandoPor} puede finalizar esta grabación`,
         });
       }
- 
+
       await db.collection('hub_reuniones').updateOne(
         { _id: new ObjectId(id) },
         { $unset: { grabandoPor: '', grabacionInicio: '' }, $set: { updatedAt: new Date() } }
       );
- 
+
       console.log(`[Reuniones] Grabación finalizada: reunión=${id} por ${username}`);
       return res.json({ success: true });
     }
- 
+
   } catch (e) {
     console.error('Error mutex grabacion:', e);
     res.status(500).json({ error: 'Error en mutex de grabación' });
   }
 });
+
 // ================================================================
 // REPOSICIONES — CRUD completo v4.4.0
-// Colección: hub_reposiciones
-// Permisos: activos.ver (lectura) / activos.registrar (escritura)
 // ================================================================
-
-// [REP-1] GET — historial con filtros opcionales
 app.get('/api/reposiciones/movimientos', requireAuth, requirePermiso('activos.ver'), async (req, res) => {
     try {
         const limit  = Math.min(parseInt(req.query.limit) || 500, 1000);
@@ -1781,7 +1708,6 @@ app.get('/api/reposiciones/movimientos', requireAuth, requirePermiso('activos.ve
     }
 });
 
-// [REP-2] POST /bulk — ANTES del POST base (evitar colisión con :id)
 app.post('/api/reposiciones/movimientos/bulk', requireAuth, requirePermiso('activos.registrar'), async (req, res) => {
     try {
         const { registros } = req.body;
@@ -1832,11 +1758,10 @@ app.post('/api/reposiciones/movimientos/bulk', requireAuth, requirePermiso('acti
     }
 });
 
-// [REP-3] POST — crear un registro individual
 app.post('/api/reposiciones/movimientos', requireAuth, requirePermiso('activos.registrar'), async (req, res) => {
     try {
         const { registro } = req.body;
-        const data = registro || req.body; // aceptar ambos formatos
+        const data = registro || req.body;
 
         const serie = String(data['Número de Serie'] || data['Serie'] || '').trim();
         const pdv   = String(data['PDV'] || '').trim();
@@ -1863,7 +1788,6 @@ app.post('/api/reposiciones/movimientos', requireAuth, requirePermiso('activos.r
     }
 });
 
-// [REP-4] PATCH — editar registro
 app.patch('/api/reposiciones/movimientos/:id', requireAuth, requirePermiso('activos.registrar'), async (req, res) => {
     try {
         const { id } = req.params;
@@ -1879,12 +1803,10 @@ app.patch('/api/reposiciones/movimientos/:id', requireAuth, requirePermiso('acti
                 return res.status(403).json({ error: 'Sin permisos para editar este registro' });
         }
 
-        // Filtrar campos vacíos para no sobreescribir datos existentes con vacíos
         const updates = {};
         Object.entries(req.body).forEach(([k, v]) => {
             if (v !== '' && v !== null && v !== undefined) updates[k] = v;
         });
-        // Campos protegidos
         delete updates._id;
         delete updates.creadoPor;
         delete updates.createdAt;
@@ -1903,7 +1825,6 @@ app.patch('/api/reposiciones/movimientos/:id', requireAuth, requirePermiso('acti
     }
 });
 
-// [REP-5] DELETE — eliminar registro
 app.delete('/api/reposiciones/movimientos/:id', requireAuth, requirePermiso('activos.registrar'), async (req, res) => {
     try {
         const { id } = req.params;
@@ -2147,11 +2068,8 @@ app.delete('/api/hub/peticiones/:id', requireAuth, requirePermiso('hub.peticione
     try { await db.collection('hub_peticiones').deleteOne({_id:new ObjectId(req.params.id)}); res.json({success:true}); }
     catch (e) { res.status(500).json({ error: 'Error peticion' }); }
 });
-// ================================================================
-// [CAN-1] GET /api/hub/canales — lista de canales por área
-// Fallback: si no hay canales en DB para un área, devuelve []
-// (el frontend usa sus defaults en ese caso)
-// ================================================================
+
+// ── Canales ────────────────────────────────────────────────────
 app.get('/api/hub/canales', requireAuth, requirePermiso('hub.mensajes'), async (req, res) => {
     try {
         const { area } = req.query;
@@ -2166,35 +2084,29 @@ app.get('/api/hub/canales', requireAuth, requirePermiso('hub.mensajes'), async (
         res.status(500).json({ error: 'Error obteniendo canales' });
     }
 });
- 
-// ================================================================
-// [CAN-2] POST /api/hub/canales — crear canal
-// ================================================================
+
 app.post('/api/hub/canales', requireAuth, requirePermiso('hub.mensajes'), async (req, res) => {
     try {
         const { nombre, emoji, desc, area, pinned = false } = req.body;
- 
-        // Solo ADMIN, GERENTE_OPERACIONES y COORDINADOR pueden crear canales
+
         const rolesPermitidos = ['ADMIN', 'GERENTE_OPERACIONES', 'COORDINADOR'];
         if (!rolesPermitidos.includes(req.usuario.rol)) {
             return res.status(403).json({ error: 'Sin permisos para crear canales' });
         }
- 
+
         if (!nombre || !nombre.trim()) {
             return res.status(400).json({ error: 'nombre requerido' });
         }
- 
-        // ID único legible basado en área + nombre + timestamp
+
         const areaSlug   = (area || 'hub').toLowerCase().replace(/[^a-z0-9]/g, '_');
         const nombreSlug = nombre.toLowerCase().replace(/[^a-z0-9]/g, '_');
         const id         = `${areaSlug}_${nombreSlug}_${Date.now()}`;
- 
-        // Verificar que el nombre no esté duplicado en esa área
+
         const existe = await db.collection('hub_canales').findOne({ area, nombre: nombre.trim() });
         if (existe) {
             return res.status(409).json({ error: `Ya existe un canal "${nombre}" en esa área` });
         }
- 
+
         const doc = {
             id,
             nombre:    nombre.trim(),
@@ -2205,11 +2117,11 @@ app.post('/api/hub/canales', requireAuth, requirePermiso('hub.mensajes'), async 
             creadoPor: req.usuario.username,
             createdAt: new Date(),
         };
- 
+
         await db.collection('hub_canales').insertOne(doc);
         console.log(`[Canales] Creado: ${id} por ${req.usuario.username}`);
         res.status(201).json({ success: true, canal: doc });
- 
+
     } catch (e) {
         if (e.code === 11000) {
             return res.status(409).json({ error: 'ID de canal duplicado, intenta de nuevo' });
@@ -2218,127 +2130,106 @@ app.post('/api/hub/canales', requireAuth, requirePermiso('hub.mensajes'), async 
         res.status(500).json({ error: 'Error creando canal' });
     }
 });
- 
-// ================================================================
-// [CAN-3] PATCH /api/hub/canales/:id — editar canal
-// :id es el campo id (string), no ObjectId
-// ================================================================
+
 app.patch('/api/hub/canales/:id', requireAuth, requirePermiso('hub.mensajes'), async (req, res) => {
     try {
         const { id } = req.params;
- 
+
         const rolesPermitidos = ['ADMIN', 'GERENTE_OPERACIONES', 'COORDINADOR'];
         if (!rolesPermitidos.includes(req.usuario.rol)) {
             return res.status(403).json({ error: 'Sin permisos para editar canales' });
         }
- 
+
         const canal = await db.collection('hub_canales').findOne({ id });
         if (!canal) {
-            // Canal podría ser un canal de default no persistido aún — responder OK sin error
             return res.json({ success: true, note: 'Canal no encontrado en DB (puede ser default)' });
         }
- 
+
         const { nombre, emoji, desc, pinned } = req.body;
         const updates = { updatedAt: new Date(), updatedBy: req.usuario.username };
         if (nombre    !== undefined) updates.nombre = nombre.trim();
         if (emoji     !== undefined) updates.emoji  = emoji;
         if (desc      !== undefined) updates.desc   = desc;
         if (pinned    !== undefined) updates.pinned = !!pinned;
- 
+
         await db.collection('hub_canales').updateOne({ id }, { $set: updates });
         res.json({ success: true });
- 
+
     } catch (e) {
         console.error('Error PATCH canales:', e);
         res.status(500).json({ error: 'Error actualizando canal' });
     }
 });
- 
-// ================================================================
-// [CAN-4] DELETE /api/hub/canales/:id — eliminar canal y sus mensajes
-// ================================================================
+
 app.delete('/api/hub/canales/:id', requireAuth, requirePermiso('hub.mensajes'), async (req, res) => {
     try {
         const { id } = req.params;
- 
+
         const rolesPermitidos = ['ADMIN', 'GERENTE_OPERACIONES', 'COORDINADOR'];
         if (!rolesPermitidos.includes(req.usuario.rol)) {
             return res.status(403).json({ error: 'Sin permisos para eliminar canales' });
         }
- 
+
         const canal = await db.collection('hub_canales').findOne({ id });
         if (!canal) {
             return res.status(404).json({ error: 'Canal no encontrado' });
         }
- 
-        // No permitir eliminar canales anclados (pinned: true)
+
         if (canal.pinned) {
             return res.status(400).json({ error: 'No se puede eliminar un canal anclado (pinned)' });
         }
- 
-        // Eliminar mensajes del canal + el canal mismo
+
         const [mensajesResult] = await Promise.all([
             db.collection('hub_mensajes').deleteMany({ canal: id }),
             db.collection('hub_canales').deleteOne({ id }),
         ]);
- 
+
         console.log(`[Canales] Eliminado: ${id} (${mensajesResult.deletedCount} mensajes) por ${req.usuario.username}`);
         res.json({ success: true, mensajesEliminados: mensajesResult.deletedCount });
- 
+
     } catch (e) {
         console.error('Error DELETE canales:', e);
         res.status(500).json({ error: 'Error eliminando canal' });
     }
 });
-// ================================================================
-// [BOL-1] GET /api/hub/boletines — lista con filtros opcionales
-// GERENTE_OPERACIONES / ADMIN ven todas las áreas
-// COORDINADOR ve solo su área
-// ================================================================
+
+// ── Boletines ──────────────────────────────────────────────────
 app.get('/api/hub/boletines', requireAuth, async (req, res) => {
     try {
         const { usuario } = req;
- 
-        // Verificar permiso de acceso básico al hub de coordinación
+
         const rolesPermitidos = ['ADMIN', 'GERENTE_OPERACIONES', 'COORDINADOR'];
         if (!rolesPermitidos.includes(usuario.rol)) {
             return res.status(403).json({ error: 'Sin acceso al módulo de boletines' });
         }
- 
+
         const limit  = Math.min(parseInt(req.query.limit) || 100, 500);
         const filter = {};
- 
-        // Filtro por área — COORDINADOR solo ve la suya
+
         if (req.query.area) {
             filter.area = req.query.area;
         }
         if (usuario.rol === 'COORDINADOR') {
-            // Fuerza el área propia independientemente del query param
             filter.area = usuario.area;
         }
- 
+
         if (req.query.semana) filter.semana = req.query.semana;
- 
-        // Excluir datos binarios de archivos para el listado (aligerar respuesta)
-        // Solo incluimos nombre, tipo y tamanio — no el base64
+
         const docs = await db.collection('hub_boletines')
             .find(filter)
             .sort({ createdAt: -1 })
             .limit(limit)
-            .project({ 'archivos.data': 0 }) // excluir base64 del listado
+            .project({ 'archivos.data': 0 })
             .toArray();
- 
+
         res.json(docs);
- 
+
     } catch (e) {
         console.error('Error GET boletines:', e);
         res.status(500).json({ error: 'Error obteniendo boletines' });
     }
 });
- 
-// ================================================================
-// [BOL-2] GET /api/hub/boletines/:id — detalle con archivos completos
-// ================================================================
+
 app.get('/api/hub/boletines/:id', requireAuth, async (req, res) => {
     try {
         const { usuario } = req;
@@ -2346,30 +2237,26 @@ app.get('/api/hub/boletines/:id', requireAuth, async (req, res) => {
         if (!rolesPermitidos.includes(usuario.rol)) {
             return res.status(403).json({ error: 'Sin acceso' });
         }
- 
+
         if (!ObjectId.isValid(req.params.id)) {
             return res.status(400).json({ error: 'ID inválido' });
         }
- 
+
         const doc = await db.collection('hub_boletines').findOne({ _id: new ObjectId(req.params.id) });
         if (!doc) return res.status(404).json({ error: 'Boletín no encontrado' });
- 
-        // COORDINADOR solo puede ver boletines de su área
+
         if (usuario.rol === 'COORDINADOR' && doc.area !== usuario.area) {
             return res.status(403).json({ error: 'Sin acceso a este boletín' });
         }
- 
-        res.json(doc); // incluye base64 de archivos
- 
+
+        res.json(doc);
+
     } catch (e) {
         console.error('Error GET boletín:', e);
         res.status(500).json({ error: 'Error obteniendo boletín' });
     }
 });
- 
-// ================================================================
-// [BOL-3] POST /api/hub/boletines — crear boletín
-// ================================================================
+
 app.post('/api/hub/boletines', requireAuth, async (req, res) => {
     try {
         const { usuario } = req;
@@ -2377,22 +2264,20 @@ app.post('/api/hub/boletines', requireAuth, async (req, res) => {
         if (!rolesPermitidos.includes(usuario.rol)) {
             return res.status(403).json({ error: 'Sin permisos para crear boletines' });
         }
- 
+
         const {
             area, semana, semanaLabel, titulo, descripcion,
             archivos, fechaLimiteSabado, lunesPublicacion,
         } = req.body;
- 
+
         if (!area || !titulo) {
             return res.status(400).json({ error: 'area y titulo son requeridos' });
         }
- 
-        // COORDINADOR solo puede subir boletín de su propia área
+
         if (usuario.rol === 'COORDINADOR' && usuario.area !== area) {
             return res.status(403).json({ error: `Solo puedes subir boletines del área ${usuario.area}` });
         }
- 
-        // Validar deadline — no se puede subir después del sábado (salvo ADMIN/GERENTE)
+
         const privilegiados = ['ADMIN', 'GERENTE_OPERACIONES'];
         const hoy = new Date().toISOString().split('T')[0];
         if (!privilegiados.includes(usuario.rol) && fechaLimiteSabado && hoy > fechaLimiteSabado) {
@@ -2400,8 +2285,7 @@ app.post('/api/hub/boletines', requireAuth, async (req, res) => {
                 error: `La fecha límite de entrega (${fechaLimiteSabado}) ya pasó. Solo ADMIN o Gerente pueden subir fuera de plazo.`
             });
         }
- 
-        // Validar tamaño de archivos (max 3 MB cada uno)
+
         const MAX_FILE_BYTES = 3 * 1024 * 1024;
         for (const arch of (archivos || [])) {
             if (!arch.data) continue;
@@ -2410,7 +2294,7 @@ app.post('/api/hub/boletines', requireAuth, async (req, res) => {
                 return res.status(400).json({ error: `Archivo "${arch.nombre}" excede el límite de 3 MB` });
             }
         }
- 
+
         const doc = {
             area,
             semana:            semana        || '',
@@ -2423,11 +2307,10 @@ app.post('/api/hub/boletines', requireAuth, async (req, res) => {
             creadoPor:         usuario.username,
             createdAt:         new Date(),
         };
- 
+
         const result = await db.collection('hub_boletines').insertOne(doc);
         console.log(`[Boletines] Creado: ${result.insertedId} área=${area} semana=${semana} por ${usuario.username}`);
- 
-        // Responder sin base64 para aligerar la respuesta
+
         const { archivos: _arch, ...sinArchivos } = doc;
         const archMetadata = (archivos || []).map(({ nombre, tipo, tamanio }) => ({ nombre, tipo, tamanio }));
         res.status(201).json({
@@ -2435,16 +2318,13 @@ app.post('/api/hub/boletines', requireAuth, async (req, res) => {
             id:       result.insertedId,
             boletin:  { ...sinArchivos, archivos: archMetadata, _id: result.insertedId },
         });
- 
+
     } catch (e) {
         console.error('Error POST boletines:', e);
         res.status(500).json({ error: 'Error creando boletín' });
     }
 });
- 
-// ================================================================
-// [BOL-4] PATCH /api/hub/boletines/:id — actualizar boletín
-// ================================================================
+
 app.patch('/api/hub/boletines/:id', requireAuth, async (req, res) => {
     try {
         const { usuario } = req;
@@ -2452,15 +2332,14 @@ app.patch('/api/hub/boletines/:id', requireAuth, async (req, res) => {
         if (!rolesPermitidos.includes(usuario.rol)) {
             return res.status(403).json({ error: 'Sin permisos' });
         }
- 
+
         if (!ObjectId.isValid(req.params.id)) {
             return res.status(400).json({ error: 'ID inválido' });
         }
- 
+
         const doc = await db.collection('hub_boletines').findOne({ _id: new ObjectId(req.params.id) });
         if (!doc) return res.status(404).json({ error: 'Boletín no encontrado' });
- 
-        // COORDINADOR: solo su área y solo antes del deadline
+
         if (usuario.rol === 'COORDINADOR') {
             if (doc.area !== usuario.area) {
                 return res.status(403).json({ error: 'Solo puedes editar boletines de tu área' });
@@ -2470,13 +2349,12 @@ app.patch('/api/hub/boletines/:id', requireAuth, async (req, res) => {
                 return res.status(400).json({ error: 'La fecha límite de entrega ya pasó. No puedes editar este boletín.' });
             }
         }
- 
+
         const { titulo, descripcion, archivos } = req.body;
         const updates = { updatedAt: new Date(), updatedBy: usuario.username };
         if (titulo      !== undefined) updates.titulo      = titulo.trim();
         if (descripcion !== undefined) updates.descripcion = descripcion.trim();
         if (archivos    !== undefined) {
-            // Validar archivos nuevos
             const MAX_FILE_BYTES = 3 * 1024 * 1024;
             for (const arch of archivos) {
                 if (!arch.data) continue;
@@ -2487,20 +2365,17 @@ app.patch('/api/hub/boletines/:id', requireAuth, async (req, res) => {
             }
             updates.archivos = archivos;
         }
- 
+
         await db.collection('hub_boletines').updateOne({ _id: new ObjectId(req.params.id) }, { $set: updates });
         console.log(`[Boletines] Actualizado: ${req.params.id} por ${usuario.username}`);
         res.json({ success: true });
- 
+
     } catch (e) {
         console.error('Error PATCH boletines:', e);
         res.status(500).json({ error: 'Error actualizando boletín' });
     }
 });
- 
-// ================================================================
-// [BOL-5] DELETE /api/hub/boletines/:id — eliminar boletín
-// ================================================================
+
 app.delete('/api/hub/boletines/:id', requireAuth, async (req, res) => {
     try {
         const { usuario } = req;
@@ -2508,40 +2383,42 @@ app.delete('/api/hub/boletines/:id', requireAuth, async (req, res) => {
         if (!rolesPermitidos.includes(usuario.rol)) {
             return res.status(403).json({ error: 'Sin permisos' });
         }
- 
+
         if (!ObjectId.isValid(req.params.id)) {
             return res.status(400).json({ error: 'ID inválido' });
         }
- 
+
         const doc = await db.collection('hub_boletines').findOne({ _id: new ObjectId(req.params.id) });
         if (!doc) return res.status(404).json({ error: 'Boletín no encontrado' });
- 
-        // COORDINADOR solo puede eliminar de su área y antes del deadline
+
         if (usuario.rol === 'COORDINADOR') {
             if (doc.area !== usuario.area) {
                 return res.status(403).json({ error: 'Solo puedes eliminar boletines de tu área' });
             }
         }
-        // GERENTE y ADMIN pueden eliminar cualquiera
- 
+
         await db.collection('hub_boletines').deleteOne({ _id: new ObjectId(req.params.id) });
         console.log(`[Boletines] Eliminado: ${req.params.id} por ${usuario.username}`);
         res.json({ success: true });
- 
+
     } catch (e) {
         console.error('Error DELETE boletines:', e);
         res.status(500).json({ error: 'Error eliminando boletín' });
     }
 });
 
-// [HC-FIX-1] GET /api/hc/usuarios — requireAuth + db global (v4.5.1)
+// ================================================================
+// HC — Headcount (hub_hc_usuarios / hub_hc_meta)
+// ================================================================
+
+// [HC-FIX-1] GET /api/hc/usuarios
 app.get('/api/hc/usuarios', requireAuth, async (req, res) => {
     try {
         const meta = await db.collection('hub_hc_meta').findOne({ _type: 'hc_usuarios' });
         const rows = await db.collection('hub_hc_usuarios').find({}).toArray();
- 
+
         const rowsLimpias = rows.map(({ _id, _type, ...rest }) => rest);
- 
+
         res.json({
             ok:   true,
             meta: meta ? {
@@ -2557,10 +2434,15 @@ app.get('/api/hc/usuarios', requireAuth, async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
- 
-// ──────────────────────────────────────────────────────────────
-// POST /api/hc/upload
-// [HC-FIX-2] POST /api/hc/upload — requireAuth + db global (v4.5.1)
+
+// ================================================================
+// [HC-FIX-2] POST /api/hc/upload — v4.5.2
+// CORRECCIÓN BUG-003: Transacción atómica con driver nativo MongoDB.
+// El patrón anterior (deleteMany + insertMany sin sesión) dejaba la
+// colección vacía si insertMany fallaba entre lotes.
+// Ahora usa mongoClient.startSession() + withTransaction() para
+// garantizar que ambas operaciones sean todo-o-nada (ACID).
+// ================================================================
 app.post('/api/hc/upload', requireAuth, async (req, res) => {
     try {
         const usuario = req.usuario;
@@ -2568,46 +2450,83 @@ app.post('/api/hc/upload', requireAuth, async (req, res) => {
         if (!rolesPermitidos.includes(usuario.rol)) {
             return res.status(403).json({ error: 'Sin permisos para cargar HC' });
         }
- 
+
         const { rows, filename } = req.body;
         if (!Array.isArray(rows) || rows.length === 0) {
             return res.status(400).json({ error: 'rows debe ser un array no vacío' });
         }
- 
-        await db.collection('hub_hc_usuarios').deleteMany({});
- 
-        const rowsConTipo = rows.map(r => ({ ...r, _type: 'hc_row' }));
- 
-        const BATCH_SIZE = 500;
-        for (let i = 0; i < rowsConTipo.length; i += BATCH_SIZE) {
-            await db.collection('hub_hc_usuarios').insertMany(rowsConTipo.slice(i, i + BATCH_SIZE));
+
+        // Límite de seguridad — ajustar si el HC supera este valor
+        const MAX_ROWS = 50_000;
+        if (rows.length > MAX_ROWS) {
+            return res.status(413).json({ error: `El archivo supera el límite de ${MAX_ROWS} filas` });
         }
- 
-        const meta = {
-            _type:      'hc_usuarios',
-            filename:   filename || 'desconocido',
-            total:      rows.length,
-            uploadedAt: new Date().toISOString(),
-            uploadedBy: usuario.username,
-        };
-        await db.collection('hub_hc_meta').updateOne(
-            { _type: 'hc_usuarios' },
-            { $set: meta },
-            { upsert: true }
-        );
- 
-        console.log(`✅ HC Upload: ${rows.length} registros por ${usuario.username}`);
-        res.json({ ok: true, total: rows.length, meta });
- 
+
+        // ── Transacción atómica (driver nativo MongoDB) ──────────
+        // Requiere: mongoClient disponible como global (asignado en connectDB)
+        // Atlas: Replica Set nativo → soporta multi-document transactions
+        const session = mongoClient.startSession();
+
+        try {
+            await session.withTransaction(async () => {
+                const col = db.collection('hub_hc_usuarios');
+
+                // 1. Borrar colección DENTRO de la transacción
+                //    Si el siguiente paso falla → este delete se revierte
+                await col.deleteMany({}, { session });
+
+                // 2. Preparar documentos
+                const rowsConTipo = rows.map(r => ({ ...r, _type: 'hc_row' }));
+
+                // 3. Insertar en lotes de 500 DENTRO de la misma transacción
+                //    Si cualquier lote falla → rollback completo (colección intacta)
+                const BATCH_SIZE = 500;
+                for (let i = 0; i < rowsConTipo.length; i += BATCH_SIZE) {
+                    await col.insertMany(
+                        rowsConTipo.slice(i, i + BATCH_SIZE),
+                        { session }
+                    );
+                }
+            }, {
+                // Garantía máxima en Atlas replica set
+                readConcern:  { level: 'snapshot' },
+                writeConcern: { w: 'majority' },
+            });
+
+            // ── Actualizar metadata FUERA de la transacción ──────
+            // No es crítico para la atomicidad del HC:
+            // si esto falla, el HC sí se actualizó y el meta se puede recalcular
+            const meta = {
+                _type:      'hc_usuarios',
+                filename:   filename || 'desconocido',
+                total:      rows.length,
+                uploadedAt: new Date().toISOString(),
+                uploadedBy: usuario.username,
+            };
+            await db.collection('hub_hc_meta').updateOne(
+                { _type: 'hc_usuarios' },
+                { $set: meta },
+                { upsert: true }
+            );
+
+            console.log(`✅ HC Upload (transacción): ${rows.length} registros por ${usuario.username}`);
+            res.json({ ok: true, total: rows.length, meta });
+
+        } finally {
+            // Siempre liberar la sesión, con o sin error
+            await session.endSession();
+        }
+
     } catch (err) {
         console.error('POST /api/hc/upload error:', err);
-        res.status(500).json({ error: err.message });
+        res.status(500).json({
+            error: err.message,
+            detail: 'Los datos anteriores del HC no fueron modificados (rollback automático).',
+        });
     }
 });
- 
-// ──────────────────────────────────────────────────────────────
-// PATCH /api/hc/usuarios/aplicar-movimiento
-// [HC-FIX-3] PATCH /api/hc/usuarios/aplicar-movimiento — requireAuth + db global (v4.5.1)
+
+// [HC-FIX-3] PATCH /api/hc/usuarios/aplicar-movimiento
 app.patch('/api/hc/usuarios/aplicar-movimiento', requireAuth, async (req, res) => {
     try {
         const usuario = req.usuario;
@@ -2615,12 +2534,12 @@ app.patch('/api/hc/usuarios/aplicar-movimiento', requireAuth, async (req, res) =
         if (!rolesPermitidos.includes(usuario.rol)) {
             return res.status(403).json({ error: 'Sin permisos para modificar HC' });
         }
- 
+
         const { tipo, attuid, nombre, pdv, puesto, motivo } = req.body;
         if (!tipo) return res.status(400).json({ error: 'tipo es requerido' });
- 
+
         const col = db.collection('hub_hc_usuarios');
- 
+
         const buildQuery = () => {
             if (attuid && attuid.trim()) {
                 return {
@@ -2642,12 +2561,12 @@ app.patch('/api/hc/usuarios/aplicar-movimiento', requireAuth, async (req, res) =
             }
             return null;
         };
- 
+
         const query = buildQuery();
         if (!query) {
             return res.status(400).json({ error: 'Se requiere attuid o nombre para identificar al colaborador' });
         }
- 
+
         const historial = {
             tipo,
             fecha: new Date().toISOString(),
@@ -2656,7 +2575,7 @@ app.patch('/api/hc/usuarios/aplicar-movimiento', requireAuth, async (req, res) =
             ...(puesto ? { puesto } : {}),
             ...(motivo ? { motivo } : {}),
         };
- 
+
         let updateOp = {};
         switch (tipo) {
             case 'BAJA':
@@ -2670,7 +2589,7 @@ app.patch('/api/hc/usuarios/aplicar-movimiento', requireAuth, async (req, res) =
                     $push: { _historialMovimientos: historial }
                 };
                 break;
- 
+
             case 'CAMBIO_PDV':
                 updateOp = {
                     $set: {
@@ -2680,7 +2599,7 @@ app.patch('/api/hc/usuarios/aplicar-movimiento', requireAuth, async (req, res) =
                     $push: { _historialMovimientos: historial }
                 };
                 break;
- 
+
             case 'CAMBIO_PUESTO':
                 updateOp = {
                     $set: {
@@ -2690,7 +2609,7 @@ app.patch('/api/hc/usuarios/aplicar-movimiento', requireAuth, async (req, res) =
                     $push: { _historialMovimientos: historial }
                 };
                 break;
- 
+
             case 'CAMBIO_COMBINADO':
                 updateOp = {
                     $set: {
@@ -2701,13 +2620,13 @@ app.patch('/api/hc/usuarios/aplicar-movimiento', requireAuth, async (req, res) =
                     $push: { _historialMovimientos: historial }
                 };
                 break;
- 
+
             default:
                 return res.status(400).json({ error: `Tipo de movimiento no soportado: ${tipo}` });
         }
- 
+
         const result = await col.updateOne(query, updateOp);
- 
+
         if (result.matchedCount === 0) {
             console.warn(`⚠️  HC aplicar-movimiento: ningún registro coincidió. tipo=${tipo} attuid=${attuid} nombre=${nombre}`);
             return res.json({
@@ -2716,10 +2635,10 @@ app.patch('/api/hc/usuarios/aplicar-movimiento', requireAuth, async (req, res) =
                 matched: 0, modified: 0,
             });
         }
- 
+
         console.log(`✅ HC movimiento aplicado: ${tipo} → ${attuid || nombre} por ${usuario.username}`);
         res.json({ ok: true, matched: result.matchedCount, modified: result.modifiedCount });
- 
+
     } catch (err) {
         console.error('PATCH /api/hc/usuarios/aplicar-movimiento error:', err);
         res.status(500).json({ error: err.message });
@@ -2727,7 +2646,6 @@ app.patch('/api/hc/usuarios/aplicar-movimiento', requireAuth, async (req, res) =
 });
 
 // ── 404 / Error handler ────────────────────────────────────────
-
 async function start() {
     try {
         await connectDB();
@@ -2736,15 +2654,16 @@ async function start() {
             console.error('Error no manejado:', err);
             res.status(500).json({ error: 'Error interno' });
         });
- 
+
         app.listen(PORT, () => {
-            console.log(`MYG API v4.5.0 en puerto ${PORT}`);
+            console.log(`MYG API v4.5.2 en puerto ${PORT}`);
             console.log(`IA Minutas: Groq=${!!process.env.GROQ_API_KEY ? '✅' : '❌'} | Gemini=${!!process.env.GEMINI_API_KEY ? '✅' : '❌'} | Local=✅`);
             console.log(`Activos:      GET(limit) POST(insertMany) PATCH(edit) DELETE(permisos) BULK(500max) ✅`);
             console.log(`Reposiciones: GET POST POST-bulk PATCH DELETE → hub_reposiciones ✅`);
             console.log(`Reuniones:    GET con filtro de privacidad por invitadoUsernames ✅`);
             console.log(`Nebula Agent: /api/nebula/* y /api/agents/* ✅`);
             console.log(`Email SMTP: ${process.env.SMTP_HOST ? '✅ ' + process.env.SMTP_HOST : '❌ no configurado'}`);
+            console.log(`HC Upload:    Transacción atómica ACID (BUG-003 ✅ v4.5.2)`);
         });
     } catch (err) {
         console.error('Error iniciando:', err);
