@@ -1,5 +1,5 @@
 // ================================================================
-// MYG TELECOM — API SERVER v4.5.3
+// MYG TELECOM — API SERVER v4.5.4
 // Render (Node.js) + MongoDB Atlas
 //
 // CHANGELOG:
@@ -18,6 +18,10 @@
 //                      Función crearIndicesTTL() llamada post-conexión en connectDB()
 //           [BUG-004]  Email RH fresco desde MongoDB — evita email desactualizado del JWT
 //                      POST /api/rh/movimientos consulta db.users para obtener email actual
+//   v4.5.4: [BUG-005]  GET /api/rh/movimientos → paginación real con skip/limit/total
+//                      Parámetros: page, limit (max 200), tipo, area, estado, desde, hasta
+//                      Respuesta: { ok, data, paginacion: { total, page, limit, pages, hasNext, hasPrev } }
+//                      Compatible hacia atrás — defaults: page=1, limit=50
 // ================================================================
 
 require('dotenv').config();
@@ -366,6 +370,9 @@ async function connectDB() {
     await idx('hub_boletines',       { createdAt: -1 },                  { name: 'boletines_fecha' });
     await idx('hub_canales',         { area: 1 },                        { name: 'canales_area' });
     await idx('hub_canales',         { id: 1 },                          { unique: true, name: 'canales_id_unique' });
+    // [BUG-005] Índice de soporte para paginación de movimientos RH
+    await idx('rh_movimientos',      { createdAt: -1 },                  { name: 'rh_mov_fecha' });
+    await idx('rh_movimientos',      { tipo: 1, createdAt: -1 },         { name: 'rh_mov_tipo_fecha' });
 
     // ── [PERF-002] TTL index notificaciones — separado para mayor claridad en logs ──
     await crearIndicesTTL();
@@ -587,7 +594,7 @@ async function logAccess(username, action, details = {}) {
 // ── HEALTH ─────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({
     status:    'ok',
-    version:   '4.5.3',
+    version:   '4.5.4',
     timestamp: new Date().toISOString(),
     db:        db ? 'connected' : 'disconnected',
     ia: {
@@ -953,12 +960,89 @@ app.delete('/api/notificaciones', requireAuth, async (req, res) => {
 // ================================================================
 // RH — Movimientos
 // ================================================================
+
+// ================================================================
+// [BUG-005] GET /api/rh/movimientos — Paginación real v4.5.4
+// Autor: IT Director | Fecha: 2026-04-21
+// Ticket: BUG-005 | Riesgo: BAJO | Rollback: revertir a limit(200) sin skip
+//
+// Problema original:
+//   .limit(200) hardcodeado sin skip → con HC grande (>500 filas) la respuesta
+//   serializa todo en memoria, el JSON pesa MBs y la UI congela esperando.
+//   Sin total ni pages, el frontend no puede paginar ni mostrar progreso.
+//
+// Solución:
+//   - page + limit con defaults seguros (page=1, limit=50, max=200)
+//   - Promise.all para countDocuments paralelo (evita 2 round-trips secuenciales)
+//   - Filtros opcionales: tipo, area, estado, desde, hasta
+//   - Respuesta incluye { ok, data, paginacion: { total, page, limit, pages, hasNext, hasPrev } }
+//   - Compatible hacia atrás: clientes sin ?page ni ?limit reciben page=1, limit=50
+//
+// IMPORTANTE para frontend (rh-frontend-component.jsx):
+//   Actualizar consumidor para leer response.data (antes era array directo).
+//   Leer paginacion.total y paginacion.pages para mostrar controles de paginación.
+//   Ejemplo: GET /api/rh/movimientos?page=2&limit=50&tipo=BAJA
+// ================================================================
 app.get('/api/rh/movimientos', requireAuth, requirePermiso('rh.movimientos.ver'), async (req, res) => {
     try {
+        // ── Parámetros de paginación con defaults seguros ──────────────────
+        const page  = Math.max(1, parseInt(req.query.page)  || 1);
+        const limit = Math.min(200, Math.max(1, parseInt(req.query.limit) || 50));
+        const skip  = (page - 1) * limit;
+
+        // ── Filtros opcionales (compatibles con clientes existentes) ───────
         const q = {};
-        if (req.query.tipo) q.tipo = req.query.tipo;
-        res.json(await db.collection('rh_movimientos').find(q).sort({ createdAt: -1 }).limit(200).toArray());
-    } catch (e) { res.status(500).json({ error: 'Error RH' }); }
+        if (req.query.tipo)   q.tipo   = req.query.tipo;
+        if (req.query.area)   q.area   = req.query.area;
+        if (req.query.estado) q.estado = req.query.estado;
+
+        // Filtro de rango de fechas (ISO string o Date)
+        if (req.query.desde || req.query.hasta) {
+            q.createdAt = {};
+            if (req.query.desde) {
+                const desde = new Date(req.query.desde);
+                if (!isNaN(desde)) q.createdAt.$gte = desde;
+            }
+            if (req.query.hasta) {
+                const hasta = new Date(req.query.hasta);
+                if (!isNaN(hasta)) {
+                    hasta.setHours(23, 59, 59, 999); // incluir todo el día
+                    q.createdAt.$lte = hasta;
+                }
+            }
+            if (Object.keys(q.createdAt).length === 0) delete q.createdAt;
+        }
+
+        // ── Query paralela: datos + total ──────────────────────────────────
+        // Promise.all evita 2 round-trips secuenciales a MongoDB
+        const [movimientos, total] = await Promise.all([
+            db.collection('rh_movimientos')
+                .find(q)
+                .sort({ createdAt: -1 })
+                .skip(skip)
+                .limit(limit)
+                .toArray(),
+            db.collection('rh_movimientos')
+                .countDocuments(q)
+        ]);
+
+        res.json({
+            ok: true,
+            data: movimientos,
+            paginacion: {
+                total,
+                page,
+                limit,
+                pages:   Math.ceil(total / limit) || 1,
+                hasNext: page * limit < total,
+                hasPrev: page > 1,
+            }
+        });
+
+    } catch (e) {
+        console.error('[BUG-005] Error GET rh/movimientos:', e);
+        res.status(500).json({ error: 'Error RH' });
+    }
 });
 
 // ================================================================
@@ -2879,7 +2963,7 @@ async function start() {
         });
 
         app.listen(PORT, () => {
-            console.log(`MYG API v4.5.3 en puerto ${PORT}`);
+            console.log(`MYG API v4.5.4 en puerto ${PORT}`);
             console.log(`IA Minutas: Groq=${!!process.env.GROQ_API_KEY ? '✅' : '❌'} | Gemini=${!!process.env.GEMINI_API_KEY ? '✅' : '❌'} | Local=✅`);
             console.log(`Activos:      GET(limit) POST(insertMany) PATCH(edit) DELETE(permisos) BULK(500max) ✅`);
             console.log(`Reposiciones: GET POST POST-bulk PATCH DELETE → hub_reposiciones ✅`);
@@ -2891,6 +2975,7 @@ async function start() {
             console.log(`Seguridad:    Helmet CSP/HSTS/hidePoweredBy (SEC-004 ✅ v4.5.2)`);
             console.log(`TTL Index:    hub_notificaciones 30d (PERF-002 ✅ v4.5.3)`);
             console.log(`Email RH:     Email fresco desde MongoDB (BUG-004 ✅ v4.5.3)`);
+            console.log(`Paginación:   GET /api/rh/movimientos page+limit+filtros (BUG-005 ✅ v4.5.4)`);
         });
     } catch (err) {
         console.error('Error iniciando:', err);
