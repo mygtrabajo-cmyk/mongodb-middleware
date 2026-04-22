@@ -651,7 +651,63 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
         res.status(500).json({ error: 'Error interno' });
     }
 });
-
+app.post('/api/auth/renew', requireAuth, async (req, res) => {
+    try {
+        const { username } = req.usuario;
+ 
+        // Leer datos frescos desde MongoDB (no confiar sólo en el payload del JWT).
+        // Esto detecta cambios de rol/permisos hechos por el admin entre sesiones.
+        const usuarioDoc = await db.collection('users').findOne(
+            { username },
+            { projection: { password: 0 } } // nunca devolver el hash
+        );
+ 
+        if (!usuarioDoc) {
+            return res.status(401).json({ error: 'Usuario no encontrado', code: 'USER_NOT_FOUND' });
+        }
+ 
+        if (!usuarioDoc.activo) {
+            // El admin desactivó la cuenta mientras la sesión estaba abierta
+            return res.status(401).json({ error: 'Cuenta desactivada', code: 'ACCOUNT_DISABLED' });
+        }
+ 
+        // Recalcular permisos desde la DB (por si el admin los modificó)
+        const rolNormalizado = normalizarRol(usuarioDoc.rol);
+        const permisos       = calcularPermisos({ ...usuarioDoc, rol: rolNormalizado });
+ 
+        const tokenPayload = {
+            username:      usuarioDoc.username,
+            nombre:        usuarioDoc.nombre,
+            email:         usuarioDoc.email         || '',
+            rol:           rolNormalizado,
+            area:          usuarioDoc.area           || null,
+            rolSecundario: usuarioDoc.rolSecundario  || null,
+            permisos,
+            preferencias:  usuarioDoc.preferencias   || {},
+        };
+ 
+        // Emitir token nuevo con 8h de vida desde ahora
+        const token = jwt.sign(tokenPayload, JWT_SECRET, { expiresIn: '8h' });
+ 
+        // Log para auditoría (usa el access_logs con TTL 30d)
+        await logAccess(username, 'TOKEN_RENEWED', {
+            ip:  req.ip,
+            rol: rolNormalizado,
+        });
+ 
+        console.log(`[FEAT-001] Token renovado: ${username} (${rolNormalizado})`);
+ 
+        return res.json({
+            success: true,
+            token,
+            user: { ...tokenPayload },
+        });
+ 
+    } catch (err) {
+        console.error('[FEAT-001] Error en /api/auth/renew:', err.message);
+        return res.status(500).json({ error: 'Error al renovar sesión' });
+    }
+});
 // ── USUARIOS CRUD (solo ADMIN) ─────────────────────────────────
 app.get('/api/users', requireAuth, requireAdmin, async (req, res) => {
     try {
