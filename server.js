@@ -1,5 +1,5 @@
 // ================================================================
-// MYG TELECOM — API SERVER v4.5.4
+// MYG TELECOM — API SERVER v4.5.5
 // Render (Node.js) + MongoDB Atlas
 //
 // CHANGELOG:
@@ -22,6 +22,9 @@
 //                      Parámetros: page, limit (max 200), tipo, area, estado, desde, hasta
 //                      Respuesta: { ok, data, paginacion: { total, page, limit, pages, hasNext, hasPrev } }
 //                      Compatible hacia atrás — defaults: page=1, limit=50
+//   v4.5.5: [FEAT-003] GET  /api/nebula/umbrales → leer umbrales CPU/RAM/Disco (autenticado)
+//                      PATCH /api/nebula/umbrales → guardar umbrales (ADMIN/GERENTE_OPERACIONES)
+//                      Colección: hub_nebula_config { _id: 'umbrales', umbrales, updatedBy, updatedAt }
 // ================================================================
 
 require('dotenv').config();
@@ -373,6 +376,7 @@ async function connectDB() {
     // [BUG-005] Índice de soporte para paginación de movimientos RH
     await idx('rh_movimientos',      { createdAt: -1 },                  { name: 'rh_mov_fecha' });
     await idx('rh_movimientos',      { tipo: 1, createdAt: -1 },         { name: 'rh_mov_tipo_fecha' });
+    await idx('hub_nebula_config',   { _id: 1 },                       { name: 'nebula_config_id' });
 
     // ── [PERF-002] TTL index notificaciones — separado para mayor claridad en logs ──
     await crearIndicesTTL();
@@ -871,8 +875,9 @@ app.get('/api/admin/form-submissions', requireAuth, requireAdmin, async (req, re
         res.json(submissions);
     } catch (e) { res.status(500).json({ error: 'Error obteniendo formularios' }); }
 });
-/ GET /api/nebula/umbrales — leer umbrales actuales (autenticado)
-app.get('/api/nebula/umbrales', verificarToken, async (req, res) => {
+
+// ── GET /api/nebula/umbrales — leer umbrales actuales (autenticado)
+app.get('/api/nebula/umbrales', requireAuth, async (req, res) => {
     try {
         const doc = await db.collection('hub_nebula_config').findOne({ _id: 'umbrales' });
         if (!doc) {
@@ -895,7 +900,7 @@ app.get('/api/nebula/umbrales', verificarToken, async (req, res) => {
 });
 
 // PATCH /api/nebula/umbrales — guardar umbrales (solo ADMIN o GERENTE_OPERACIONES)
-app.patch('/api/nebula/umbrales', verificarToken, async (req, res) => {
+app.patch('/api/nebula/umbrales', requireAuth, async (req, res) => {
     const { rol } = req.usuario;
     if (!['ADMIN', 'GERENTE_OPERACIONES'].includes(rol)) {
         return res.status(403).json({ ok: false, error: 'Sin permiso para modificar umbrales' });
@@ -925,6 +930,7 @@ app.patch('/api/nebula/umbrales', verificarToken, async (req, res) => {
         res.status(500).json({ ok: false, error: 'Error guardando umbrales' });
     }
 });
+
 // ================================================================
 // NOTIFICACIONES SSE
 // ================================================================
@@ -1014,28 +1020,6 @@ app.delete('/api/notificaciones', requireAuth, async (req, res) => {
 // RH — Movimientos
 // ================================================================
 
-// ================================================================
-// [BUG-005] GET /api/rh/movimientos — Paginación real v4.5.4
-// Autor: IT Director | Fecha: 2026-04-21
-// Ticket: BUG-005 | Riesgo: BAJO | Rollback: revertir a limit(200) sin skip
-//
-// Problema original:
-//   .limit(200) hardcodeado sin skip → con HC grande (>500 filas) la respuesta
-//   serializa todo en memoria, el JSON pesa MBs y la UI congela esperando.
-//   Sin total ni pages, el frontend no puede paginar ni mostrar progreso.
-//
-// Solución:
-//   - page + limit con defaults seguros (page=1, limit=50, max=200)
-//   - Promise.all para countDocuments paralelo (evita 2 round-trips secuenciales)
-//   - Filtros opcionales: tipo, area, estado, desde, hasta
-//   - Respuesta incluye { ok, data, paginacion: { total, page, limit, pages, hasNext, hasPrev } }
-//   - Compatible hacia atrás: clientes sin ?page ni ?limit reciben page=1, limit=50
-//
-// IMPORTANTE para frontend (rh-frontend-component.jsx):
-//   Actualizar consumidor para leer response.data (antes era array directo).
-//   Leer paginacion.total y paginacion.pages para mostrar controles de paginación.
-//   Ejemplo: GET /api/rh/movimientos?page=2&limit=50&tipo=BAJA
-// ================================================================
 app.get('/api/rh/movimientos', requireAuth, requirePermiso('rh.movimientos.ver'), async (req, res) => {
     try {
         // ── Parámetros de paginación con defaults seguros ──────────────────
@@ -3016,7 +3000,7 @@ async function start() {
         });
 
         app.listen(PORT, () => {
-            console.log(`MYG API v4.5.4 en puerto ${PORT}`);
+            console.log(`MYG API v4.5.5 en puerto ${PORT}`);
             console.log(`IA Minutas: Groq=${!!process.env.GROQ_API_KEY ? '✅' : '❌'} | Gemini=${!!process.env.GEMINI_API_KEY ? '✅' : '❌'} | Local=✅`);
             console.log(`Activos:      GET(limit) POST(insertMany) PATCH(edit) DELETE(permisos) BULK(500max) ✅`);
             console.log(`Reposiciones: GET POST POST-bulk PATCH DELETE → hub_reposiciones ✅`);
