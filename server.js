@@ -871,7 +871,60 @@ app.get('/api/admin/form-submissions', requireAuth, requireAdmin, async (req, re
         res.json(submissions);
     } catch (e) { res.status(500).json({ error: 'Error obteniendo formularios' }); }
 });
+/ GET /api/nebula/umbrales — leer umbrales actuales (autenticado)
+app.get('/api/nebula/umbrales', verificarToken, async (req, res) => {
+    try {
+        const doc = await db.collection('hub_nebula_config').findOne({ _id: 'umbrales' });
+        if (!doc) {
+            // Si no existe, retornar defaults para que el frontend los cache
+            return res.json({
+                ok: true,
+                umbrales: {
+                    cpu:   { warning: 70, danger: 90 },
+                    ram:   { warning: 70, danger: 90 },
+                    disco: { warning: 75, danger: 90 },
+                },
+                source: 'default',
+            });
+        }
+        res.json({ ok: true, umbrales: doc.umbrales, source: 'db' });
+    } catch (err) {
+        console.error('[FEAT-003] GET /api/nebula/umbrales:', err.message);
+        res.status(500).json({ ok: false, error: 'Error leyendo umbrales' });
+    }
+});
 
+// PATCH /api/nebula/umbrales — guardar umbrales (solo ADMIN o GERENTE_OPERACIONES)
+app.patch('/api/nebula/umbrales', verificarToken, async (req, res) => {
+    const { rol } = req.usuario;
+    if (!['ADMIN', 'GERENTE_OPERACIONES'].includes(rol)) {
+        return res.status(403).json({ ok: false, error: 'Sin permiso para modificar umbrales' });
+    }
+    try {
+        const { umbrales } = req.body;
+        // Validación básica: cada métrica tiene warning < danger, ambos 0-100
+        const metricas = ['cpu', 'ram', 'disco'];
+        for (const m of metricas) {
+            if (!umbrales?.[m]) return res.status(400).json({ ok: false, error: `Falta métrica: ${m}` });
+            const { warning, danger } = umbrales[m];
+            if (typeof warning !== 'number' || typeof danger !== 'number')
+                return res.status(400).json({ ok: false, error: `${m}: valores deben ser números` });
+            if (warning < 0 || warning > 100 || danger < 0 || danger > 100)
+                return res.status(400).json({ ok: false, error: `${m}: valores deben estar entre 0 y 100` });
+            if (warning >= danger)
+                return res.status(400).json({ ok: false, error: `${m}: warning debe ser menor que danger` });
+        }
+        await db.collection('hub_nebula_config').updateOne(
+            { _id: 'umbrales' },
+            { $set: { umbrales, updatedBy: req.usuario.username, updatedAt: new Date() } },
+            { upsert: true }
+        );
+        res.json({ ok: true, message: 'Umbrales guardados' });
+    } catch (err) {
+        console.error('[FEAT-003] PATCH /api/nebula/umbrales:', err.message);
+        res.status(500).json({ ok: false, error: 'Error guardando umbrales' });
+    }
+});
 // ================================================================
 // NOTIFICACIONES SSE
 // ================================================================
