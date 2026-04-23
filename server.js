@@ -1,5 +1,5 @@
 // ================================================================
-// MYG TELECOM — API SERVER v4.5.6
+// MYG TELECOM — API SERVER v4.5.7
 // Render (Node.js) + MongoDB Atlas
 //
 // CHANGELOG:
@@ -2403,7 +2403,220 @@ app.patch('/api/hc/usuarios/aplicar-movimiento', requireAuth, async (req, res) =
         res.json({ ok: true, matched: result.matchedCount, modified: result.modifiedCount });
     } catch (err) { console.error('PATCH /api/hc/usuarios/aplicar-movimiento error:', err); res.status(500).json({ error: err.message }); }
 });
+// ================================================================
+// [FEAT-005] GET /api/hc/validar-consistencia — v4.5.7
+// Compara hub_hc_usuarios vs rh_movimientos y detecta:
+//   A) sinMatchEnHC        — ATTUID del movimiento RH no existe en HC
+//   B) bajasPendientesEnRH — Baja RH pendiente pero HC sigue ACTIVO
+//   C) attuidsDuplicados   — mismo ATTUID repetido en HC
+//   D) camposFaltantes     — registros HC sin PDV / PUESTO / ESTATUS
+// Parámetros: ?dias=90 (cuántos días hacia atrás analizar movimientos RH)
+// Roles: ADMIN, GERENTE_OPERACIONES, COORDINADOR, GERENTE_RH, ANALISTA_RH
+// Autor: IT Director | Sesion 15 | 2026-04-23
+// ================================================================
+app.get('/api/hc/validar-consistencia', requireAuth, async (req, res) => {
+    const ROLES_PERMITIDOS_FEAT005 = [
+        'ADMIN', 'GERENTE_OPERACIONES', 'COORDINADOR', 'GERENTE_RH', 'ANALISTA_RH',
+    ];
+    if (!ROLES_PERMITIDOS_FEAT005.includes(req.usuario.rol))
+        return res.status(403).json({ error: 'Sin permisos para ejecutar validación HC vs RH' });
 
+    try {
+        // ── Parámetros ────────────────────────────────────────────
+        const diasAtras = Math.min(Math.max(parseInt(req.query.dias) || 90, 1), 365);
+        const desde     = new Date(Date.now() - diasAtras * 24 * 3600 * 1000);
+
+        // ── 1. Cargar datos en paralelo ────────────────────────────
+        const [hcRows, movimientos] = await Promise.all([
+            db.collection('hub_hc_usuarios').find({}).toArray(),
+            db.collection('rh_movimientos')
+                .find({ createdAt: { $gte: desde } })
+                .sort({ createdAt: -1 })
+                .toArray(),
+        ]);
+
+        // ── 2. Guardia: HC vacío ───────────────────────────────────
+        if (hcRows.length === 0) {
+            return res.json({
+                ok: true,
+                resumen: {
+                    hcTotalRegistros: 0,
+                    rhMovimientosAnalizados: movimientos.length,
+                    diasAnalizados: diasAtras,
+                    totalInconsistencias: 0,
+                    estadoGeneral: 'SIN_HC',
+                    aviso: 'No hay datos de HC cargados. Sube el archivo HC primero.',
+                },
+                inconsistencias: { sinMatchEnHC: [], bajasPendientesEnRH: [], attuidsDuplicados: [], camposFaltantes: [] },
+                timestamp: new Date().toISOString(),
+            });
+        }
+
+        // ── 3. Construir índices HC (O(1) lookup) ─────────────────
+        // Normalizar ATTUID: trim + uppercase para comparación consistente
+        const hcByAttuid    = new Map();  // attuid_norm → primera fila HC
+        const hcAttuidCount = new Map();  // attuid_norm → cantidad de ocurrencias
+
+        for (const row of hcRows) {
+            const attuid = (row.ATTUID || row.attuid || '').trim().toUpperCase();
+            if (!attuid) continue;
+            hcAttuidCount.set(attuid, (hcAttuidCount.get(attuid) || 0) + 1);
+            if (!hcByAttuid.has(attuid)) hcByAttuid.set(attuid, row);
+        }
+
+        // ── 4. Contenedor de inconsistencias ──────────────────────
+        const inconsistencias = {
+            sinMatchEnHC:        [],
+            bajasPendientesEnRH: [],
+            attuidsDuplicados:   [],
+            camposFaltantes:     [],
+        };
+
+        // ── A) ATTUIDs duplicados en HC ────────────────────────────
+        for (const [attuid, count] of hcAttuidCount.entries()) {
+            if (count > 1) {
+                inconsistencias.attuidsDuplicados.push({
+                    attuid,
+                    ocurrencias: count,
+                    severidad: 'MEDIA',
+                    mensaje: `ATTUID "${attuid}" aparece ${count} veces en el HC — posible duplicado de carga`,
+                    accionRecomendada: 'Revisar y eliminar duplicados en el archivo HC antes del próximo upload',
+                });
+            }
+        }
+
+        // ── B) HC rows con campos críticos vacíos ─────────────────
+        // Soporte para variantes de nombre de campo (legacy vs nuevo)
+        const getCampo = (row, ...keys) => {
+            for (const k of keys) {
+                const v = row[k];
+                if (v !== undefined && v !== null && String(v).trim() !== '') return String(v).trim();
+            }
+            return '';
+        };
+
+        for (const row of hcRows) {
+            const attuid = getCampo(row, 'ATTUID', 'attuid');
+            const nombre = getCampo(row, 'NOMBRE', 'Nombre Completo', 'nombre');
+            const faltantes = [];
+
+            if (!getCampo(row, 'PDV', 'NOMBRE PDV', 'pdv'))       faltantes.push('PDV');
+            if (!getCampo(row, 'PUESTO', 'Puesto', 'puesto'))      faltantes.push('PUESTO');
+            if (!getCampo(row, 'ESTATUS', 'estatus', 'Status'))    faltantes.push('ESTATUS');
+
+            if (faltantes.length > 0) {
+                inconsistencias.camposFaltantes.push({
+                    attuid: attuid || '(sin ATTUID)',
+                    nombre: nombre || '(sin nombre)',
+                    camposFaltantes: faltantes,
+                    severidad: faltantes.length >= 2 ? 'ALTA' : 'BAJA',
+                    mensaje: `Faltan campos críticos: ${faltantes.join(', ')}`,
+                    accionRecomendada: 'Actualizar el archivo HC con los campos faltantes y recargar',
+                });
+            }
+        }
+
+        // ── C & D) Analizar movimientos RH ────────────────────────
+        for (const mov of movimientos) {
+            const empleado = mov.empleado || {};
+            const attuid   = (
+                empleado.attuid         ||
+                empleado.ATTUID         ||
+                empleado.numero_empleado ||
+                ''
+            ).trim().toUpperCase();
+
+            const nombre = [empleado.nombre, empleado.apellido_paterno, empleado.apellido_materno]
+                .filter(Boolean).join(' ') || '(sin nombre)';
+
+            // C) Sin match en HC
+            if (attuid && !hcByAttuid.has(attuid)) {
+                inconsistencias.sinMatchEnHC.push({
+                    movimientoId: String(mov._id),
+                    attuid,
+                    nombre,
+                    tipo:         mov.tipo,
+                    estado:       mov.estado || 'desconocido',
+                    fecha:        mov.createdAt,
+                    creadoPor:    mov.creadoPor || '',
+                    severidad:    'ALTA',
+                    mensaje:      `Movimiento ${mov.tipo} referencia ATTUID "${attuid}" que no existe en el HC actual`,
+                    accionRecomendada: 'Verificar ATTUID o recargar HC si el colaborador ya fue dado de alta',
+                });
+                continue; // No hacer más checks sobre este movimiento
+            }
+
+            // D) Bajas pendientes sin aplicar en HC
+            if (mov.tipo === 'BAJA' && mov.estado === 'pendiente' && attuid) {
+                const hcRow = hcByAttuid.get(attuid);
+                if (hcRow) {
+                    const estatus = getCampo(hcRow, 'ESTATUS', 'estatus', 'Status').toUpperCase();
+                    if (estatus !== 'BAJA' && estatus !== 'INACTIVO') {
+                        inconsistencias.bajasPendientesEnRH.push({
+                            movimientoId: String(mov._id),
+                            attuid,
+                            nombre,
+                            estatusHC:      estatus || 'ACTIVO',
+                            fechaMovimiento: mov.createdAt,
+                            diasPendiente:  Math.floor((Date.now() - new Date(mov.createdAt).getTime()) / 86400000),
+                            severidad:      'ALTA',
+                            mensaje:        `Baja RH pendiente desde hace ${Math.floor((Date.now() - new Date(mov.createdAt).getTime()) / 86400000)} días, HC sigue como "${estatus || 'ACTIVO'}"`,
+                            accionRecomendada: 'Aprobar el movimiento RH o aplicar manualmente en el módulo HC',
+                        });
+                    }
+                }
+            }
+        }
+
+        // ── 5. Resumen ejecutivo ───────────────────────────────────
+        const totalInconsistencias =
+            inconsistencias.sinMatchEnHC.length        +
+            inconsistencias.bajasPendientesEnRH.length +
+            inconsistencias.attuidsDuplicados.length   +
+            inconsistencias.camposFaltantes.length;
+
+        const altasSeveridad =
+            inconsistencias.sinMatchEnHC.filter(i => i.severidad === 'ALTA').length        +
+            inconsistencias.bajasPendientesEnRH.filter(i => i.severidad === 'ALTA').length +
+            inconsistencias.camposFaltantes.filter(i => i.severidad === 'ALTA').length;
+
+        const estadoGeneral =
+            altasSeveridad > 0  ? 'CRITICO'    :
+            totalInconsistencias > 0 ? 'ADVERTENCIA' : 'OK';
+
+        const resumen = {
+            hcTotalRegistros:        hcRows.length,
+            rhMovimientosAnalizados: movimientos.length,
+            diasAnalizados:          diasAtras,
+            totalInconsistencias,
+            altaSeveridad:           altasSeveridad,
+            sinMatchEnHC:            inconsistencias.sinMatchEnHC.length,
+            bajasPendientesEnRH:     inconsistencias.bajasPendientesEnRH.length,
+            attuidsDuplicados:       inconsistencias.attuidsDuplicados.length,
+            camposFaltantes:         inconsistencias.camposFaltantes.length,
+            estadoGeneral,
+        };
+
+        console.log(
+            `[FEAT-005] Validación HC vs RH — estado=${estadoGeneral} | ` +
+            `inconsistencias=${totalInconsistencias} | hc=${hcRows.length} | rh=${movimientos.length} | ` +
+            `usuario=${req.usuario.username}`
+        );
+
+        // Cache-Control corto: 60s (el reporte puede cambiar si se aprueba una baja)
+        res.set('Cache-Control', 'private, max-age=60');
+        res.json({
+            ok: true,
+            resumen,
+            inconsistencias,
+            timestamp: new Date().toISOString(),
+        });
+
+    } catch (err) {
+        console.error('[FEAT-005] Error en /api/hc/validar-consistencia:', err.message);
+        res.status(500).json({ error: 'Error ejecutando validación de consistencia HC vs RH' });
+    }
+});
 // ================================================================
 // START
 // ================================================================
@@ -2415,7 +2628,7 @@ async function start() {
         app.use((err, req, res, next) => { console.error('Error no manejado:', err); res.status(500).json({ error: 'Error interno' }); });
 
         app.listen(PORT, () => {
-            console.log(`MYG API v4.5.6 en puerto ${PORT}`);
+            console.log(`MYG API v4.5.7 en puerto ${PORT}`);
             console.log(`IA Minutas: Groq=${!!process.env.GROQ_API_KEY ? '✅' : '❌'} | Gemini=${!!process.env.GEMINI_API_KEY ? '✅' : '❌'} | Local=✅`);
             console.log(`Activos:      GET(limit) POST(insertMany) PATCH(edit) DELETE(permisos) BULK(500max) ✅`);
             console.log(`Reposiciones: GET POST POST-bulk PATCH DELETE → hub_reposiciones ✅`);
@@ -2429,6 +2642,7 @@ async function start() {
             console.log(`Email RH:     Email fresco desde MongoDB (BUG-004 ✅ v4.5.3)`);
             console.log(`Paginación:   GET /api/rh/movimientos page+limit+filtros (BUG-005 ✅ v4.5.4)`);
             console.log(`Sheet IDs:    GET /api/config/sheets autenticado (MAINT-002 ✅ v4.5.6) — ${_sheetIdsConfigured.length}/${Object.keys(SHEET_ENV_MAP).length} configurados`);
+            console.log(`HC Validación: GET /api/hc/validar-consistencia (FEAT-005 ✅ v4.5.7)`);
         });
     } catch (err) {
         console.error('Error iniciando:', err);
