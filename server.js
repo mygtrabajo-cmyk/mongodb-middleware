@@ -1,5 +1,5 @@
 // ================================================================
-// MYG TELECOM — API SERVER v4.5.7
+// MYG TELECOM — API SERVER v4.6.0
 // Render (Node.js) + MongoDB Atlas
 //
 // CHANGELOG:
@@ -33,6 +33,19 @@
 //                         SHEET_ID_REPOSICIONES, SHEET_ID_TICKETS_DASHBOARD, SHEET_ID_TICKETS_CONTEO,
 //                         SHEET_ID_RH_POC, SHEET_ID_RH_HISTORICO, SHEET_ID_SEGUIMIENTO_ALTAS,
 //                         SHEET_ID_HEADCOUNT
+//   v4.5.7: [FEAT-005] GET /api/hc/validar-consistencia
+//   v4.6.0: [FEAT-004] Resumen semanal por email (scheduler nativo, sin deps)
+//                      GET  /api/admin/weekly-report/status    → estado del scheduler
+//                      POST /api/admin/weekly-report/enviar-ahora → disparo manual
+//                      scheduleWeeklyReport() en connectDB() post-conexión
+//                      Funciones: calcularResumenSemanal, _formatearHtmlResumenSemanal,
+//                                 enviarResumenSemanal, scheduleWeeklyReport
+//                      Nuevas env vars (todas opcionales, opt-in explícito):
+//                        WEEKLY_REPORT_ENABLED=true
+//                        WEEKLY_REPORT_RECIPIENTS=a@b.com,c@d.com
+//                        WEEKLY_REPORT_DAY=1   (0=Dom…6=Sáb, default: 1=Lunes)
+//                        WEEKLY_REPORT_HOUR=8  (hora MX 0-23, default: 8am)
+//                        WEEKLY_REPORT_TZ_OFFSET=-6 (offset UTC, default: -6=MX)
 // ================================================================
 
 require('dotenv').config();
@@ -63,9 +76,6 @@ const ExcelJS   = require('exceljs');
 const nebulaRoutes = require('./routes/nebula_agents');
 
 // ── [MAINT-002] Mapa de env vars → claves de Sheet ID ─────────
-// Todos OPCIONALES: si no están en .env, el endpoint retorna
-// 'missing' y el cliente usa config.js local como fallback.
-// Para añadir un nuevo sheet: agregar aquí + en Render env vars.
 const SHEET_ENV_MAP = {
     rh:               'SHEET_ID_RH',
     correos:          'SHEET_ID_CORREOS',
@@ -82,7 +92,6 @@ const SHEET_ENV_MAP = {
     headcount:        'SHEET_ID_HEADCOUNT',
 };
 
-// Log de diagnóstico al arranque (sin exponer los IDs)
 const _sheetIdsConfigured = Object.entries(SHEET_ENV_MAP)
     .filter(([, envVar]) => process.env[envVar]?.trim())
     .map(([key]) => key);
@@ -298,6 +307,485 @@ async function enviarEmailMovimientoRH(movimiento, destinatario) {
 }
 
 // ================================================================
+// [FEAT-004] RESUMEN SEMANAL POR EMAIL — v4.6.0
+// Scheduler nativo (setTimeout recursivo) — sin dependencias adicionales.
+//
+// ZERO DOWNTIME: si WEEKLY_REPORT_ENABLED != 'true' o SMTP no está
+// configurado, NADA de este bloque se activa. Completamente inerte.
+//
+// Env vars (todas opcionales con defaults seguros):
+//   WEEKLY_REPORT_ENABLED=true|false    (default: false — opt-in explícito)
+//   WEEKLY_REPORT_RECIPIENTS=a@b.com,c  (vacío = auto-detect ADMIN+GERENTE con email)
+//   WEEKLY_REPORT_DAY=1                 (0=Dom … 6=Sáb; default: 1=Lunes)
+//   WEEKLY_REPORT_HOUR=8                (hora local MX 0–23; default: 8am)
+//   WEEKLY_REPORT_TZ_OFFSET=-6          (offset UTC de la zona; default: -6 = MX)
+// ================================================================
+
+/**
+ * Calcula los ms hasta la próxima ejecución programada.
+ * @param {number} targetDay     - día UTC (0=Dom … 6=Sáb)
+ * @param {number} targetHourUTC - hora en UTC ya ajustada por timezone
+ * @returns {number} milisegundos hasta la próxima ejecución (mínimo 60 000 ms)
+ */
+function _getNextReportMs(targetDay, targetHourUTC) {
+    const now  = new Date();
+    const next = new Date(now);
+    next.setUTCHours(targetHourUTC, 0, 0, 0);
+
+    const curDay    = now.getUTCDay();
+    let   daysAhead = (targetDay - curDay + 7) % 7;
+
+    // Si hoy es el día pero la hora ya pasó → siguiente semana
+    if (daysAhead === 0 && now.getTime() >= next.getTime()) daysAhead = 7;
+    next.setUTCDate(next.getUTCDate() + daysAhead);
+
+    return Math.max(next.getTime() - Date.now(), 60_000); // Mínimo 1 min
+}
+
+/**
+ * Recoge datos de los últimos N días para armar el resumen semanal.
+ * Usa Promise.allSettled → tolerante a fallos individuales de colección.
+ * @param {number} diasAtras - ventana de análisis (default: 7)
+ * @returns {object} resumen estructurado
+ */
+async function calcularResumenSemanal(diasAtras = 7) {
+    const desde             = new Date(Date.now() - diasAtras * 24 * 3600 * 1000);
+    const ahora             = new Date();
+    const proximaSemanaFin  = new Date(ahora.getTime() + 7 * 24 * 3600 * 1000);
+
+    const [
+        rhMovsResult,
+        hcMetaResult,
+        hcEstatusResult,
+        reunionesProxResult,
+        reunionesRealizadasResult,
+        activosResult,
+        boletinesResult,
+        minutasResult,
+        notifResult,
+        usuariosResult,
+    ] = await Promise.allSettled([
+        // RH: desglose por tipo + pendientes
+        db.collection('rh_movimientos').aggregate([
+            { $match: { createdAt: { $gte: desde } } },
+            { $group: {
+                _id:        '$tipo',
+                count:      { $sum: 1 },
+                pendientes: { $sum: { $cond: [{ $eq: ['$estado', 'pendiente'] }, 1, 0] } },
+            }},
+        ]).toArray(),
+
+        // HC: última carga
+        db.collection('hub_hc_meta').findOne({ _type: 'hc_usuarios' }),
+
+        // HC: distribución por estatus
+        db.collection('hub_hc_usuarios').aggregate([
+            { $group: {
+                _id:   { $toUpper: { $ifNull: ['$ESTATUS', 'DESCONOCIDO'] } },
+                count: { $sum: 1 },
+            }},
+        ]).toArray(),
+
+        // Reuniones programadas próxima semana (sin canceladas)
+        db.collection('hub_reuniones').find({
+            date:   {
+                $gte: ahora.toISOString().split('T')[0],
+                $lte: proximaSemanaFin.toISOString().split('T')[0],
+            },
+            status: { $ne: 'cancelada' },
+        }).sort({ date: 1 }).limit(8)
+          .project({ title: 1, date: 1, time: 1, organizer: 1 }).toArray(),
+
+        // Reuniones completadas esta semana
+        db.collection('hub_reuniones').countDocuments({
+            date:   {
+                $gte: desde.toISOString().split('T')[0],
+                $lt:  ahora.toISOString().split('T')[0],
+            },
+            status: { $in: ['completada', 'realizada', 'finalizada'] },
+        }),
+
+        // Activos registrados esta semana
+        db.collection('activos_movimientos').countDocuments({ createdAt: { $gte: desde } }),
+
+        // Boletines subidos esta semana
+        db.collection('hub_boletines').countDocuments({ createdAt: { $gte: desde } }),
+
+        // Minutas generadas esta semana
+        db.collection('hub_minutas').countDocuments({ createdAt: { $gte: desde } }),
+
+        // Notificaciones no leídas (indicador de salud)
+        db.collection('notificaciones').countDocuments({ leida: false }),
+
+        // Usuarios activos en sistema
+        db.collection('users').countDocuments({ activo: true }),
+    ]);
+
+    // Helper seguro para extraer valor de settled result
+    const val = (r, fallback = null) => r.status === 'fulfilled' ? r.value : fallback;
+
+    // ── Procesar RH ──────────────────────────────────────────────
+    const rhMovs    = val(rhMovsResult, []);
+    const rhPorTipo = {};
+    let   rhPendientes = 0;
+    for (const g of rhMovs) {
+        rhPorTipo[g._id || 'OTRO'] = g.count;
+        rhPendientes += g.pendientes || 0;
+    }
+    const rhTotal = Object.values(rhPorTipo).reduce((a, b) => a + b, 0);
+
+    // ── Procesar HC ──────────────────────────────────────────────
+    const hcMeta    = val(hcMetaResult);
+    const hcEstatus = val(hcEstatusResult, []);
+    const hcCounts  = {};
+    for (const g of hcEstatus) hcCounts[g._id] = g.count;
+    const hcActivos = hcCounts['ACTIVO'] || hcCounts['ALTA']     || 0;
+    const hcBajas   = hcCounts['BAJA']   || hcCounts['INACTIVO'] || 0;
+    const hcTotal   = Object.values(hcCounts).reduce((a, b) => a + b, 0);
+
+    return {
+        periodo: {
+            desde:    desde.toLocaleDateString('es-MX', { timeZone: 'America/Mexico_City' }),
+            hasta:    ahora.toLocaleDateString('es-MX',  { timeZone: 'America/Mexico_City' }),
+            diasAtras,
+        },
+        rh:  { total: rhTotal, porTipo: rhPorTipo, pendientes: rhPendientes },
+        hc:  {
+            total: hcTotal, activos: hcActivos, bajas: hcBajas,
+            ultimaCarga:   hcMeta?.uploadedAt || null,
+            ultimaArchivo: hcMeta?.filename   || null,
+            ultimaPor:     hcMeta?.uploadedBy || null,
+        },
+        reuniones: {
+            programadasProximaSemana: val(reunionesProxResult,        []),
+            realizadasEstaSemana:     val(reunionesRealizadasResult,   0),
+        },
+        activosRegistrados:    val(activosResult,   0),
+        boletinesSubidos:      val(boletinesResult, 0),
+        minutasGeneradas:      val(minutasResult,   0),
+        notificacionesSinLeer: val(notifResult,     0),
+        usuariosActivos:       val(usuariosResult,  0),
+        generadoEn: ahora.toISOString(),
+    };
+}
+
+/**
+ * Genera el HTML del email de resumen semanal.
+ * @param {object} resumen - salida de calcularResumenSemanal()
+ * @returns {string} HTML completo del email
+ */
+function _formatearHtmlResumenSemanal(resumen) {
+    const {
+        periodo, rh, hc, reuniones,
+        activosRegistrados, boletinesSubidos, minutasGeneradas,
+        notificacionesSinLeer, usuariosActivos,
+    } = resumen;
+
+    const RH_LABELS = {
+        ALTA:             '➕ Altas',
+        ALTA_UDP:         '👪 Altas UDP',
+        BAJA:             '➖ Bajas',
+        CAMBIO_PDV:       '🏪 Cambios de PDV',
+        CAMBIO_PUESTO:    '📋 Cambios de Puesto',
+        CAMBIO_COMBINADO: '🔀 Cambios Combinados',
+    };
+
+    // ── Sección RH ───────────────────────────────────────────────
+    const rhRowsHtml = Object.entries(rh.porTipo).length > 0
+        ? Object.entries(rh.porTipo).map(([tipo, count]) => `
+            <tr>
+              <td style="padding:5px 12px 5px 0;color:#6B7280;font-size:13px;">${RH_LABELS[tipo] || tipo}</td>
+              <td style="padding:5px 0;font-size:14px;font-weight:600;color:#111827;">${count}</td>
+            </tr>`).join('') +
+          `<tr style="border-top:1px solid #E5E7EB;">
+             <td style="padding:8px 12px 4px 0;font-size:13px;font-weight:700;color:#374151;">Total</td>
+             <td style="padding:8px 0 4px;font-size:15px;font-weight:700;color:#1D4ED8;">${rh.total}</td>
+           </tr>` +
+          (rh.pendientes > 0
+            ? `<tr><td colspan="2" style="padding:6px 0 0;">
+                 <span style="background:#FEF3C7;color:#92400E;padding:3px 10px;border-radius:4px;font-size:12px;font-weight:600;">
+                   ⚠️ ${rh.pendientes} movimiento(s) pendiente(s) de aprobación
+                 </span></td></tr>`
+            : '')
+        : '<tr><td colspan="2" style="padding:6px 0;color:#9CA3AF;font-size:13px;">Sin movimientos esta semana</td></tr>';
+
+    // ── Sección Reuniones ────────────────────────────────────────
+    const reunionesProxHtml = reuniones.programadasProximaSemana.length > 0
+        ? reuniones.programadasProximaSemana.slice(0, 5).map(r => `
+            <tr>
+              <td style="padding:4px 10px 4px 0;color:#6B7280;font-size:12px;white-space:nowrap;">${r.date || ''}</td>
+              <td style="padding:4px 0;font-size:12px;color:#374151;">${r.title || '(sin título)'}</td>
+            </tr>`).join('')
+        : '<tr><td colspan="2" style="padding:6px 0;color:#9CA3AF;font-size:13px;">Sin reuniones programadas para la próxima semana</td></tr>';
+
+    // ── Badge notificaciones ─────────────────────────────────────
+    const badgeNotif = notificacionesSinLeer > 10
+        ? `<span style="background:#FEF3C7;color:#92400E;padding:2px 8px;border-radius:4px;font-weight:600;font-size:12px;">${notificacionesSinLeer} sin leer</span>`
+        : `<span style="background:#D1FAE5;color:#065F46;padding:2px 8px;border-radius:4px;font-weight:600;font-size:12px;">${notificacionesSinLeer} sin leer</span>`;
+
+    const hcUltimaCargaHtml = hc.ultimaCarga
+        ? `<tr>
+             <td style="padding:4px 12px 4px 0;color:#6B7280;font-size:13px;">Última carga HC</td>
+             <td style="padding:4px 0;font-size:12px;color:#9CA3AF;">
+               ${new Date(hc.ultimaCarga).toLocaleDateString('es-MX')}
+               ${hc.ultimaPor ? `· por ${hc.ultimaPor}` : ''}
+             </td>
+           </tr>`
+        : '<tr><td colspan="2" style="padding:4px 0;color:#F87171;font-size:12px;">⚠️ Sin datos de HC cargados</td></tr>';
+
+    const ahoraStr = new Date().toLocaleString('es-MX', { timeZone: 'America/Mexico_City' });
+
+    return `<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#F3F4F6;font-family:Arial,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#F3F4F6;padding:32px 16px;">
+<tr><td align="center">
+<table width="640" cellpadding="0" cellspacing="0"
+       style="background:#FFFFFF;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,.10);">
+
+  <!-- HEADER -->
+  <tr><td style="background:linear-gradient(135deg,#1E3A5F,#3B82F6);padding:28px 32px;">
+    <h1 style="margin:0;color:#fff;font-size:22px;font-weight:700;">📊 Resumen Semanal — MYG Telecom</h1>
+    <p style="margin:6px 0 0;color:#BFDBFE;font-size:14px;">
+      Período: ${periodo.desde} → ${periodo.hasta} · Dashboard Sistemas IT
+    </p>
+  </td></tr>
+
+  <!-- KPI CARDS -->
+  <tr><td style="padding:24px 32px 8px;">
+    <table width="100%" cellpadding="0" cellspacing="0"><tr>
+      <td width="25%" style="text-align:center;padding:0 6px;">
+        <div style="background:#EFF6FF;border-radius:12px;padding:16px 6px;">
+          <p style="margin:0;font-size:30px;font-weight:700;color:#1D4ED8;">${rh.total}</p>
+          <p style="margin:4px 0 0;font-size:11px;color:#6B7280;">Movimientos RH</p>
+        </div>
+      </td>
+      <td width="25%" style="text-align:center;padding:0 6px;">
+        <div style="background:#F0FDF4;border-radius:12px;padding:16px 6px;">
+          <p style="margin:0;font-size:30px;font-weight:700;color:#15803D;">${hc.activos}</p>
+          <p style="margin:4px 0 0;font-size:11px;color:#6B7280;">HC Activos</p>
+        </div>
+      </td>
+      <td width="25%" style="text-align:center;padding:0 6px;">
+        <div style="background:#FFF7ED;border-radius:12px;padding:16px 6px;">
+          <p style="margin:0;font-size:30px;font-weight:700;color:#C2410C;">${activosRegistrados}</p>
+          <p style="margin:4px 0 0;font-size:11px;color:#6B7280;">Activos Reg.</p>
+        </div>
+      </td>
+      <td width="25%" style="text-align:center;padding:0 6px;">
+        <div style="background:#FAF5FF;border-radius:12px;padding:16px 6px;">
+          <p style="margin:0;font-size:30px;font-weight:700;color:#7C3AED;">${minutasGeneradas}</p>
+          <p style="margin:4px 0 0;font-size:11px;color:#6B7280;">Minutas</p>
+        </div>
+      </td>
+    </tr></table>
+  </td></tr>
+
+  <!-- RH DETALLE -->
+  <tr><td style="padding:20px 32px 0;">
+    <h3 style="margin:0 0 12px;color:#1E3A5F;font-size:15px;border-bottom:2px solid #EEF2FF;padding-bottom:8px;">
+      👥 Movimientos RH — Últimos ${periodo.diasAtras} días
+    </h3>
+    <table cellpadding="0" cellspacing="0" style="width:100%;">${rhRowsHtml}</table>
+  </td></tr>
+
+  <!-- HC STATUS -->
+  <tr><td style="padding:20px 32px 0;">
+    <h3 style="margin:0 0 12px;color:#1E3A5F;font-size:15px;border-bottom:2px solid #EEF2FF;padding-bottom:8px;">
+      🏢 Estado Headcount
+    </h3>
+    <table cellpadding="0" cellspacing="0" style="width:100%;">
+      <tr>
+        <td style="padding:4px 12px 4px 0;color:#6B7280;font-size:13px;">Total registros HC</td>
+        <td style="padding:4px 0;font-size:13px;font-weight:600;color:#111827;">${hc.total}</td>
+      </tr>
+      <tr>
+        <td style="padding:4px 12px 4px 0;color:#6B7280;font-size:13px;">Colaboradores activos</td>
+        <td style="padding:4px 0;font-size:13px;font-weight:600;color:#15803D;">${hc.activos}</td>
+      </tr>
+      ${hc.bajas > 0 ? `
+      <tr>
+        <td style="padding:4px 12px 4px 0;color:#6B7280;font-size:13px;">Bajas registradas</td>
+        <td style="padding:4px 0;font-size:13px;font-weight:600;color:#DC2626;">${hc.bajas}</td>
+      </tr>` : ''}
+      ${hcUltimaCargaHtml}
+    </table>
+  </td></tr>
+
+  <!-- REUNIONES PRÓXIMA SEMANA -->
+  <tr><td style="padding:20px 32px 0;">
+    <h3 style="margin:0 0 12px;color:#1E3A5F;font-size:15px;border-bottom:2px solid #EEF2FF;padding-bottom:8px;">
+      📅 Reuniones — Próxima Semana
+    </h3>
+    <table cellpadding="0" cellspacing="0" style="width:100%;">${reunionesProxHtml}</table>
+    ${reuniones.realizadasEstaSemana > 0
+      ? `<p style="margin:10px 0 0;font-size:12px;color:#6B7280;">
+           ✅ ${reuniones.realizadasEstaSemana} reunión(es) realizada(s) esta semana
+         </p>`
+      : ''}
+  </td></tr>
+
+  <!-- OTROS INDICADORES -->
+  <tr><td style="padding:20px 32px 24px;">
+    <h3 style="margin:0 0 12px;color:#1E3A5F;font-size:15px;border-bottom:2px solid #EEF2FF;padding-bottom:8px;">
+      📌 Otros Indicadores
+    </h3>
+    <table cellpadding="0" cellspacing="0" style="width:100%;">
+      <tr>
+        <td style="padding:4px 12px 4px 0;color:#6B7280;font-size:13px;">Boletines subidos</td>
+        <td style="padding:4px 0;font-size:13px;font-weight:600;">${boletinesSubidos}</td>
+      </tr>
+      <tr>
+        <td style="padding:4px 12px 4px 0;color:#6B7280;font-size:13px;">Usuarios activos en sistema</td>
+        <td style="padding:4px 0;font-size:13px;font-weight:600;">${usuariosActivos}</td>
+      </tr>
+      <tr>
+        <td style="padding:4px 12px 4px 0;color:#6B7280;font-size:13px;">Notificaciones sin leer</td>
+        <td style="padding:4px 0;">${badgeNotif}</td>
+      </tr>
+    </table>
+  </td></tr>
+
+  <!-- CTA -->
+  <tr><td style="padding:0 32px 24px;">
+    <div style="background:#EFF6FF;border-left:4px solid #3B82F6;border-radius:4px;padding:12px 16px;">
+      <p style="margin:0;color:#1E40AF;font-size:13px;">
+        📌 Revisa los movimientos pendientes en la pestaña <strong>RH</strong> del Dashboard MYG.
+      </p>
+    </div>
+  </td></tr>
+
+  <!-- FOOTER -->
+  <tr><td style="background:#F9FAFB;padding:16px 32px;border-top:1px solid #E5E7EB;">
+    <p style="margin:0;color:#9CA3AF;font-size:11px;text-align:center;">
+      Dashboard MYG Telecom · Reporte automático semanal · ${ahoraStr} (MX) · v4.6.0<br>
+      Para desactivar: <code>WEEKLY_REPORT_ENABLED=false</code> en Render.
+    </p>
+  </td></tr>
+
+</table></td></tr></table>
+</body></html>`;
+}
+
+/**
+ * Orquesta la recolección de datos y el envío del reporte semanal.
+ * @param {string[]|null} recipientOverride - lista de emails para envío manual
+ * @returns {object} { ok, enviados, total, resultados, resumen } | { ok:false, reason, error }
+ */
+async function enviarResumenSemanal(recipientOverride = null) {
+    const transporter = _getTransporter();
+    if (!transporter) {
+        console.warn('[FEAT-004] enviarResumenSemanal: SMTP no configurado, skipping');
+        return { ok: false, reason: 'smtp_not_configured' };
+    }
+
+    try {
+        console.log('[FEAT-004] Generando resumen semanal...');
+        const resumen = await calcularResumenSemanal(7);
+
+        // ── Determinar destinatarios ─────────────────────────────
+        let destinatarios = (recipientOverride || []).filter(Boolean);
+
+        if (!destinatarios.length) {
+            // Env var: lista fija separada por comas
+            destinatarios = (process.env.WEEKLY_REPORT_RECIPIENTS || '')
+                .split(',').map(s => s.trim()).filter(Boolean);
+        }
+
+        if (!destinatarios.length) {
+            // Auto-detect: ADMIN y GERENTE_OPERACIONES activos con email
+            const admins = await db.collection('users').find(
+                { rol: { $in: ['ADMIN', 'GERENTE_OPERACIONES'] }, activo: true, email: { $exists: true, $ne: '' } },
+                { projection: { email: 1 } }
+            ).toArray();
+            destinatarios = admins.map(u => u.email).filter(Boolean);
+        }
+
+        if (!destinatarios.length) {
+            console.warn('[FEAT-004] Sin destinatarios. Configura WEEKLY_REPORT_RECIPIENTS o agrega email a usuarios ADMIN/GERENTE.');
+            return { ok: false, reason: 'no_recipients' };
+        }
+
+        const html    = _formatearHtmlResumenSemanal(resumen);
+        const subject = `[MYG] Resumen Semanal ${resumen.periodo.desde} – ${resumen.periodo.hasta}`;
+
+        // Enviar individualmente (no exponer lista en To:)
+        const resultados = [];
+        for (const dest of destinatarios) {
+            try {
+                await transporter.sendMail({
+                    from:    `"MYG Dashboard" <${process.env.SMTP_USER}>`,
+                    to:      dest,
+                    subject,
+                    html,
+                });
+                console.log(`[FEAT-004] ✅ Enviado a ${dest}`);
+                resultados.push({ dest, ok: true });
+            } catch (mailErr) {
+                console.error(`[FEAT-004] ❌ Error enviando a ${dest}:`, mailErr.message);
+                resultados.push({ dest, ok: false, error: mailErr.message });
+            }
+        }
+
+        const enviados = resultados.filter(r => r.ok).length;
+        console.log(`[FEAT-004] Reporte: ${enviados}/${destinatarios.length} enviados`);
+        return { ok: true, enviados, total: destinatarios.length, resultados, resumen };
+
+    } catch (err) {
+        console.error('[FEAT-004] Error generando resumen semanal:', err.message);
+        return { ok: false, error: err.message };
+    }
+}
+
+// Referencias al timer activo (permite inspección en endpoint de status)
+let _weeklyReportTimer    = null;
+let _weeklyReportNextDate = null; // ISO string de la próxima ejecución
+
+/**
+ * Programa el próximo envío usando setTimeout recursivo.
+ * Tolerante a fallos — siempre se reprograma en el finally.
+ * No hace nada si WEEKLY_REPORT_ENABLED != 'true' o SMTP no configurado.
+ */
+function scheduleWeeklyReport() {
+    if (process.env.WEEKLY_REPORT_ENABLED !== 'true') {
+        console.log('[FEAT-004] Reporte semanal desactivado (WEEKLY_REPORT_ENABLED != "true")');
+        return;
+    }
+    if (!_getTransporter()) {
+        console.warn('[FEAT-004] SMTP no configurado — reporte semanal no se programará');
+        return;
+    }
+
+    const configDay    = Math.min(Math.max(parseInt(process.env.WEEKLY_REPORT_DAY  || '1', 10), 0), 6);
+    const configHourMX = Math.min(Math.max(parseInt(process.env.WEEKLY_REPORT_HOUR || '8', 10), 0), 23);
+    const tzOffset     = parseInt(process.env.WEEKLY_REPORT_TZ_OFFSET || '-6', 10);
+    const hourUTC      = ((configHourMX - tzOffset) % 24 + 24) % 24;
+
+    const delayMs  = _getNextReportMs(configDay, hourUTC);
+    const nextDate = new Date(Date.now() + delayMs);
+    _weeklyReportNextDate = nextDate.toISOString();
+
+    const nextStr  = nextDate.toLocaleString('es-MX', { timeZone: 'America/Mexico_City' });
+    const horasR   = Math.floor(delayMs / 3600000);
+    const minsR    = Math.round((delayMs % 3600000) / 60000);
+
+    console.log(`[FEAT-004] ✅ Próximo reporte semanal: ${nextStr} MX (en ${horasR}h ${minsR}m)`);
+
+    if (_weeklyReportTimer) clearTimeout(_weeklyReportTimer);
+
+    _weeklyReportTimer = setTimeout(async () => {
+        try {
+            console.log('[FEAT-004] ⏰ Ejecutando envío automático de reporte semanal...');
+            await enviarResumenSemanal();
+        } catch (err) {
+            console.error('[FEAT-004] Error en envío automático:', err.message);
+        } finally {
+            scheduleWeeklyReport(); // Re-programar siempre, incluso si falló
+        }
+    }, delayMs);
+}
+
+// ================================================================
 // [PERF-002] TTL index para hub_notificaciones — v4.5.3
 // ================================================================
 async function crearIndicesTTL() {
@@ -372,6 +860,10 @@ async function connectDB() {
     await idx('hub_nebula_config',   { _id: 1 },                         { name: 'nebula_config_id' });
 
     await crearIndicesTTL();
+
+    // [FEAT-004] Programar reporte semanal (opt-in via WEEKLY_REPORT_ENABLED=true)
+    // Si la env var no está o es 'false', esta llamada es completamente inerte.
+    scheduleWeeklyReport();
 
     return client;
 }
@@ -590,7 +1082,7 @@ async function logAccess(username, action, details = {}) {
 // ── HEALTH ─────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({
     status:    'ok',
-    version:   '4.5.6',
+    version:   '4.6.0',        // ← PASO 5: actualizado
     timestamp: new Date().toISOString(),
     db:        db ? 'connected' : 'disconnected',
     ia: {
@@ -601,21 +1093,6 @@ app.get('/health', (req, res) => res.json({
 
 // ================================================================
 // [MAINT-002] GET /api/config/sheets — Sheet IDs desde .env
-// Autor: IT Director | Fecha: 2026-04-22
-// Ticket: MAINT-002 | Riesgo: BAJO
-// Rollback: comentar este bloque → frontend usa config.js local sin cambios.
-//
-// Por qué requireAuth y no público:
-//   - Los IDs no son secretos criptográficos, pero exponerlos en el cliente
-//     facilita scraping de sheets y enumeración de datos internos.
-//   - Solo usuarios con sesión activa (cualquier rol) pueden acceder.
-//   - Cache-Control: private, max-age=300 → el browser cachea 5 min por tab,
-//     reduciendo round-trips sin que proxies/CDN accedan al dato.
-//
-// Respuesta:
-//   { ok, sheets: { rh, correos, ... }, source: 'env'|'none', missing: [...] }
-//   - sheets: solo los IDs configurados en .env
-//   - missing: claves no en .env (el cliente usa config.js local para ésas)
 // ================================================================
 app.get('/api/config/sheets', requireAuth, (req, res) => {
     const sheets  = {};
@@ -632,7 +1109,6 @@ app.get('/api/config/sheets', requireAuth, (req, res) => {
 
     const source = Object.keys(sheets).length > 0 ? 'env' : 'none';
 
-    // Cache privado 5 min — no CDN, no inter-usuario
     res.set('Cache-Control', 'private, max-age=300');
     res.json({ ok: true, sheets, source, missing });
 });
@@ -938,6 +1414,89 @@ app.get('/api/admin/form-submissions', requireAuth, requireAdmin, async (req, re
         const submissions = await db.collection('form_submissions').find({}).sort({ createdAt: -1 }).limit(limit).toArray();
         res.json(submissions);
     } catch (e) { res.status(500).json({ error: 'Error obteniendo formularios' }); }
+});
+
+// ================================================================
+// [FEAT-004] ENDPOINTS Reporte Semanal — solo ADMIN
+// ================================================================
+
+/**
+ * GET /api/admin/weekly-report/status
+ * Retorna el estado actual del scheduler (solo lectura, no ejecuta nada).
+ */
+app.get('/api/admin/weekly-report/status', requireAuth, requireAdmin, (req, res) => {
+    const enabled    = process.env.WEEKLY_REPORT_ENABLED === 'true';
+    const smtpOk     = !!_getTransporter();
+    const scheduled  = !!_weeklyReportTimer;
+    const recipients = (process.env.WEEKLY_REPORT_RECIPIENTS || '')
+        .split(',').map(s => s.trim()).filter(Boolean);
+
+    res.json({
+        ok: true,
+        config: {
+            enabled,
+            smtpConfigured:  smtpOk,
+            schedulerActive: scheduled && enabled,
+            nextExecutionUtc: _weeklyReportNextDate || null,
+            nextExecutionMx:  _weeklyReportNextDate
+                ? new Date(_weeklyReportNextDate).toLocaleString('es-MX', { timeZone: 'America/Mexico_City' })
+                : null,
+            reportDay:        parseInt(process.env.WEEKLY_REPORT_DAY   || '1', 10),
+            reportHourMx:     parseInt(process.env.WEEKLY_REPORT_HOUR  || '8', 10),
+            recipientMode:    recipients.length > 0 ? 'env_list' : 'auto_detect',
+            recipientCount:   recipients.length || '(auto-detect ADMIN+GERENTE)',
+        },
+        notes: [
+            !enabled   && '⚠️  WEEKLY_REPORT_ENABLED != "true" — scheduler inactivo',
+            !smtpOk    && '⚠️  SMTP no configurado (SMTP_HOST/USER/PASS)',
+            !scheduled && enabled && smtpOk && '⚠️  Timer no programado — reiniciar servidor',
+        ].filter(Boolean),
+    });
+});
+
+/**
+ * POST /api/admin/weekly-report/enviar-ahora
+ * Disparo manual. Body opcional: { recipients: ["a@b.com"] }
+ * Si no se pasa recipients, usa la lógica de auto-detect igual que el scheduler.
+ */
+app.post('/api/admin/weekly-report/enviar-ahora', requireAuth, requireAdmin, async (req, res) => {
+    try {
+        const { recipients } = req.body || {};
+        if (recipients !== undefined && !Array.isArray(recipients))
+            return res.status(400).json({ ok: false, error: 'recipients debe ser un array de emails' });
+
+        console.log(`[FEAT-004] Envío manual disparado por ${req.usuario.username}`);
+        const resultado = await enviarResumenSemanal(recipients || null);
+
+        if (!resultado.ok) {
+            const statusCode = resultado.reason === 'smtp_not_configured' ? 503 : 400;
+            return res.status(statusCode).json(resultado);
+        }
+
+        await logAccess(req.usuario.username, 'WEEKLY_REPORT_SENT', {
+            ip:       req.ip,
+            enviados: resultado.enviados,
+            total:    resultado.total,
+        });
+
+        res.json({
+            ok:        true,
+            message:   `Reporte enviado a ${resultado.enviados} de ${resultado.total} destinatario(s)`,
+            enviados:  resultado.enviados,
+            total:     resultado.total,
+            resultados: resultado.resultados,
+            resumen: {
+                periodo:            resultado.resumen?.periodo,
+                rhMovimientos:      resultado.resumen?.rh?.total,
+                hcActivos:          resultado.resumen?.hc?.activos,
+                activosRegistrados: resultado.resumen?.activosRegistrados,
+                minutasGeneradas:   resultado.resumen?.minutasGeneradas,
+            },
+        });
+    } catch (err) {
+        console.error('[FEAT-004] Error en /enviar-ahora:', err.message);
+        res.status(500).json({ ok: false, error: 'Error enviando reporte semanal' });
+    }
 });
 
 // ── Nebula Umbrales ─────────────────────────────────────────────
@@ -2403,16 +2962,9 @@ app.patch('/api/hc/usuarios/aplicar-movimiento', requireAuth, async (req, res) =
         res.json({ ok: true, matched: result.matchedCount, modified: result.modifiedCount });
     } catch (err) { console.error('PATCH /api/hc/usuarios/aplicar-movimiento error:', err); res.status(500).json({ error: err.message }); }
 });
+
 // ================================================================
 // [FEAT-005] GET /api/hc/validar-consistencia — v4.5.7
-// Compara hub_hc_usuarios vs rh_movimientos y detecta:
-//   A) sinMatchEnHC        — ATTUID del movimiento RH no existe en HC
-//   B) bajasPendientesEnRH — Baja RH pendiente pero HC sigue ACTIVO
-//   C) attuidsDuplicados   — mismo ATTUID repetido en HC
-//   D) camposFaltantes     — registros HC sin PDV / PUESTO / ESTATUS
-// Parámetros: ?dias=90 (cuántos días hacia atrás analizar movimientos RH)
-// Roles: ADMIN, GERENTE_OPERACIONES, COORDINADOR, GERENTE_RH, ANALISTA_RH
-// Autor: IT Director | Sesion 15 | 2026-04-23
 // ================================================================
 app.get('/api/hc/validar-consistencia', requireAuth, async (req, res) => {
     const ROLES_PERMITIDOS_FEAT005 = [
@@ -2422,11 +2974,9 @@ app.get('/api/hc/validar-consistencia', requireAuth, async (req, res) => {
         return res.status(403).json({ error: 'Sin permisos para ejecutar validación HC vs RH' });
 
     try {
-        // ── Parámetros ────────────────────────────────────────────
         const diasAtras = Math.min(Math.max(parseInt(req.query.dias) || 90, 1), 365);
         const desde     = new Date(Date.now() - diasAtras * 24 * 3600 * 1000);
 
-        // ── 1. Cargar datos en paralelo ────────────────────────────
         const [hcRows, movimientos] = await Promise.all([
             db.collection('hub_hc_usuarios').find({}).toArray(),
             db.collection('rh_movimientos')
@@ -2435,7 +2985,6 @@ app.get('/api/hc/validar-consistencia', requireAuth, async (req, res) => {
                 .toArray(),
         ]);
 
-        // ── 2. Guardia: HC vacío ───────────────────────────────────
         if (hcRows.length === 0) {
             return res.json({
                 ok: true,
@@ -2452,10 +3001,8 @@ app.get('/api/hc/validar-consistencia', requireAuth, async (req, res) => {
             });
         }
 
-        // ── 3. Construir índices HC (O(1) lookup) ─────────────────
-        // Normalizar ATTUID: trim + uppercase para comparación consistente
-        const hcByAttuid    = new Map();  // attuid_norm → primera fila HC
-        const hcAttuidCount = new Map();  // attuid_norm → cantidad de ocurrencias
+        const hcByAttuid    = new Map();
+        const hcAttuidCount = new Map();
 
         for (const row of hcRows) {
             const attuid = (row.ATTUID || row.attuid || '').trim().toUpperCase();
@@ -2464,7 +3011,6 @@ app.get('/api/hc/validar-consistencia', requireAuth, async (req, res) => {
             if (!hcByAttuid.has(attuid)) hcByAttuid.set(attuid, row);
         }
 
-        // ── 4. Contenedor de inconsistencias ──────────────────────
         const inconsistencias = {
             sinMatchEnHC:        [],
             bajasPendientesEnRH: [],
@@ -2472,21 +3018,16 @@ app.get('/api/hc/validar-consistencia', requireAuth, async (req, res) => {
             camposFaltantes:     [],
         };
 
-        // ── A) ATTUIDs duplicados en HC ────────────────────────────
         for (const [attuid, count] of hcAttuidCount.entries()) {
             if (count > 1) {
                 inconsistencias.attuidsDuplicados.push({
-                    attuid,
-                    ocurrencias: count,
-                    severidad: 'MEDIA',
+                    attuid, ocurrencias: count, severidad: 'MEDIA',
                     mensaje: `ATTUID "${attuid}" aparece ${count} veces en el HC — posible duplicado de carga`,
                     accionRecomendada: 'Revisar y eliminar duplicados en el archivo HC antes del próximo upload',
                 });
             }
         }
 
-        // ── B) HC rows con campos críticos vacíos ─────────────────
-        // Soporte para variantes de nombre de campo (legacy vs nuevo)
         const getCampo = (row, ...keys) => {
             for (const k of keys) {
                 const v = row[k];
@@ -2499,68 +3040,47 @@ app.get('/api/hc/validar-consistencia', requireAuth, async (req, res) => {
             const attuid = getCampo(row, 'ATTUID', 'attuid');
             const nombre = getCampo(row, 'NOMBRE', 'Nombre Completo', 'nombre');
             const faltantes = [];
-
             if (!getCampo(row, 'PDV', 'NOMBRE PDV', 'pdv'))       faltantes.push('PDV');
             if (!getCampo(row, 'PUESTO', 'Puesto', 'puesto'))      faltantes.push('PUESTO');
             if (!getCampo(row, 'ESTATUS', 'estatus', 'Status'))    faltantes.push('ESTATUS');
-
             if (faltantes.length > 0) {
                 inconsistencias.camposFaltantes.push({
-                    attuid: attuid || '(sin ATTUID)',
-                    nombre: nombre || '(sin nombre)',
-                    camposFaltantes: faltantes,
-                    severidad: faltantes.length >= 2 ? 'ALTA' : 'BAJA',
+                    attuid: attuid || '(sin ATTUID)', nombre: nombre || '(sin nombre)',
+                    camposFaltantes: faltantes, severidad: faltantes.length >= 2 ? 'ALTA' : 'BAJA',
                     mensaje: `Faltan campos críticos: ${faltantes.join(', ')}`,
                     accionRecomendada: 'Actualizar el archivo HC con los campos faltantes y recargar',
                 });
             }
         }
 
-        // ── C & D) Analizar movimientos RH ────────────────────────
         for (const mov of movimientos) {
             const empleado = mov.empleado || {};
-            const attuid   = (
-                empleado.attuid         ||
-                empleado.ATTUID         ||
-                empleado.numero_empleado ||
-                ''
-            ).trim().toUpperCase();
+            const attuid   = (empleado.attuid || empleado.ATTUID || empleado.numero_empleado || '').trim().toUpperCase();
+            const nombre   = [empleado.nombre, empleado.apellido_paterno, empleado.apellido_materno].filter(Boolean).join(' ') || '(sin nombre)';
 
-            const nombre = [empleado.nombre, empleado.apellido_paterno, empleado.apellido_materno]
-                .filter(Boolean).join(' ') || '(sin nombre)';
-
-            // C) Sin match en HC
             if (attuid && !hcByAttuid.has(attuid)) {
                 inconsistencias.sinMatchEnHC.push({
-                    movimientoId: String(mov._id),
-                    attuid,
-                    nombre,
-                    tipo:         mov.tipo,
-                    estado:       mov.estado || 'desconocido',
-                    fecha:        mov.createdAt,
-                    creadoPor:    mov.creadoPor || '',
-                    severidad:    'ALTA',
-                    mensaje:      `Movimiento ${mov.tipo} referencia ATTUID "${attuid}" que no existe en el HC actual`,
+                    movimientoId: String(mov._id), attuid, nombre,
+                    tipo: mov.tipo, estado: mov.estado || 'desconocido',
+                    fecha: mov.createdAt, creadoPor: mov.creadoPor || '',
+                    severidad: 'ALTA',
+                    mensaje: `Movimiento ${mov.tipo} referencia ATTUID "${attuid}" que no existe en el HC actual`,
                     accionRecomendada: 'Verificar ATTUID o recargar HC si el colaborador ya fue dado de alta',
                 });
-                continue; // No hacer más checks sobre este movimiento
+                continue;
             }
 
-            // D) Bajas pendientes sin aplicar en HC
             if (mov.tipo === 'BAJA' && mov.estado === 'pendiente' && attuid) {
                 const hcRow = hcByAttuid.get(attuid);
                 if (hcRow) {
                     const estatus = getCampo(hcRow, 'ESTATUS', 'estatus', 'Status').toUpperCase();
                     if (estatus !== 'BAJA' && estatus !== 'INACTIVO') {
                         inconsistencias.bajasPendientesEnRH.push({
-                            movimientoId: String(mov._id),
-                            attuid,
-                            nombre,
-                            estatusHC:      estatus || 'ACTIVO',
-                            fechaMovimiento: mov.createdAt,
-                            diasPendiente:  Math.floor((Date.now() - new Date(mov.createdAt).getTime()) / 86400000),
-                            severidad:      'ALTA',
-                            mensaje:        `Baja RH pendiente desde hace ${Math.floor((Date.now() - new Date(mov.createdAt).getTime()) / 86400000)} días, HC sigue como "${estatus || 'ACTIVO'}"`,
+                            movimientoId: String(mov._id), attuid, nombre,
+                            estatusHC: estatus || 'ACTIVO', fechaMovimiento: mov.createdAt,
+                            diasPendiente: Math.floor((Date.now() - new Date(mov.createdAt).getTime()) / 86400000),
+                            severidad: 'ALTA',
+                            mensaje: `Baja RH pendiente desde hace ${Math.floor((Date.now() - new Date(mov.createdAt).getTime()) / 86400000)} días, HC sigue como "${estatus || 'ACTIVO'}"`,
                             accionRecomendada: 'Aprobar el movimiento RH o aplicar manualmente en el módulo HC',
                         });
                     }
@@ -2568,7 +3088,6 @@ app.get('/api/hc/validar-consistencia', requireAuth, async (req, res) => {
             }
         }
 
-        // ── 5. Resumen ejecutivo ───────────────────────────────────
         const totalInconsistencias =
             inconsistencias.sinMatchEnHC.length        +
             inconsistencias.bajasPendientesEnRH.length +
@@ -2581,7 +3100,7 @@ app.get('/api/hc/validar-consistencia', requireAuth, async (req, res) => {
             inconsistencias.camposFaltantes.filter(i => i.severidad === 'ALTA').length;
 
         const estadoGeneral =
-            altasSeveridad > 0  ? 'CRITICO'    :
+            altasSeveridad > 0       ? 'CRITICO'    :
             totalInconsistencias > 0 ? 'ADVERTENCIA' : 'OK';
 
         const resumen = {
@@ -2603,20 +3122,15 @@ app.get('/api/hc/validar-consistencia', requireAuth, async (req, res) => {
             `usuario=${req.usuario.username}`
         );
 
-        // Cache-Control corto: 60s (el reporte puede cambiar si se aprueba una baja)
         res.set('Cache-Control', 'private, max-age=60');
-        res.json({
-            ok: true,
-            resumen,
-            inconsistencias,
-            timestamp: new Date().toISOString(),
-        });
+        res.json({ ok: true, resumen, inconsistencias, timestamp: new Date().toISOString() });
 
     } catch (err) {
         console.error('[FEAT-005] Error en /api/hc/validar-consistencia:', err.message);
         res.status(500).json({ error: 'Error ejecutando validación de consistencia HC vs RH' });
     }
 });
+
 // ================================================================
 // START
 // ================================================================
@@ -2628,7 +3142,7 @@ async function start() {
         app.use((err, req, res, next) => { console.error('Error no manejado:', err); res.status(500).json({ error: 'Error interno' }); });
 
         app.listen(PORT, () => {
-            console.log(`MYG API v4.5.7 en puerto ${PORT}`);
+            console.log(`MYG API v4.6.0 en puerto ${PORT}`);   // ← PASO 5: actualizado
             console.log(`IA Minutas: Groq=${!!process.env.GROQ_API_KEY ? '✅' : '❌'} | Gemini=${!!process.env.GEMINI_API_KEY ? '✅' : '❌'} | Local=✅`);
             console.log(`Activos:      GET(limit) POST(insertMany) PATCH(edit) DELETE(permisos) BULK(500max) ✅`);
             console.log(`Reposiciones: GET POST POST-bulk PATCH DELETE → hub_reposiciones ✅`);
@@ -2643,6 +3157,8 @@ async function start() {
             console.log(`Paginación:   GET /api/rh/movimientos page+limit+filtros (BUG-005 ✅ v4.5.4)`);
             console.log(`Sheet IDs:    GET /api/config/sheets autenticado (MAINT-002 ✅ v4.5.6) — ${_sheetIdsConfigured.length}/${Object.keys(SHEET_ENV_MAP).length} configurados`);
             console.log(`HC Validación: GET /api/hc/validar-consistencia (FEAT-005 ✅ v4.5.7)`);
+            // ← PASO 5: nueva línea de estado FEAT-004
+            console.log(`Reporte Semanal: ${process.env.WEEKLY_REPORT_ENABLED === 'true' ? '✅ Activo (WEEKLY_REPORT_ENABLED=true)' : '❌ Inactivo — activa con WEEKLY_REPORT_ENABLED=true'}`);
         });
     } catch (err) {
         console.error('Error iniciando:', err);
