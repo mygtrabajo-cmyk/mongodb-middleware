@@ -269,8 +269,10 @@ async function enviarEmailMovimientoRH(movimiento, destinatario) {
           <table cellpadding="0" cellspacing="0" style="width:100%;border-top:1px solid #E5E7EB;">
             <tr><td style="padding:12px 12px 4px 0;color:#6B7280;font-size:13px;">Colaborador</td>
                 <td style="padding:12px 0 4px;font-size:15px;font-weight:700;color:#111827;">${nombre}</td></tr>
-            <tr><td style="padding:4px 12px 4px 0;color:#6B7280;font-size:13px;">ATTUID / N° Empleado</td>
-                <td style="padding:4px;font-size:13px;">${attuid}</td></tr>
+            <tr><td style="padding:4px 12px 4px 0;color:#6B7280;font-size:13px;">Puesto</td>
+                <td style="padding:4px;font-size:13px;">${puesto}</td></tr>
+            <tr><td style="padding:4px 12px 4px 0;color:#6B7280;font-size:13px;">PDV</td>
+                <td style="padding:4px;font-size:13px;">${pdv}</td></tr>
             ${detallesExtra.join('')}
             <tr><td style="padding:4px 12px 4px 0;color:#6B7280;font-size:13px;">ID Solicitud</td>
                 <td style="padding:4px;font-size:11px;color:#9CA3AF;font-family:monospace;">${id}</td></tr>
