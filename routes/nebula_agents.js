@@ -115,6 +115,7 @@ const HIGH_COMMANDS = new Set([
     // Originales
     'reset_password',
     'disable_user',
+    'enable_user',         // re-activar cuenta: mismo impacto que disable_user
     'enable_bitlocker',
     'install_updates',
     'run_script',
@@ -149,6 +150,13 @@ module.exports = {
 
     async init(app, db, ssePush, requireAuth, requireAdmin) {
         await initIndexes(db);
+
+        // Middleware que acepta Agent HMAC o Bearer JWT.
+        // Usado solo en endpoints que ambos callers necesitan consultar.
+        const requireAgentOrAuth = (req, res, next) => {
+            if ((req.headers.authorization || '').startsWith('Agent ')) return next();
+            return requireAuth(req, res, next);
+        };
 
         // ═══════════════════════════════════════════════════
         // ENDPOINTS DEL AGENTE (Authorization: Agent ...)
@@ -643,26 +651,57 @@ module.exports = {
         });
 
         // [SRV-2] GET /api/nebula/agent-version — para updater.py Fase 3
-        // El AgentUpdater llama este endpoint cada 6 horas para detectar nuevas versiones.
+        // Acepta Agent HMAC (agente) y Bearer JWT (dashboard) via requireAgentOrAuth.
         // Configurar en Render.com → Environment Variables:
         //   NEBULA_AGENT_LATEST_VERSION = "1.2.0"
         //   NEBULA_AGENT_DOWNLOAD_URL   = "https://tu-cdn/NebulAgent_v1.2.0.zip"
-        //   NEBULA_AGENT_RELEASE_NOTES  = "Fixes + 20 nuevos comandos"
-        app.get('/api/nebula/agent-version', requireAuth, async (req, res) => {
+        //   NEBULA_AGENT_RELEASE_NOTES  = "Fixes + nuevos comandos"
+        //   NEBULA_AGENT_SHA256         = "abc123..."  ← hash del ZIP/EXE para verificación
+        app.get('/api/nebula/agent-version', requireAgentOrAuth, async (req, res) => {
             try {
-                const latest_version  = process.env.NEBULA_AGENT_LATEST_VERSION || '1.2.0';
-                const download_url    = process.env.NEBULA_AGENT_DOWNLOAD_URL   || null;
-                const release_notes   = process.env.NEBULA_AGENT_RELEASE_NOTES  || 'Fixes + nuevos comandos';
+                // Si es agente, validar HMAC (requireAgentOrAuth dejó pasar sin verificar HMAC)
+                const authHeader = req.headers.authorization || '';
+                if (authHeader.startsWith('Agent ')) {
+                    const credentials = authHeader.slice(6);
+                    const sepIdx = credentials.indexOf(':');
+                    if (sepIdx === -1)
+                        return res.status(401).json({ error: 'Formato de agente inválido' });
+                    const machine_id = credentials.slice(0, sepIdx);
+                    const token      = credentials.slice(sepIdx + 1);
+                    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+                    if (!UUID_RE.test(machine_id))
+                        return res.status(401).json({ error: 'machine_id inválido' });
+                    const expectedToken = crypto.createHmac('sha256', NEBULA_AGENT_SECRET).update(machine_id).digest('hex');
+                    let valid = false;
+                    try {
+                        const b1 = Buffer.from(token, 'hex');
+                        const b2 = Buffer.from(expectedToken, 'hex');
+                        valid = b1.length === b2.length && crypto.timingSafeEqual(b1, b2);
+                    } catch { valid = false; }
+                    if (!valid)
+                        return res.status(401).json({ error: 'Token de agente inválido' });
+                }
+
+                const latest_version = process.env.NEBULA_AGENT_LATEST_VERSION || '1.2.0';
+                const download_url   = process.env.NEBULA_AGENT_DOWNLOAD_URL   || null;
+                const release_notes  = process.env.NEBULA_AGENT_RELEASE_NOTES  || 'Fixes + nuevos comandos';
+                const sha256         = process.env.NEBULA_AGENT_SHA256         || null;
+
+                const isAgent = authHeader.startsWith('Agent ');
+                const caller  = isAgent
+                    ? `agente ${authHeader.slice(6, 22)}...`
+                    : (req.usuario?.username || 'dashboard');
 
                 res.json({
                     version:       latest_version,
                     download_url:  download_url,
+                    sha256:        sha256,
                     release_notes: release_notes,
                     published_at:  new Date().toISOString(),
                     min_version:   '1.0.0',
                 });
 
-                console.log(`[Nebula] Version check: latest=${latest_version} solicitado por ${req.usuario.username}`);
+                console.log(`[Nebula] Version check: latest=${latest_version} solicitado por ${caller}`);
             } catch (e) {
                 console.error('[Nebula] Error agent-version:', e);
                 res.status(500).json({ error: 'Error obteniendo versión' });
