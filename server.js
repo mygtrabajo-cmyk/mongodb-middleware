@@ -1,5 +1,5 @@
 // ================================================================
-// MYG TELECOM — API SERVER v4.7.0
+// MYG TELECOM — API SERVER v4.8.0
 // Render (Node.js) + MongoDB Atlas
 //
 // CHANGELOG:
@@ -34,6 +34,7 @@
 //                         SHEET_ID_RH_POC, SHEET_ID_RH_HISTORICO, SHEET_ID_SEGUIMIENTO_ALTAS,
 //                         SHEET_ID_HEADCOUNT
 //   v4.5.7: [FEAT-005] GET /api/hc/validar-consistencia
+//   v4.8.0: [PERF-LOGIN] Login: projection+fire-and-forget+rehash progresivo bcrypt
 //   v4.7.0: [INN-002] Hub AI — POST /api/hub/ai/summarize-chat · extract-tasks · meeting-brief
 //                      Helper _llamarIATexto (Groq→Gemini cascada, texto libre)
 //           [INN-003] Dashboard Ejecutivo — GET /api/exec/alerts · /api/hub/activity/summary
@@ -1138,23 +1139,36 @@ app.get('/api/config/sheets', requireAuth, (req, res) => {
 });
 
 // ── LOGIN ──────────────────────────────────────────────────────
+// [PERF-LOGIN-v4.8] Optimizaciones rendimiento login:
+//   1. Projection en findOne — solo campos necesarios para auth
+//   2. updateOne + logAccess SUCCESS en background (fire-and-forget)
+//   3. Rehash progresivo: migra silenciosamente bcrypt de 12 a 10 rounds
+const BCRYPT_TARGET_ROUNDS = parseInt(process.env.BCRYPT_ROUNDS || '10', 10);
+
 app.post('/api/auth/login', loginLimiter, async (req, res) => {
     try {
         const { username, password } = req.body;
         if (!username || !password)
             return res.status(400).json({ error: 'Usuario y contrasena requeridos' });
-        const usuarioDoc = await db.collection('users').findOne({ username: username.toLowerCase().trim() });
+
+        // [PERF-1] Projection minima — evita traer campos innecesarios del documento
+        const usuarioDoc = await db.collection('users').findOne(
+            { username: username.toLowerCase().trim() },
+            { projection: { username:1, nombre:1, email:1, rol:1, area:1,
+                            rolSecundario:1, permisos:1, preferencias:1,
+                            activo:1, password:1 } }
+        );
         if (!usuarioDoc) {
-            await logAccess(username, 'LOGIN_FAILED', { reason: 'user_not_found', ip: req.ip });
+            logAccess(username, 'LOGIN_FAILED', { reason: 'user_not_found', ip: req.ip });
             return res.status(401).json({ error: 'Credenciales invalidas' });
         }
         if (!usuarioDoc.activo) {
-            await logAccess(username, 'LOGIN_BLOCKED', { reason: 'account_disabled', ip: req.ip });
+            logAccess(username, 'LOGIN_BLOCKED', { reason: 'account_disabled', ip: req.ip });
             return res.status(401).json({ error: 'Cuenta desactivada.' });
         }
         const validPassword = await bcrypt.compare(password, usuarioDoc.password);
         if (!validPassword) {
-            await logAccess(username, 'LOGIN_FAILED', { reason: 'wrong_password', ip: req.ip });
+            logAccess(username, 'LOGIN_FAILED', { reason: 'wrong_password', ip: req.ip });
             return res.status(401).json({ error: 'Credenciales invalidas' });
         }
         const rolNormalizado = normalizarRol(usuarioDoc.rol);
@@ -1170,17 +1184,36 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
             preferencias: usuarioDoc.preferencias || {},
         };
         const token = jwt.sign(tokenPayload, JWT_SECRET, { expiresIn: '8h' });
-        await db.collection('users').updateOne(
-            { username: usuarioDoc.username },
-            { $set: { ultimoLogin: new Date(), rol: rolNormalizado } }
-        );
-        await logAccess(usuarioDoc.username, 'LOGIN_SUCCESS', { ip: req.ip, rol: rolNormalizado });
+
+        // [PERF-2] Fire-and-forget — respuesta inmediata, escrituras en background
+        Promise.allSettled([
+            db.collection('users').updateOne(
+                { username: usuarioDoc.username },
+                { $set: { ultimoLogin: new Date(), rol: rolNormalizado } }
+            ),
+            logAccess(usuarioDoc.username, 'LOGIN_SUCCESS', { ip: req.ip, rol: rolNormalizado }),
+            // [PERF-3] Rehash progresivo: si el hash usa mas rounds del objetivo, rehash silencioso
+            (async () => {
+                try {
+                    const storedRounds = parseInt((usuarioDoc.password.split('$')[2] || '12'), 10);
+                    if (!isNaN(storedRounds) && storedRounds > BCRYPT_TARGET_ROUNDS) {
+                        const newHash = await bcrypt.hash(password, BCRYPT_TARGET_ROUNDS);
+                        await db.collection('users').updateOne(
+                            { username: usuarioDoc.username },
+                            { $set: { password: newHash } }
+                        );
+                        console.log('[PERF-3] Rehash progresivo completado para:', usuarioDoc.username);
+                    }
+                } catch (e) { console.warn('[PERF-3] Rehash fallido (no critico):', e.message); }
+            })(),
+        ]);
+
         res.json({ success: true, token, user: { ...tokenPayload } });
     } catch (error) {
         console.error('Error en login:', error);
         res.status(500).json({ error: 'Error interno' });
     }
-});
+});;
 
 app.post('/api/auth/renew', requireAuth, async (req, res) => {
     try {
