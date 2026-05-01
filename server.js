@@ -1,5 +1,5 @@
 // ================================================================
-// MYG TELECOM — API SERVER v4.6.0
+// MYG TELECOM — API SERVER v4.7.0
 // Render (Node.js) + MongoDB Atlas
 //
 // CHANGELOG:
@@ -34,6 +34,11 @@
 //                         SHEET_ID_RH_POC, SHEET_ID_RH_HISTORICO, SHEET_ID_SEGUIMIENTO_ALTAS,
 //                         SHEET_ID_HEADCOUNT
 //   v4.5.7: [FEAT-005] GET /api/hc/validar-consistencia
+//   v4.7.0: [INN-002] Hub AI — POST /api/hub/ai/summarize-chat · extract-tasks · meeting-brief
+//                      Helper _llamarIATexto (Groq→Gemini cascada, texto libre)
+//           [INN-003] Dashboard Ejecutivo — GET /api/exec/alerts · /api/hub/activity/summary
+//                      GET /api/kpi/summary · /api/headcount/summary
+//                      requireEjecutivo middleware (ADMIN + GERENTE_OPERACIONES)
 //   v4.6.0: [FEAT-004] Resumen semanal por email (scheduler nativo, sin deps)
 //                      GET  /api/admin/weekly-report/status    → estado del scheduler
 //                      POST /api/admin/weekly-report/enviar-ahora → disparo manual
@@ -810,7 +815,24 @@ async function connectDB() {
     const client = new MongoClient(MONGO_URI, {
         serverSelectionTimeoutMS: 10000,
         socketTimeoutMS:          45000,
+        heartbeatFrequencyMS:     10000,   // ping al servidor cada 10s para detectar caídas rápido
+        minPoolSize:              2,        // mantener al menos 2 conexiones abiertas (evita cold-start)
+        maxPoolSize:              10,
+        connectTimeoutMS:         15000,
+        retryWrites:              true,
+        retryReads:               true,
     });
+
+    client.on('serverHeartbeatFailed', (evt) => {
+        console.error(`[MongoDB] ❌ Heartbeat falló → ${evt.connectionId} (${evt.failure?.message})`);
+    });
+    client.on('serverClosed', (evt) => {
+        console.warn(`[MongoDB] ⚠️  Servidor cerrado: ${evt.address}`);
+    });
+    client.on('topologyOpening', () => {
+        console.log('[MongoDB] Conectando...');
+    });
+
     await client.connect();
     db          = client.db(DB_NAME);
     mongoClient = client;
@@ -1084,7 +1106,7 @@ async function logAccess(username, action, details = {}) {
 // ── HEALTH ─────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({
     status:    'ok',
-    version:   '4.6.0',        // ← PASO 5: actualizado
+    version:   '4.7.0',
     timestamp: new Date().toISOString(),
     db:        db ? 'connected' : 'disconnected',
     ia: {
@@ -1557,7 +1579,7 @@ app.patch('/api/nebula/umbrales', requireAuth, async (req, res) => {
 // ================================================================
 const sseClients = new Map();
 function sseAdd(username, res)    { if (!sseClients.has(username)) sseClients.set(username, new Set()); sseClients.get(username).add(res); }
-function sseRemove(username, res) { sseClients.get(username)?.delete(res); }
+function sseRemove(username, res) { const s = sseClients.get(username); if (!s) return; s.delete(res); if (s.size === 0) sseClients.delete(username); }
 function ssePush(username, evento, datos) {
     const targets = new Set();
     if (username === '*') { sseClients.forEach(set => set.forEach(r => targets.add(r))); }
@@ -1851,17 +1873,29 @@ app.post('/api/chat', requireAuth, requirePermiso('chatbot.usar'), async (req, r
 });
 
 // ================================================================
-// HUB — Helpers CRUD genéricos v4.3
+// HUB — Helpers CRUD genéricos v4.4
 // ================================================================
 const COLECCIONES_CON_AREA = new Set([
     'hub_tareas','hub_minutas','hub_anuncios','hub_recursos','hub_guias','hub_plantillas',
 ]);
 const ROLES_GESTORES_HUB = new Set(['ADMIN', 'GERENTE_OPERACIONES', 'COORDINADOR']);
 
+// Elimina claves peligrosas del body antes de insertar en MongoDB.
+// Previene prototype pollution y acceso a campos internos.
+const _BLOCKED_KEYS = new Set(['__proto__', 'constructor', 'prototype', '_id', 'creadoPor', 'createdAt', 'updatedAt', 'updatedBy']);
+function _sanitizeBody(body) {
+    if (!body || typeof body !== 'object') return {};
+    return Object.fromEntries(
+        Object.entries(body).filter(([k]) => !_BLOCKED_KEYS.has(k))
+    );
+}
+
 function hubGet(col, perm) {
     return [requireAuth, requirePermiso(perm), async (req, res) => {
         try {
-            const limit  = Math.min(parseInt(req.query.limit) || 100, 500);
+            const limit  = Math.min(parseInt(req.query.limit)  || 100, 500);
+            const page   = Math.max(parseInt(req.query.page)   || 1,   1);
+            const skip   = (page - 1) * limit;
             const filter = {};
             if (req.query.username) filter.username = req.query.username;
             if (req.query.mes)      filter.mes      = req.query.mes;
@@ -1872,7 +1906,11 @@ function hubGet(col, perm) {
                     filter.$or = [{ area: 'Sistemas' }, { area: { $exists: false } }, { area: null }];
                 } else { filter.area = area; }
             }
-            res.json(await db.collection(col).find(filter).sort({ createdAt: -1 }).limit(limit).toArray());
+            const [data, total] = await Promise.all([
+                db.collection(col).find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+                db.collection(col).countDocuments(filter),
+            ]);
+            res.json({ data, paginacion: { total, page, limit, pages: Math.ceil(total / limit), hasNext: skip + limit < total } });
         } catch (e) { res.status(500).json({ error: `Error ${col}` }); }
     }];
 }
@@ -1880,8 +1918,9 @@ function hubGet(col, perm) {
 function hubPost(col, perm) {
     return [requireAuth, requirePermiso(perm), async (req, res) => {
         try {
-            const areaDefault = COLECCIONES_CON_AREA.has(col) && !req.body.area ? 'Sistemas' : undefined;
-            const doc = { ...req.body, ...(areaDefault !== undefined && { area: areaDefault }), creadoPor: req.usuario.username, createdAt: new Date() };
+            const safe = _sanitizeBody(req.body);
+            const areaDefault = COLECCIONES_CON_AREA.has(col) && !safe.area ? 'Sistemas' : undefined;
+            const doc = { ...safe, ...(areaDefault !== undefined && { area: areaDefault }), creadoPor: req.usuario.username, createdAt: new Date() };
             const result = await db.collection(col).insertOne(doc);
             res.status(201).json({ success: true, id: result.insertedId, doc });
         } catch (e) { res.status(500).json({ error: `Error ${col}` }); }
@@ -1897,8 +1936,7 @@ function hubPatch(col, perm) {
             if (!doc) return res.status(404).json({ error: 'Registro no encontrado' });
             if (!ROLES_GESTORES_HUB.has(req.usuario.rol) && doc.creadoPor !== req.usuario.username)
                 return res.status(403).json({ error: 'No tienes permiso para editar registros de otros usuarios.' });
-            const updates = { ...req.body };
-            delete updates._id; delete updates.creadoPor; delete updates.createdAt;
+            const updates = _sanitizeBody(req.body);
             if (Object.keys(updates).length === 0) return res.status(400).json({ error: 'No se enviaron campos a actualizar' });
             await db.collection(col).updateOne({ _id: new ObjectId(id) }, { $set: { ...updates, updatedAt: new Date(), updatedBy: req.usuario.username } });
             res.json({ success: true });
@@ -3134,6 +3172,244 @@ app.get('/api/hc/validar-consistencia', requireAuth, async (req, res) => {
 });
 
 // ================================================================
+// [INN-002] HUB AI — Asistente IA genérico (texto libre)
+// ================================================================
+
+// Helper genérico: llama Groq → Gemini en cascada, devuelve texto plano
+const _llamarIATexto = async (systemPrompt, userPrompt) => {
+    const forced = process.env.AI_PROVIDER;
+    const tryGroq = async () => {
+        const apiKey = process.env.GROQ_API_KEY;
+        if (!apiKey) throw new Error('GROQ_API_KEY no configurada');
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 22000);
+        try {
+            const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+                signal: controller.signal,
+                body: JSON.stringify({ model: 'llama-3.3-70b-versatile', max_tokens: 1500, temperature: 0.3, messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }] }),
+            });
+            clearTimeout(timeout);
+            if (!response.ok) { const t = await response.text().catch(() => ''); throw new Error(`Groq HTTP ${response.status}: ${t.slice(0, 120)}`); }
+            const data = await response.json();
+            const text = data.choices?.[0]?.message?.content || '';
+            if (!text) throw new Error('Groq devolvió respuesta vacía');
+            return text.trim();
+        } finally { clearTimeout(timeout); }
+    };
+    const tryGemini = async () => {
+        const apiKey = process.env.GEMINI_API_KEY;
+        if (!apiKey) throw new Error('GEMINI_API_KEY no configurada');
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 22000);
+        try {
+            const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+            const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal, body: JSON.stringify({ contents: [{ parts: [{ text: userPrompt }] }], systemInstruction: { parts: [{ text: systemPrompt }] }, generationConfig: { temperature: 0.3, maxOutputTokens: 1500 } }) });
+            clearTimeout(timeout);
+            if (!response.ok) throw new Error(`Gemini HTTP ${response.status}`);
+            const data = await response.json();
+            const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+            if (!text) throw new Error('Gemini devolvió respuesta vacía');
+            return text.trim();
+        } finally { clearTimeout(timeout); }
+    };
+    const cadena = [
+        { nombre: 'groq',   fn: tryGroq,   activo: !forced || forced === 'groq',   tiene_key: !!process.env.GROQ_API_KEY },
+        { nombre: 'gemini', fn: tryGemini, activo: !forced || forced === 'gemini', tiene_key: !!process.env.GEMINI_API_KEY },
+    ].filter(p => p.activo && p.tiene_key);
+    if (cadena.length === 0) throw new Error('No hay proveedor IA disponible (configura GROQ_API_KEY o GEMINI_API_KEY)');
+    let lastError;
+    for (const prov of cadena) {
+        try { return await prov.fn(); } catch (e) { lastError = e; console.warn(`[HubAI] ${prov.nombre} falló: ${e.message} — próximo proveedor`); }
+    }
+    throw lastError;
+};
+
+// POST /api/hub/ai/summarize-chat
+app.post('/api/hub/ai/summarize-chat', requireAuth, requirePermiso('hub.chat'), async (req, res) => {
+    try {
+        const { area = '', canal = '', messages = [] } = req.body;
+        if (!Array.isArray(messages) || messages.length === 0)
+            return res.status(400).json({ error: 'Se requiere el array messages[]' });
+        const transcripcion = messages.slice(-60).map(m => {
+            const autor = m.autor || m.author || m.username || '?';
+            const texto = m.texto || m.content || m.text || '';
+            const ts    = m.ts   || m.createdAt || '';
+            const hora  = ts ? new Date(ts).toLocaleTimeString('es-MX', { hour: '2-digit', minute: '2-digit' }) : '??:??';
+            return `[${hora}] ${autor}: ${texto}`;
+        }).join('\n');
+        const system = 'Eres un asistente corporativo. Resumir conversaciones de chat de equipos de trabajo en español de forma clara, objetiva y concisa.';
+        const user = `Resume el chat del área "${area || 'N/A'}"${canal ? `, canal #${canal}` : ''} (${messages.length} mensajes):\n\n${transcripcion}\n\nProporciona:\n1. Resumen ejecutivo (3-5 líneas)\n2. Temas principales discutidos\n3. Conclusiones o próximos pasos mencionados\n\nTexto plano, sin markdown excesivo.`;
+        const resumen = await _llamarIATexto(system, user);
+        res.json({ resumen, _proveedor: 'ia', mensajesAnalizados: Math.min(messages.length, 60) });
+    } catch (e) {
+        console.error('[INN-002] summarize-chat:', e.message);
+        res.status(e.message.includes('No hay proveedor') || e.message.includes('_KEY') ? 503 : 500).json({ error: e.message });
+    }
+});
+
+// POST /api/hub/ai/extract-tasks
+app.post('/api/hub/ai/extract-tasks', requireAuth, requirePermiso('hub.chat'), async (req, res) => {
+    try {
+        const { area = '', canal = '', messages = [] } = req.body;
+        if (!Array.isArray(messages) || messages.length === 0)
+            return res.status(400).json({ error: 'Se requiere el array messages[]' });
+        const transcripcion = messages.slice(-60).map(m => {
+            const autor = m.autor || m.author || m.username || '?';
+            const texto = m.texto || m.content || m.text || '';
+            return `${autor}: ${texto}`;
+        }).join('\n');
+        const system = 'Eres un extractor de tareas y compromisos en chats corporativos en español. Extrae ÚNICAMENTE tareas concretas, compromisos, pendientes o acciones mencionadas. Responde SOLO con JSON válido, sin texto adicional.';
+        const user = `Del siguiente chat del área "${area || 'N/A'}"${canal ? `, canal #${canal}` : ''}, extrae todas las tareas y compromisos:\n\n${transcripcion}\n\nResponde con JSON:\n{"tareas":[{"tarea":"descripción concreta","responsable":"nombre si se menciona, si no vacío","fecha":"fecha límite si se menciona, si no vacío"}]}\n\nSi no hay tareas: {"tareas":[]}`;
+        const texto = await _llamarIATexto(system, user);
+        let parsed;
+        try { const clean = texto.replace(/```json\s*/gi, '').replace(/```\s*/gi, '').trim(); parsed = JSON.parse(clean); if (!parsed.tareas) parsed = { tareas: [] }; }
+        catch (_) { parsed = { tareas: [], _raw: texto }; }
+        res.json({ ...parsed, _proveedor: 'ia', mensajesAnalizados: Math.min(messages.length, 60) });
+    } catch (e) {
+        console.error('[INN-002] extract-tasks:', e.message);
+        res.status(e.message.includes('No hay proveedor') || e.message.includes('_KEY') ? 503 : 500).json({ error: e.message });
+    }
+});
+
+// POST /api/hub/ai/meeting-brief
+app.post('/api/hub/ai/meeting-brief', requireAuth, requirePermiso('hub.reuniones'), async (req, res) => {
+    try {
+        const { area = '', reunionId, titulo = '' } = req.body;
+        if (!reunionId) return res.status(400).json({ error: 'Se requiere reunionId' });
+        let rid;
+        try { rid = new ObjectId(String(reunionId)); } catch (_) { return res.status(400).json({ error: 'reunionId inválido' }); }
+        const reunion = await db.collection('hub_reuniones').findOne({ _id: rid });
+        if (!reunion) return res.status(404).json({ error: 'Reunión no encontrada' });
+        const tituloReunion = titulo || reunion.title || reunion.titulo || 'Reunión';
+        const agenda     = reunion.agenda || '';
+        const asistentes = Array.isArray(reunion.invitadoUsernames) ? reunion.invitadoUsernames.join(', ') : (reunion.invitados || '');
+        const fecha      = reunion.startTime || reunion.fecha || reunion.date || '';
+        const minuta     = reunion.minuta || reunion.acuerdos || '';
+        const system = 'Eres un asistente corporativo experto en redacción de actas y minutas de reuniones en español. Redacta actas estructuradas y profesionales en texto plano.';
+        const user = `Genera un acta de reunión para:\n\nTítulo: ${tituloReunion}\nÁrea: ${area}\nFecha: ${fecha ? new Date(fecha).toLocaleDateString('es-MX') : 'No especificada'}\nAsistentes: ${asistentes || 'No especificados'}\nAgenda: ${agenda || 'No especificada'}\n${minuta ? `\nMinuta/Notas previas:\n${minuta}` : ''}\n\nEstructura el acta con:\n1. Encabezado (título, fecha, área, asistentes)\n2. Objetivo de la reunión\n3. Temas tratados\n4. Acuerdos y decisiones\n5. Compromisos y responsables\n6. Próxima reunión (si aplica)\n\nUsa formato de texto claro y profesional.`;
+        const acta = await _llamarIATexto(system, user);
+        res.json({ acta, _proveedor: 'ia', reunionTitulo: tituloReunion });
+    } catch (e) {
+        console.error('[INN-002] meeting-brief:', e.message);
+        res.status(e.message.includes('No hay proveedor') || e.message.includes('_KEY') ? 503 : 500).json({ error: e.message });
+    }
+});
+
+// ================================================================
+// [INN-003] DASHBOARD EJECUTIVO — Alertas y resúmenes cross-system
+// ================================================================
+
+function requireEjecutivo(req, res, next) {
+    const rol = req.usuario?.rol;
+    if (rol === 'ADMIN' || rol === 'GERENTE_OPERACIONES' || (req.usuario?.permisos || []).includes('*'))
+        return next();
+    return res.status(403).json({ error: 'Acceso denegado. Se requiere rol ADMIN o GERENTE_OPERACIONES.' });
+}
+
+// GET /api/exec/alerts
+app.get('/api/exec/alerts', requireAuth, requireEjecutivo, async (req, res) => {
+    try {
+        const ahora = new Date();
+        const alerts = [];
+        // Agentes Nebula offline (sin heartbeat > 10 min)
+        try {
+            const agOffline = await db.collection('nebula_agents')
+                .find({ lastSeen: { $lt: new Date(ahora - 10 * 60 * 1000) }, activo: { $ne: false } })
+                .project({ agentId: 1, hostname: 1, lastSeen: 1 }).limit(10).toArray();
+            for (const ag of agOffline) {
+                const min = Math.floor((ahora - new Date(ag.lastSeen)) / 60000);
+                alerts.push({ severity: min > 60 ? 'critical' : 'warning', categoria: 'nebula', titulo: `Agente offline: ${ag.hostname || ag.agentId}`, descripcion: `Sin heartbeat hace ${min} min` });
+            }
+        } catch (_) {}
+        // Movimientos RH pendientes > 5 días
+        try {
+            const n = await db.collection('hub_movimientos_rh').countDocuments({ estado: 'pendiente', createdAt: { $lt: new Date(ahora - 5 * 24 * 60 * 60 * 1000) } });
+            if (n > 0) alerts.push({ severity: n > 3 ? 'warning' : 'info', categoria: 'rh', titulo: `${n} movimiento(s) RH pendiente(s) > 5 días`, descripcion: 'Revisar y procesar en el módulo de RH' });
+        } catch (_) {}
+        // Peticiones hub sin atender > 3 días
+        try {
+            const n = await db.collection('hub_peticiones').countDocuments({ status: 'pendiente', createdAt: { $lt: new Date(ahora - 3 * 24 * 60 * 60 * 1000) } });
+            if (n > 0) alerts.push({ severity: 'info', categoria: 'hub', titulo: `${n} petición(es) hub sin atender > 3 días`, descripcion: 'Revisar en el módulo de asistencia' });
+        } catch (_) {}
+        // Vacaciones pendientes de aprobación > 2 días
+        try {
+            const n = await db.collection('hub_vacaciones').countDocuments({ estado: 'pendiente', createdAt: { $lt: new Date(ahora - 2 * 24 * 60 * 60 * 1000) } });
+            if (n > 0) alerts.push({ severity: 'info', categoria: 'rh', titulo: `${n} solicitud(es) de vacaciones pendiente(s)`, descripcion: 'Revisar en el módulo de asistencia' });
+        } catch (_) {}
+        res.set('Cache-Control', 'private, max-age=120');
+        res.json({ ok: true, items: alerts, timestamp: ahora.toISOString() });
+    } catch (e) {
+        console.error('[INN-003] /api/exec/alerts:', e.message);
+        res.status(500).json({ error: 'Error obteniendo alertas ejecutivas' });
+    }
+});
+
+// GET /api/hub/activity/summary
+app.get('/api/hub/activity/summary', requireAuth, async (req, res) => {
+    try {
+        const ahora  = new Date();
+        const hace7d = new Date(ahora - 7 * 24 * 60 * 60 * 1000);
+        const [msgs, mtgs, pets, bols] = await Promise.allSettled([
+            db.collection('hub_messages').aggregate([{ $match: { createdAt: { $gte: hace7d } } }, { $group: { _id: '$area', count: { $sum: 1 }, lastMsg: { $max: '$createdAt' } } }, { $sort: { count: -1 } }]).toArray(),
+            db.collection('hub_reuniones').aggregate([{ $match: { startTime: { $gte: hace7d } } }, { $group: { _id: '$area', count: { $sum: 1 } } }]).toArray(),
+            db.collection('hub_peticiones').aggregate([{ $match: { createdAt: { $gte: hace7d } } }, { $group: { _id: '$area', count: { $sum: 1 } } }]).toArray(),
+            db.collection('hub_boletines').find({ createdAt: { $gte: hace7d } }).sort({ createdAt: -1 }).limit(5).project({ titulo: 1, area: 1, createdAt: 1, autor: 1 }).toArray(),
+        ]);
+        const areas = {};
+        const merge = (settled, key) => { if (settled.status === 'fulfilled') for (const r of settled.value) { if (!r._id) continue; if (!areas[r._id]) areas[r._id] = { mensajes: 0, reuniones: 0, peticiones: 0 }; areas[r._id][key] = r.count; } };
+        merge(msgs, 'mensajes'); merge(mtgs, 'reuniones'); merge(pets, 'peticiones');
+        res.set('Cache-Control', 'private, max-age=300');
+        res.json({ ok: true, countsByArea: areas, boletinesRecientes: bols.status === 'fulfilled' ? bols.value : [], timestamp: ahora.toISOString() });
+    } catch (e) {
+        console.error('[INN-003] /api/hub/activity/summary:', e.message);
+        res.status(500).json({ error: 'Error obteniendo resumen de actividad' });
+    }
+});
+
+// GET /api/kpi/summary
+app.get('/api/kpi/summary', requireAuth, async (req, res) => {
+    try {
+        const ahora = new Date();
+        const [ticketsPend, rhMovsPend, vacPend, agTotal, agOk, hcTotal, usrActivos] = await Promise.allSettled([
+            db.collection('hub_peticiones').countDocuments({ status: { $in: ['pendiente', 'en_proceso'] } }),
+            db.collection('hub_movimientos_rh').countDocuments({ estado: 'pendiente' }),
+            db.collection('hub_vacaciones').countDocuments({ estado: 'pendiente' }),
+            db.collection('nebula_agents').countDocuments({ activo: { $ne: false } }),
+            db.collection('nebula_agents').countDocuments({ activo: { $ne: false }, lastSeen: { $gte: new Date(ahora - 10 * 60 * 1000) } }),
+            db.collection('headcount').countDocuments({}),
+            db.collection('users').countDocuments({ activo: true }),
+        ]);
+        const g = (r, d = 0) => r.status === 'fulfilled' ? r.value : d;
+        res.set('Cache-Control', 'private, max-age=180');
+        res.json({ ok: true, kpis: { tickets: { pendientes: g(ticketsPend), label: 'Tickets/Peticiones pendientes' }, rh: { movimientosPendientes: g(rhMovsPend), vacacionesPendientes: g(vacPend), label: 'Movimientos RH' }, nebula: { total: g(agTotal), online: g(agOk), label: 'Agentes Nebula' }, headcount: { total: g(hcTotal), label: 'Headcount' }, usuarios: { activos: g(usrActivos), label: 'Usuarios del sistema' } }, timestamp: ahora.toISOString() });
+    } catch (e) {
+        console.error('[INN-003] /api/kpi/summary:', e.message);
+        res.status(500).json({ error: 'Error obteniendo KPIs' });
+    }
+});
+
+// GET /api/headcount/summary
+app.get('/api/headcount/summary', requireAuth, async (req, res) => {
+    try {
+        const [result] = await db.collection('headcount').aggregate([{ $group: { _id: null, total: { $sum: 1 }, areas: { $push: '$area' } } }]).toArray();
+        if (!result) return res.json({ ok: true, total: 0, porArea: {}, activos: 0, bajas: 0, timestamp: new Date().toISOString() });
+        const porArea = {};
+        for (const a of (result.areas || [])) { const k = a || 'Sin área'; porArea[k] = (porArea[k] || 0) + 1; }
+        const [activos, bajas] = await Promise.allSettled([
+            db.collection('headcount').countDocuments({ estatus: { $regex: /activo/i } }),
+            db.collection('headcount').countDocuments({ estatus: { $regex: /baja/i } }),
+        ]);
+        res.set('Cache-Control', 'private, max-age=300');
+        res.json({ ok: true, total: result.total, activos: activos.status === 'fulfilled' ? activos.value : null, bajas: bajas.status === 'fulfilled' ? bajas.value : null, porArea, timestamp: new Date().toISOString() });
+    } catch (e) {
+        console.error('[INN-003] /api/headcount/summary:', e.message);
+        res.status(500).json({ error: 'Error obteniendo resumen de headcount' });
+    }
+});
+
+// ================================================================
 // START
 // ================================================================
 async function start() {
@@ -3144,7 +3420,7 @@ async function start() {
         app.use((err, req, res, next) => { console.error('Error no manejado:', err); res.status(500).json({ error: 'Error interno' }); });
 
         app.listen(PORT, () => {
-            console.log(`MYG API v4.6.0 en puerto ${PORT}`);   // ← PASO 5: actualizado
+            console.log(`MYG API v4.7.0 en puerto ${PORT}`);   // ← PASO 5: actualizado
             console.log(`IA Minutas: Groq=${!!process.env.GROQ_API_KEY ? '✅' : '❌'} | Gemini=${!!process.env.GEMINI_API_KEY ? '✅' : '❌'} | Local=✅`);
             console.log(`Activos:      GET(limit) POST(insertMany) PATCH(edit) DELETE(permisos) BULK(500max) ✅`);
             console.log(`Reposiciones: GET POST POST-bulk PATCH DELETE → hub_reposiciones ✅`);
@@ -3161,6 +3437,9 @@ async function start() {
             console.log(`HC Validación: GET /api/hc/validar-consistencia (FEAT-005 ✅ v4.5.7)`);
             // ← PASO 5: nueva línea de estado FEAT-004
             console.log(`Reporte Semanal: ${process.env.WEEKLY_REPORT_ENABLED === 'true' ? '✅ Activo (WEEKLY_REPORT_ENABLED=true)' : '❌ Inactivo — activa con WEEKLY_REPORT_ENABLED=true'}`);
+            console.log(`Hub AI:          POST /api/hub/ai/summarize-chat · extract-tasks · meeting-brief (INN-002 ✅ v4.7.0)`);
+            console.log(`Exec Alerts:     GET /api/exec/alerts (ADMIN/GERENTE_OPERACIONES) (INN-003 ✅ v4.7.0)`);
+            console.log(`KPI Summary:     GET /api/kpi/summary · /api/hub/activity/summary · /api/headcount/summary (INN-003 ✅ v4.7.0)`);
         });
     } catch (err) {
         console.error('Error iniciando:', err);
