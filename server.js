@@ -1,9 +1,22 @@
 // ================================================================
-// MYG TELECOM — API SERVER v4.8.0
+// MYG TELECOM — API SERVER v5.4.0
 // Render (Node.js) + MongoDB Atlas
 //
 // CHANGELOG:
-//   v4.5.0: [CAN-1..4] CRUD canales dinámicos → hub_canales
+//   v5.4.0: [SEM-4] Hub Crédito — Solicitudes de Crédito + Casos de Seguimiento
+//                   CRUD /api/hub/credito/solicitudes (GET/POST/PATCH/DELETE)
+//                   CRUD /api/hub/credito/casos (GET/POST/PATCH/DELETE)
+//   v5.3.0: [SEM-3] Hub Logística — Guías de Envío + Inventario
+//                   CRUD /api/hub/logistica/guias (GET/POST/PATCH/DELETE)
+//                   CRUD /api/hub/logistica/inventario (GET/POST/PATCH/DELETE)
+//   v5.2.0: [SEM-2] Hub Mantenimiento — Órdenes de Trabajo + Bitácora
+//                   CRUD /api/hub/mantenimiento/ordenes (GET/POST/PATCH/DELETE)
+//                   CRUD /api/hub/mantenimiento/bitacora (GET/POST + admin-only DELETE)
+//                   hubGet filtros genéricos: status, prioridad, equipoId
+//                   COLECCIONES_CON_AREA: +hub_mant_ordenes, +hub_mant_bitacora,
+//                     +hub_log_guias, +hub_log_inventario,
+//                     +hub_cred_solicitudes, +hub_cred_casos (SEM 4 reservado)
+//   v5.0.0: [INN-002] Hub AI — POST /api/hub/ai/summarize-chat · extract-tasks · meeting-brief
 //           [BOL-1..5] CRUD boletines semanales → hub_boletines
 //           [BOL-6]   Índice hub_boletines / hub_canales
 //   v4.5.2: [BUG-002] POST /api/formatos/generar → BLOB XLSX real (ExcelJS)
@@ -35,7 +48,7 @@
 //                         SHEET_ID_HEADCOUNT
 //   v4.5.7: [FEAT-005] GET /api/hc/validar-consistencia
 //   v4.8.0: [PERF-LOGIN] Login: projection+fire-and-forget+rehash progresivo bcrypt
-//   v4.7.0: [INN-002] Hub AI — POST /api/hub/ai/summarize-chat · extract-tasks · meeting-brief
+//   v5.0.0: [INN-002] Hub AI — POST /api/hub/ai/summarize-chat · extract-tasks · meeting-brief
 //                      Helper _llamarIATexto (Groq→Gemini cascada, texto libre)
 //           [INN-003] Dashboard Ejecutivo — GET /api/exec/alerts · /api/hub/activity/summary
 //                      GET /api/kpi/summary · /api/headcount/summary
@@ -1771,12 +1784,13 @@ app.patch('/api/rh/movimientos/:id/estado', requireAuth, requirePermiso('rh.movi
 // FORMATOS DE ACTIVACIÓN — XLSX real con ExcelJS [BUG-002]
 // ================================================================
 const _formatosCache = { sistemas: null, timestamp: 0, TTL: 5 * 60 * 1000 };
-const SISTEMAS_ACTIVACION = [
-    { id: 'SIEBEL',  nombre: 'Siebel CRM',            descripcion: 'Gestión de clientes y oportunidades',    status: 'available' },
-    { id: 'CLARIFY', nombre: 'Clarify',                descripcion: 'Atención a clientes y casos de soporte', status: 'available' },
-    { id: 'AMDOCS',  nombre: 'Amdocs',                 descripcion: 'Facturación y activaciones',             status: 'available' },
-    { id: 'REMEDY',  nombre: 'Remedy / ITSM',          descripcion: 'Gestión de tickets internos',            status: 'available' },
-    { id: 'GENESYS', nombre: 'Genesys Contact Center', descripcion: 'Plataforma de llamadas',                 status: 'available' },
+const // [FIX-FORMATOS] Agregados name/description/icon para compatibilidad con el selector frontend
+SISTEMAS_ACTIVACION = [
+    { id: 'SIEBEL',  icon: '📊', nombre: 'Siebel CRM',             name: 'Siebel CRM',             descripcion: 'Gestión de clientes y oportunidades',    description: 'Gestión de clientes y oportunidades',    status: 'available' },
+    { id: 'CLARIFY', icon: '🎧', nombre: 'Clarify',                 name: 'Clarify',                descripcion: 'Atención a clientes y casos de soporte', description: 'Atención a clientes y casos de soporte', status: 'available' },
+    { id: 'AMDOCS',  icon: '📱', nombre: 'Amdocs',                  name: 'Amdocs',                 descripcion: 'Facturación y activaciones',             description: 'Facturación y activaciones',             status: 'available' },
+    { id: 'REMEDY',  icon: '🎫', nombre: 'Remedy / ITSM',           name: 'Remedy / ITSM',          descripcion: 'Gestión de tickets internos',            description: 'Gestión de tickets internos',            status: 'available' },
+    { id: 'GENESYS', icon: '📞', nombre: 'Genesys Contact Center',  name: 'Genesys Contact Center', descripcion: 'Plataforma de llamadas',                 description: 'Plataforma de llamadas',                 status: 'available' },
 ];
 
 app.get('/api/formatos/sistemas', requireAuth, requirePermiso('formatos.generar'), (req, res) => {
@@ -1910,6 +1924,12 @@ app.post('/api/chat', requireAuth, requirePermiso('chatbot.usar'), async (req, r
 // ================================================================
 const COLECCIONES_CON_AREA = new Set([
     'hub_tareas','hub_minutas','hub_anuncios','hub_recursos','hub_guias','hub_plantillas',
+    // SEM 2: Mantenimiento
+    'hub_mant_ordenes','hub_mant_bitacora',
+    // SEM 3: Logística (reservado)
+    'hub_log_guias','hub_log_inventario',
+    // SEM 4: Crédito (reservado)
+    'hub_cred_solicitudes','hub_cred_casos',
 ]);
 const ROLES_GESTORES_HUB = new Set(['ADMIN', 'GERENTE_OPERACIONES', 'COORDINADOR']);
 
@@ -1930,9 +1950,13 @@ function hubGet(col, perm) {
             const page   = Math.max(parseInt(req.query.page)   || 1,   1);
             const skip   = (page - 1) * limit;
             const filter = {};
-            if (req.query.username) filter.username = req.query.username;
-            if (req.query.mes)      filter.mes      = req.query.mes;
-            if (req.query.estado)   filter.estado   = req.query.estado;
+            if (req.query.username)  filter.username  = req.query.username;
+            if (req.query.mes)       filter.mes       = req.query.mes;
+            if (req.query.estado)    filter.estado    = req.query.estado;
+            // [SEM 2] Filtros genéricos para colecciones custom de áreas
+            if (req.query.status)    filter.status    = req.query.status;
+            if (req.query.prioridad) filter.prioridad = req.query.prioridad;
+            if (req.query.equipoId)  filter.equipoId  = req.query.equipoId;
             if (COLECCIONES_CON_AREA.has(col) && req.query.area) {
                 const area = req.query.area;
                 if (area === 'Sistemas') {
@@ -2350,6 +2374,88 @@ app.get('/api/hub/capacitacion',         ...hubGet   ('hub_capacitacion', 'hub.c
 app.post('/api/hub/capacitacion',        ...hubPost  ('hub_capacitacion', 'hub.capacitacion'));
 app.patch('/api/hub/capacitacion/:id',   ...hubPatch ('hub_capacitacion', 'hub.capacitacion'));
 app.delete('/api/hub/capacitacion/:id',  ...hubDelete('hub_capacitacion', 'hub.capacitacion'));
+
+// ================================================================
+// SEM 2 — HUB MANTENIMIENTO v5.2.0
+// Órdenes de Trabajo + Bitácora de Equipos
+// Permisos: hub.mantenimiento.ordenes / hub.mantenimiento.bitacora
+// COORDINADOR de Mantenimiento + ADMIN + GERENTE_OPERACIONES
+// ================================================================
+
+// ── Órdenes de Trabajo ─────────────────────────────────────────
+app.get('/api/hub/mantenimiento/ordenes',
+    ...hubGet('hub_mant_ordenes', 'hub.mantenimiento.ordenes'));
+app.post('/api/hub/mantenimiento/ordenes',
+    ...hubPost('hub_mant_ordenes', 'hub.mantenimiento.ordenes'));
+app.patch('/api/hub/mantenimiento/ordenes/:id',
+    ...hubPatch('hub_mant_ordenes', 'hub.mantenimiento.ordenes'));
+app.delete('/api/hub/mantenimiento/ordenes/:id',
+    ...hubDelete('hub_mant_ordenes', 'hub.mantenimiento.ordenes'));
+
+// ── Bitácora de Equipos ────────────────────────────────────────
+app.get('/api/hub/mantenimiento/bitacora',
+    ...hubGet('hub_mant_bitacora', 'hub.mantenimiento.bitacora'));
+app.post('/api/hub/mantenimiento/bitacora',
+    ...hubPost('hub_mant_bitacora', 'hub.mantenimiento.bitacora'));
+// Bitácora: no se edita ni elimina — es un log inmutable
+// Solo ADMIN puede eliminar en caso de error de entrada:
+app.delete('/api/hub/mantenimiento/bitacora/:id',
+    requireAuth, requireRol(['ADMIN']), async (req, res) => {
+        try {
+            if (!ObjectId.isValid(req.params.id)) return res.status(400).json({ error: 'ID inválido' });
+            await db.collection('hub_mant_bitacora').deleteOne({ _id: new ObjectId(req.params.id) });
+            res.json({ success: true });
+        } catch (e) { res.status(500).json({ error: 'Error eliminando registro bitácora' }); }
+    }
+);
+
+// ================================================================
+// [SEM-3] HUB LOGÍSTICA — Guías de Envío + Inventario
+// ================================================================
+
+// ── Guías de Envío ─────────────────────────────────────────────
+app.get('/api/hub/logistica/guias',
+    ...hubGet('hub_log_guias', 'hub.logistica.guias'));
+app.post('/api/hub/logistica/guias',
+    ...hubPost('hub_log_guias', 'hub.logistica.guias'));
+app.patch('/api/hub/logistica/guias/:id',
+    ...hubPatch('hub_log_guias', 'hub.logistica.guias'));
+app.delete('/api/hub/logistica/guias/:id',
+    ...hubDelete('hub_log_guias', 'hub.logistica.guias'));
+
+// ── Inventario de Equipos / Materiales ─────────────────────────
+app.get('/api/hub/logistica/inventario',
+    ...hubGet('hub_log_inventario', 'hub.logistica.inventario'));
+app.post('/api/hub/logistica/inventario',
+    ...hubPost('hub_log_inventario', 'hub.logistica.inventario'));
+app.patch('/api/hub/logistica/inventario/:id',
+    ...hubPatch('hub_log_inventario', 'hub.logistica.inventario'));
+app.delete('/api/hub/logistica/inventario/:id',
+    ...hubDelete('hub_log_inventario', 'hub.logistica.inventario'));
+
+// ================================================================
+// [SEM-4] HUB CRÉDITO — Solicitudes de Crédito + Casos
+// ================================================================
+
+// ── Solicitudes de Crédito ─────────────────────────────────────
+app.get('/api/hub/credito/solicitudes',
+    ...hubGet('hub_cred_solicitudes', 'hub.credito.solicitudes'));
+app.post('/api/hub/credito/solicitudes',
+    ...hubPost('hub_cred_solicitudes', 'hub.credito.solicitudes'));
+app.patch('/api/hub/credito/solicitudes/:id',
+    ...hubPatch('hub_cred_solicitudes', 'hub.credito.solicitudes'));
+app.delete('/api/hub/credito/solicitudes/:id',
+    ...hubDelete('hub_cred_solicitudes', 'hub.credito.solicitudes'));
+
+// ── Casos de Seguimiento ───────────────────────────────────────
+app.get('/api/hub/credito/casos',
+    ...hubGet('hub_cred_casos', 'hub.credito.casos'));
+app.post('/api/hub/credito/casos',
+    ...hubPost('hub_cred_casos', 'hub.credito.casos'));
+app.patch('/api/hub/credito/casos/:id',
+    ...hubPatch('hub_cred_casos', 'hub.credito.casos'));
+app.delete('/api/hub/credito/casos/:id',
+    ...hubDelete('hub_cred_casos', 'hub.credito.casos'));
 
 // ── Minutas comentarios/acciones ───────────────────────────────
 app.post('/api/hub/minutas/:minutaId/comentarios', requireAuth, requirePermiso('hub.minutas'), async (req, res) => {
