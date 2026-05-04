@@ -2495,7 +2495,7 @@ app.post('/api/hub/mantenimiento/bitacora',
 // Bitácora: no se edita ni elimina — es un log inmutable
 // Solo ADMIN puede eliminar en caso de error de entrada:
 app.delete('/api/hub/mantenimiento/bitacora/:id',
-    requireAuth, requireRol(['ADMIN']), async (req, res) => {
+    requireAuth, requireAdmin, async (req, res) => {
         try {
             if (!ObjectId.isValid(req.params.id)) return res.status(400).json({ error: 'ID inválido' });
             await db.collection('hub_mant_bitacora').deleteOne({ _id: new ObjectId(req.params.id) });
