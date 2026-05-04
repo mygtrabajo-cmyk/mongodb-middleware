@@ -1885,16 +1885,18 @@ app.patch('/api/rh/movimientos/:id/estado', requireAuth, requirePermiso('rh.movi
 // ================================================================
 const _formatosCache = { sistemas: null, timestamp: 0, TTL: 5 * 60 * 1000 };
 const SISTEMAS_ACTIVACION = [
-    { id: 'SALE',  icon: '💼', nombre: 'Sales',                    name: 'Sales',                    descripcion: 'Formato de activación Sales AT&T',           driveFileId: 'PENDING', status: 'available' },
-    { id: 'ACC',   icon: '🔑', nombre: 'Access',                   name: 'Access',                   descripcion: 'Formato de activación Access AT&T',          driveFileId: 'PENDING', status: 'available' },
-    { id: 'VPN',   icon: '🔒', nombre: 'VPN',                      name: 'VPN',                      descripcion: 'Formato de activación VPN AT&T',             driveFileId: 'PENDING', status: 'available' },
-    { id: 'ASD',   icon: '🖥️', nombre: 'ASD',                      name: 'ASD',                      descripcion: 'Formato de activación ASD AT&T',             driveFileId: 'PENDING', status: 'available' },
-    { id: 'IC',    icon: '📋', nombre: 'IC',                       name: 'IC',                       descripcion: 'Formato de activación IC AT&T',              driveFileId: 'PENDING', status: 'available' },
-    { id: 'IDM',   icon: '🪪', nombre: 'IDM',                      name: 'IDM',                      descripcion: 'Formato de activación IDM AT&T',             driveFileId: 'PENDING', status: 'available' },
-    { id: 'PAYM',  icon: '💳', nombre: 'Payment',                  name: 'Payment',                  descripcion: 'Formato de activación Payment AT&T',         driveFileId: 'PENDING', status: 'available' },
-    { id: 'DIGIT', icon: '📱', nombre: 'Digital',                  name: 'Digital',                  descripcion: 'Formato de activación Digital AT&T',         driveFileId: 'PENDING', status: 'available' },
-    { id: 'AVS',   icon: '🛡️', nombre: 'AVS',                      name: 'AVS',                      descripcion: 'Formato de activación AVS AT&T',             driveFileId: 'PENDING', status: 'available' },
-    { id: 'ASCC',  icon: '📞', nombre: 'ASCC',                     name: 'ASCC',                     descripcion: 'Formato de activación ASCC AT&T',            driveFileId: 'PENDING', status: 'available' },
+    { id: 'SALE',  icon: '☁️',  nombre: 'Salesforce',   name: 'Salesforce',   descripcion: 'Formato de activación Salesforce AT&T',    driveFileId: '1zFUF48OrF8J8RcItmF0Tm49vWb5Ztc8s', status: 'available' },
+    { id: 'ACC',   icon: '🔑',  nombre: 'ACC',          name: 'ACC',          descripcion: 'Formato de activación ACC AT&T',           driveFileId: '1nLzrUGGMyasBO2wyUnrQPGbuIrgvUvtp', status: 'available' },
+    { id: 'VPN',   icon: '🔒',  nombre: 'VPN',          name: 'VPN',          descripcion: 'Formato de activación VPN AT&T',           driveFileId: '1mfdsYnPO0oZz492SAYh5IxlqhBpCWnv6', status: 'available' },
+    { id: 'ASD',   icon: '🖥️',  nombre: 'ASD',          name: 'ASD',          descripcion: 'Formato de activación ASD AT&T',           driveFileId: '1ibt4nygrm93qw6jC--Hz2pL_n0W8WT-B', status: 'available' },
+    { id: 'IC',    icon: '📋',  nombre: 'IC',           name: 'IC',           descripcion: 'Formato de activación IC AT&T',            driveFileId: '1dEHRCi72n1E5T-tsPb7Ma3eJkQfkgAk0', status: 'available' },
+    { id: 'IDM',   icon: '🪪',  nombre: 'IDM',          name: 'IDM',          descripcion: 'Formato de activación IDM AT&T',           driveFileId: '1ZMJBj0nKEPycrSD8jQ-2NNOl-Gfk4N-x', status: 'available' },
+    { id: 'PAYM',  icon: '💳',  nombre: 'PaymentBox',   name: 'PaymentBox',   descripcion: 'Formato de activación PaymentBox AT&T',    driveFileId: '1VtZhq-VKHEbDTiSEV3S2IGBkqFwDiXvl', status: 'available' },
+    { id: 'DIGIT', icon: '📱',  nombre: 'Digital',      name: 'Digital',      descripcion: 'Formato de activación Digital AT&T',       driveFileId: '1UVn1kEMuyob310088CIkHwaNWeGFHq4o', status: 'available' },
+    { id: 'AVS',   icon: '🛡️',  nombre: 'AVS',          name: 'AVS',          descripcion: 'Formato de activación AVS AT&T',           driveFileId: '1A265RSP59lhcpq0k0Eq1LFgjkFltLHjq', status: 'available' },
+    { id: 'ASCC',  icon: '📞',  nombre: 'ASCC',         name: 'ASCC',         descripcion: 'Formato de activación ASCC AT&T',          driveFileId: '19e_7i8ylW2IobMwmG7Aqst2cEmh6IEPv', status: 'available' },
+    { id: 'RED',   icon: '🌐',  nombre: 'Red',          name: 'Red',          descripcion: 'Formato de activación Red AT&T',           driveFileId: '1895NVsYEdD-OagKyfDWo3eo8qF_PIM80', status: 'available' },
+    { id: 'OFA',   icon: '📄',  nombre: 'OFA',          name: 'OFA',          descripcion: 'Formato de activación OFA AT&T',           driveFileId: '110N_9-jwp0Ev5QxZq3TCF0mbdtgSB1SO', status: 'available' },
 ];
 
 app.get('/api/formatos/sistemas', requireAuth, requirePermiso('formatos.generar'), (req, res) => {
@@ -1930,9 +1932,10 @@ app.get('/api/formatos/template/:id', requireAuth, requirePermiso('formatos.gene
             });
         }
 
-        // Descargar desde Google Drive y re-servir (proxy)
-        const driveUrl = `https://drive.google.com/uc?export=download&id=${sistema.driveFileId}`;
-        console.log(`[formatos/template] Descargando ${sistemaId} desde Drive...`);
+        // Descargar desde Google Sheets como XLSX y re-servir (proxy)
+        // Nota: los archivos son Google Sheets → usar /export?format=xlsx (no /uc?export=download)
+        const driveUrl = `https://docs.google.com/spreadsheets/d/${sistema.driveFileId}/export?format=xlsx`;
+        console.log(`[formatos/template] Descargando ${sistemaId} desde Sheets (${sistema.driveFileId.slice(0,8)}...)`);
 
         const driveRes = await fetch(driveUrl, {
             headers: { 'User-Agent': 'MYG-Telecom-Server/5.5' },
