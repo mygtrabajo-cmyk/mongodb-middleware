@@ -1876,16 +1876,25 @@ app.patch('/api/rh/movimientos/:id/estado', requireAuth, requirePermiso('rh.movi
 });
 
 // ================================================================
-// FORMATOS DE ACTIVACIÓN — XLSX real con ExcelJS [BUG-002]
+// FORMATOS DE ACTIVACIÓN — Plantillas reales desde Google Drive
+// ================================================================
+// Para agregar/actualizar un driveFileId:
+//   1. Abre el archivo en Google Drive → Compartir → "Cualquiera con el enlace puede ver"
+//   2. Copia el ID del URL: drive.google.com/file/d/<ID>/view
+//   3. Pégalo en driveFileId abajo
 // ================================================================
 const _formatosCache = { sistemas: null, timestamp: 0, TTL: 5 * 60 * 1000 };
-const // [FIX-FORMATOS] Agregados name/description/icon para compatibilidad con el selector frontend
-SISTEMAS_ACTIVACION = [
-    { id: 'SIEBEL',  icon: '📊', nombre: 'Siebel CRM',             name: 'Siebel CRM',             descripcion: 'Gestión de clientes y oportunidades',    description: 'Gestión de clientes y oportunidades',    status: 'available' },
-    { id: 'CLARIFY', icon: '🎧', nombre: 'Clarify',                 name: 'Clarify',                descripcion: 'Atención a clientes y casos de soporte', description: 'Atención a clientes y casos de soporte', status: 'available' },
-    { id: 'AMDOCS',  icon: '📱', nombre: 'Amdocs',                  name: 'Amdocs',                 descripcion: 'Facturación y activaciones',             description: 'Facturación y activaciones',             status: 'available' },
-    { id: 'REMEDY',  icon: '🎫', nombre: 'Remedy / ITSM',           name: 'Remedy / ITSM',          descripcion: 'Gestión de tickets internos',            description: 'Gestión de tickets internos',            status: 'available' },
-    { id: 'GENESYS', icon: '📞', nombre: 'Genesys Contact Center',  name: 'Genesys Contact Center', descripcion: 'Plataforma de llamadas',                 description: 'Plataforma de llamadas',                 status: 'available' },
+const SISTEMAS_ACTIVACION = [
+    { id: 'SALE',  icon: '💼', nombre: 'Sales',                    name: 'Sales',                    descripcion: 'Formato de activación Sales AT&T',           driveFileId: 'PENDING', status: 'available' },
+    { id: 'ACC',   icon: '🔑', nombre: 'Access',                   name: 'Access',                   descripcion: 'Formato de activación Access AT&T',          driveFileId: 'PENDING', status: 'available' },
+    { id: 'VPN',   icon: '🔒', nombre: 'VPN',                      name: 'VPN',                      descripcion: 'Formato de activación VPN AT&T',             driveFileId: 'PENDING', status: 'available' },
+    { id: 'ASD',   icon: '🖥️', nombre: 'ASD',                      name: 'ASD',                      descripcion: 'Formato de activación ASD AT&T',             driveFileId: 'PENDING', status: 'available' },
+    { id: 'IC',    icon: '📋', nombre: 'IC',                       name: 'IC',                       descripcion: 'Formato de activación IC AT&T',              driveFileId: 'PENDING', status: 'available' },
+    { id: 'IDM',   icon: '🪪', nombre: 'IDM',                      name: 'IDM',                      descripcion: 'Formato de activación IDM AT&T',             driveFileId: 'PENDING', status: 'available' },
+    { id: 'PAYM',  icon: '💳', nombre: 'Payment',                  name: 'Payment',                  descripcion: 'Formato de activación Payment AT&T',         driveFileId: 'PENDING', status: 'available' },
+    { id: 'DIGIT', icon: '📱', nombre: 'Digital',                  name: 'Digital',                  descripcion: 'Formato de activación Digital AT&T',         driveFileId: 'PENDING', status: 'available' },
+    { id: 'AVS',   icon: '🛡️', nombre: 'AVS',                      name: 'AVS',                      descripcion: 'Formato de activación AVS AT&T',             driveFileId: 'PENDING', status: 'available' },
+    { id: 'ASCC',  icon: '📞', nombre: 'ASCC',                     name: 'ASCC',                     descripcion: 'Formato de activación ASCC AT&T',            driveFileId: 'PENDING', status: 'available' },
 ];
 
 app.get('/api/formatos/sistemas', requireAuth, requirePermiso('formatos.generar'), (req, res) => {
@@ -1893,12 +1902,71 @@ app.get('/api/formatos/sistemas', requireAuth, requirePermiso('formatos.generar'
         const ahora = Date.now();
         if (_formatosCache.sistemas && (ahora - _formatosCache.timestamp) < _formatosCache.TTL)
             return res.json({ sistemas: _formatosCache.sistemas });
-        const disponibles = SISTEMAS_ACTIVACION.filter(s => s.status === 'available');
+        // Exponer solo campos públicos (no driveFileId por seguridad)
+        const disponibles = SISTEMAS_ACTIVACION
+            .filter(s => s.status === 'available')
+            .map(({ id, icon, nombre, name, descripcion, description, status }) =>
+                ({ id, icon, nombre, name, descripcion, description, status }));
         _formatosCache.sistemas = disponibles; _formatosCache.timestamp = ahora;
         return res.json({ sistemas: disponibles });
     } catch (error) {
         console.error('[formatos/sistemas] Error:', error);
         return res.status(500).json({ error: 'Error obteniendo lista de sistemas' });
+    }
+});
+
+// GET /api/formatos/template/:id — Descarga la plantilla real desde Google Drive
+// El archivo se proxea a través del servidor (el driveFileId nunca se expone al cliente)
+app.get('/api/formatos/template/:id', requireAuth, requirePermiso('formatos.generar'), async (req, res) => {
+    try {
+        const sistemaId = req.params.id?.toUpperCase();
+        const sistema = SISTEMAS_ACTIVACION.find(s => s.id === sistemaId && s.status === 'available');
+        if (!sistema) return res.status(404).json({ error: `Sistema "${sistemaId}" no encontrado` });
+
+        if (!sistema.driveFileId || sistema.driveFileId === 'PENDING') {
+            return res.status(503).json({
+                error: `Plantilla "${sistema.nombre}" no configurada aún. Contacta al administrador.`,
+                code: 'DRIVE_ID_PENDING'
+            });
+        }
+
+        // Descargar desde Google Drive y re-servir (proxy)
+        const driveUrl = `https://drive.google.com/uc?export=download&id=${sistema.driveFileId}`;
+        console.log(`[formatos/template] Descargando ${sistemaId} desde Drive...`);
+
+        const driveRes = await fetch(driveUrl, {
+            headers: { 'User-Agent': 'MYG-Telecom-Server/5.5' },
+            signal: AbortSignal.timeout(30000)
+        });
+
+        if (!driveRes.ok) {
+            console.error(`[formatos/template] Drive respondió ${driveRes.status} para ${sistemaId}`);
+            return res.status(502).json({ error: `Error descargando plantilla (Drive ${driveRes.status}). Verifica que el archivo sea público.` });
+        }
+
+        const filename = `ACTIVACION_${sistemaId}.xlsx`;
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+
+        // Pasar el Content-Length si Drive lo incluye (para barra de progreso en el cliente)
+        const contentLength = driveRes.headers.get('content-length');
+        if (contentLength) res.setHeader('Content-Length', contentLength);
+
+        // Stream directo para no cargar todo en memoria
+        const { Readable } = require('stream');
+        const nodeStream = Readable.fromWeb(driveRes.body);
+        nodeStream.pipe(res);
+        nodeStream.on('error', (err) => {
+            console.error(`[formatos/template] Error en stream ${sistemaId}:`, err.message);
+            if (!res.headersSent) res.status(500).json({ error: 'Error en descarga de plantilla' });
+            else res.end();
+        });
+
+        console.log(`[formatos/template] ✅ Entregado: ${filename}`);
+    } catch (error) {
+        console.error('[formatos/template] ❌ Error:', error.message);
+        if (!res.headersSent) return res.status(500).json({ error: 'Error descargando plantilla: ' + error.message });
+        res.end();
     }
 });
 
