@@ -1136,16 +1136,20 @@ async function logAccess(username, action, details = {}) {
 }
 
 // ── HEALTH ─────────────────────────────────────────────────────
-app.get('/health', (req, res) => res.json({
-    status:    'ok',
-    version:   '4.7.0',
-    timestamp: new Date().toISOString(),
-    db:        db ? 'connected' : 'disconnected',
-    ia: {
-        groq:   !!process.env.GROQ_API_KEY,
-        gemini: !!process.env.GEMINI_API_KEY,
-    }
-}));
+function _healthPayload() {
+    return {
+        status:    'ok',
+        version:   '4.7.0',
+        timestamp: new Date().toISOString(),
+        db:        db ? 'connected' : 'disconnected',
+        ia: {
+            groq:   !!process.env.GROQ_API_KEY,
+            gemini: !!process.env.GEMINI_API_KEY,
+        }
+    };
+}
+app.get('/health',   (req, res) => res.json(_healthPayload()));
+app.get('/api/ping', (req, res) => res.json(_healthPayload())); // alias: evita filtros de adblocker
 
 // ================================================================
 // [MAINT-002] GET /api/config/sheets — Sheet IDs desde .env
