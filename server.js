@@ -1,8 +1,9 @@
 // ================================================================
-// MYG TELECOM — API SERVER v5.5.0
+// MYG TELECOM — API SERVER v5.5.1
 // Render (Node.js) + MongoDB Atlas
 //
 // CHANGELOG:
+//   v5.5.1: [BUG-RH-DELETE] DELETE /api/rh/movimientos/:id — ruta faltante añadida
 //   v5.5.0: [FEAT-004b] Gestión de destinatarios del reporte semanal desde el dashboard
 //                       GET/POST /api/admin/weekly-report/recipients
 //                       DELETE   /api/admin/weekly-report/recipients/:email
@@ -1873,6 +1874,14 @@ app.patch('/api/rh/movimientos/:id/estado', requireAuth, requirePermiso('rh.movi
         );
         res.json({ success: true });
     } catch (e) { res.status(500).json({ error: 'Error RH' }); }
+});
+
+app.delete('/api/rh/movimientos/:id', requireAuth, requirePermiso('rh.movimientos.gestionar'), async (req, res) => {
+    try {
+        const r = await db.collection('rh_movimientos').deleteOne({ _id: new ObjectId(req.params.id) });
+        if (!r.deletedCount) return res.status(404).json({ error: 'No encontrado' });
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: 'Error eliminando movimiento RH' }); }
 });
 
 // ================================================================
