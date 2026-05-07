@@ -28,14 +28,13 @@ jobs:
       - name: Syntax check (node --check)
         run: node --check server.js
 
-      # ── Lint: variables no declaradas, eval, no-var, eqeqeq
+      # ── Lint: usa eslint.config.js (flat config ESLint v10 — sin --env ni --rule inline)
       - name: ESLint
-        run: |
-          npx eslint server.js \
-            --rule '{"no-undef":"error","no-eval":"error","eqeqeq":["warn","always"],"no-var":"warn"}' \
-            --env node \
-            --parser-options "ecmaVersion:2022" \
-            --max-warnings 30
+        run: npx eslint server.js --max-warnings 80
+
+      # ── Tests unitarios con Vitest
+      - name: Vitest
+        run: npm test
 
       # ── Audit: vulnerabilidades en deps (solo severidad alta+crítica)
       - name: npm audit (high+critical)
