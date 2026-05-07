@@ -1,8 +1,12 @@
 // ================================================================
-// MYG TELECOM — API SERVER v5.5.1
+// MYG TELECOM — API SERVER v5.6.0
 // Render (Node.js) + MongoDB Atlas
 //
 // CHANGELOG:
+//   v5.6.0: [AUD-001] Sentry error tracking (condicional: SENTRY_DSN env var)
+//           [AUD-002] maxPoolSize: 10 → 20 (safe margin para M0 100-conn limit)
+//           [AUD-003] parseObjectId() helper centralizado para endpoints :id
+//           [AUD-004] .env.example documentado con todas las variables
 //   v5.5.1: [BUG-RH-DELETE] DELETE /api/rh/movimientos/:id — ruta faltante añadida
 //   v5.5.0: [FEAT-004b] Gestión de destinatarios del reporte semanal desde el dashboard
 //                       GET/POST /api/admin/weekly-report/recipients
@@ -82,6 +86,26 @@
 require('dotenv').config();
 const { validateEnv, getRequired, getOptional } = require('./env-validator');
 validateEnv();
+
+// ── [AUD-001] Sentry — Error Tracking (condicional: solo si SENTRY_DSN está configurado)
+let Sentry = null;
+if (process.env.SENTRY_DSN) {
+    try {
+        Sentry = require('@sentry/node');
+        Sentry.init({
+            dsn: process.env.SENTRY_DSN,
+            environment: process.env.NODE_ENV || 'production',
+            tracesSampleRate: 0.1,    // 10% de requests trackeados
+            release: 'myg-api@5.6.0',
+        });
+        console.log('[Sentry] ✅ Error tracking activo');
+    } catch (e) {
+        console.warn('[Sentry] ⚠️  No disponible (npm install @sentry/node):', e.message);
+        Sentry = null;
+    }
+} else {
+    console.log('[Sentry] ℹ️  Sin SENTRY_DSN — error tracking desactivado');
+}
 
 const JWT_SECRET          = getRequired('JWT_SECRET');
 const NEBULA_AGENT_SECRET = getRequired('NEBULA_AGENT_SECRET');
@@ -236,6 +260,25 @@ let mongoClient;
 
 const MONGO_URI = MONGODB_URI;
 const DB_NAME   = 'iqu_telecom';
+
+// ── [AUD-003] Helper parseObjectId — centralizado para evitar repetición ────────
+/**
+ * Convierte un string a ObjectId de MongoDB.
+ * Si es inválido, escribe el 400 en res y devuelve null.
+ * Uso: const oid = parseObjectId(req.params.id, res); if (!oid) return;
+ */
+function parseObjectId(idStr, res) {
+    if (!idStr || typeof idStr !== 'string' || idStr.trim() === '') {
+        if (res) res.status(400).json({ ok: false, error: 'ID requerido' });
+        return null;
+    }
+    try {
+        return new ObjectId(idStr.trim());
+    } catch {
+        if (res) res.status(400).json({ ok: false, error: `ID inválido: ${idStr}` });
+        return null;
+    }
+}
 
 // ================================================================
 // EMAIL — Movimientos RH
@@ -849,7 +892,7 @@ async function connectDB() {
         socketTimeoutMS:          45000,
         heartbeatFrequencyMS:     10000,   // ping al servidor cada 10s para detectar caídas rápido
         minPoolSize:              2,        // mantener al menos 2 conexiones abiertas (evita cold-start)
-        maxPoolSize:              10,
+        maxPoolSize:              20,       // [AUD-002] safe margin para M0 (100 conn limit)
         connectTimeoutMS:         15000,
         retryWrites:              true,
         retryReads:               true,
@@ -3743,10 +3786,18 @@ async function start() {
         await connectDB();
 
         app.use('*', (req, res) => res.status(404).json({ error: `Endpoint no encontrado: ${req.originalUrl}` }));
-        app.use((err, req, res, next) => { console.error('Error no manejado:', err); res.status(500).json({ error: 'Error interno' }); });
+
+        // [AUD-001] Sentry error handler (debe ir DESPUÉS de las rutas y ANTES del error handler genérico)
+        if (Sentry) Sentry.setupExpressErrorHandler(app);
+
+        app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
+            if (Sentry) Sentry.captureException(err);
+            console.error('Error no manejado:', err);
+            res.status(500).json({ error: 'Error interno' });
+        });
 
         app.listen(PORT, () => {
-            console.log(`MYG API v4.7.0 en puerto ${PORT}`);   // ← PASO 5: actualizado
+            console.log(`MYG API v5.6.0 en puerto ${PORT}`);
             console.log(`IA Minutas: Groq=${!!process.env.GROQ_API_KEY ? '✅' : '❌'} | Gemini=${!!process.env.GEMINI_API_KEY ? '✅' : '❌'} | Local=✅`);
             console.log(`Activos:      GET(limit) POST(insertMany) PATCH(edit) DELETE(permisos) BULK(500max) ✅`);
             console.log(`Reposiciones: GET POST POST-bulk PATCH DELETE → hub_reposiciones ✅`);
@@ -3766,6 +3817,8 @@ async function start() {
             console.log(`Hub AI:          POST /api/hub/ai/summarize-chat · extract-tasks · meeting-brief (INN-002 ✅ v4.7.0)`);
             console.log(`Exec Alerts:     GET /api/exec/alerts (ADMIN/GERENTE_OPERACIONES) (INN-003 ✅ v4.7.0)`);
             console.log(`KPI Summary:     GET /api/kpi/summary · /api/hub/activity/summary · /api/headcount/summary (INN-003 ✅ v4.7.0)`);
+            console.log(`Sentry:          ${Sentry ? '✅ Activo (' + (process.env.SENTRY_DSN?.slice(0,40) + '…') + ')' : 'ℹ️  Sin SENTRY_DSN — desactivado'}`);
+            console.log(`Pool MongoDB:    maxPoolSize=20 (safe margin M0 100-conn) [AUD-002 ✅ v5.6.0]`);
         });
     } catch (err) {
         console.error('Error iniciando:', err);
