@@ -1,0 +1,66 @@
+name: CI — MYG Telecom Backend
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    name: Lint · Syntax · Security
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      # ── Syntax check: node --check detecta errores de sintaxis sin ejecutar
+      - name: Syntax check (node --check)
+        run: node --check server.js
+
+      # ── Lint: variables no declaradas, eval, no-var, eqeqeq
+      - name: ESLint
+        run: |
+          npx eslint server.js \
+            --rule '{"no-undef":"error","no-eval":"error","eqeqeq":["warn","always"],"no-var":"warn"}' \
+            --env node \
+            --parser-options "ecmaVersion:2022" \
+            --max-warnings 30
+
+      # ── Audit: vulnerabilidades en deps (solo severidad alta+crítica)
+      - name: npm audit (high+critical)
+        run: npm audit --audit-level=high
+        continue-on-error: true   # no romper CI por deps transitivas
+
+      # ── Verificar que no haya secrets en código fuente
+      - name: Detect hardcoded secrets
+        run: |
+          echo "Buscando posibles secrets hardcodeados..."
+          if grep -rn --include="*.js" \
+            -E "(password|secret|api_key|apikey|token)\s*=\s*['\"][A-Za-z0-9+/]{20,}" \
+            --exclude-dir=node_modules .; then
+            echo "ADVERTENCIA: Posibles secrets detectados"
+          else
+            echo "OK: No se encontraron secrets hardcodeados"
+          fi
+        continue-on-error: true
+
+      # ── Verificar que .env no está en el repo
+      - name: Verify .env not tracked
+        run: |
+          if git ls-files | grep -E "^\.env$"; then
+            echo "ERROR: .env está siendo trackeado por git"
+            exit 1
+          else
+            echo "OK: .env no está en el repositorio"
+          fi

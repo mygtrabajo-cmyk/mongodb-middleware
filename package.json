@@ -4,9 +4,12 @@
   "description": "Servidor unificado MYG Telecom — API + Hub + HC + Formatos XLSX",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "prepare": "husky"
   },
-  "dependencies": { 
+  "dependencies": {
+    "@google/generative-ai": "^0.21.0",
+    "@sentry/node": "^8.0.0",
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
     "dotenv": "^16.0.0",
@@ -18,11 +21,23 @@
     "jsonwebtoken": "^9.0.0",
     "mongodb": "^6.0.0",
     "morgan": "^1.10.0",
-    "nodemailer": "^6.9.0",
-    "@google/generative-ai": "^0.21.0",
-    "@sentry/node": "^8.0.0"
+    "nodemailer": "^6.9.0"
   },
   "engines": {
     "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.3.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^17.0.2"
+  },
+  "lint-staged": {
+    "server.js": [
+      "node --check"
+    ],
+    "*.js": [
+      "npx eslint --max-warnings 80"
+    ]
   }
 }

@@ -1217,17 +1217,86 @@ app.get('/api/config/sheets', requireAuth, (req, res) => {
 });
 
 // ── LOGIN ──────────────────────────────────────────────────────
+// ================================================================
+// [AUD-003] VALIDACIÓN JOI — Middleware + Esquemas
+// Uso: app.post('/ruta', validate(esquema), async handler)
+// ================================================================
+
+/**
+ * Middleware de validación Joi reutilizable.
+ * Valida req.body contra el esquema, limpia campos desconocidos
+ * y devuelve 400 con mensajes claros en español si hay errores.
+ */
+const validate = (schema) => (req, res, next) => {
+    const { error, value } = schema.validate(req.body, {
+        stripUnknown: true,
+        abortEarly:   false,
+        convert:      true,
+    });
+    if (error) {
+        const detalles = error.details.map(d => d.message.replace(/['"]/g, ''));
+        return res.status(400).json({
+            ok:      false,
+            error:   'Datos de entrada inválidos',
+            details: detalles,
+        });
+    }
+    req.body = value;
+    next();
+};
+
+// ── Esquemas de validación por endpoint ──────────────────────────
+const schemas = {
+    login: Joi.object({
+        username: Joi.string().trim().min(2).max(60).required()
+            .messages({ 'any.required': 'El usuario es requerido' }),
+        password: Joi.string().min(4).max(200).required()
+            .messages({ 'any.required': 'La contraseña es requerida' }),
+        remember: Joi.boolean().default(false),
+    }),
+
+    rhMovimiento: Joi.object({
+        tipo: Joi.string().valid(
+            'ALTA','ALTA_UDP','BAJA','CAMBIO_PDV','CAMBIO_PUESTO','CAMBIO_COMBINADO'
+        ).required()
+            .messages({ 'any.only': 'Tipo de movimiento inválido' }),
+        nombre:      Joi.string().trim().max(200).optional(),
+        colaborador: Joi.string().trim().max(200).optional(),
+        area:        Joi.string().trim().max(100).optional(),
+        pdvOrigen:   Joi.string().trim().max(200).optional(),
+        pdvDestino:  Joi.string().trim().max(200).optional(),
+        puestoOrigen: Joi.string().trim().max(200).optional(),
+        puestoDestino: Joi.string().trim().max(200).optional(),
+        efectivo:    Joi.string().trim().max(50).optional(),
+        comentario:  Joi.string().trim().max(1000).optional(),
+    }).unknown(true),   // permitir campos adicionales de formulario
+
+    rhMovimientoPatch: Joi.object({
+        estado:     Joi.string().valid('pendiente','aprobado','rechazado','procesado').optional(),
+        comentario: Joi.string().trim().max(1000).optional(),
+    }).min(1).messages({ 'object.min': 'Se requiere al menos un campo para actualizar' }),
+
+    notificacion: Joi.object({
+        titulo:            Joi.string().trim().min(1).max(200).required(),
+        mensaje:           Joi.string().trim().min(1).max(2000).required(),
+        tipo:              Joi.string().valid('info','warning','error','success').default('info'),
+        destinatarios:     Joi.array().items(Joi.string().trim()).optional(),
+        destinatarioTodos: Joi.boolean().default(false),
+        area:              Joi.string().trim().max(100).optional(),
+        link:              Joi.string().uri().max(500).optional(),
+    }),
+};
+
 // [PERF-LOGIN-v4.8] Optimizaciones rendimiento login:
 //   1. Projection en findOne — solo campos necesarios para auth
 //   2. updateOne + logAccess SUCCESS en background (fire-and-forget)
 //   3. Rehash progresivo: migra silenciosamente bcrypt de 12 a 10 rounds
 const BCRYPT_TARGET_ROUNDS = parseInt(process.env.BCRYPT_ROUNDS || '10', 10);
 
-app.post('/api/auth/login', loginLimiter, async (req, res) => {
+app.post('/api/auth/login', loginLimiter, validate(schemas.login), async (req, res) => {
     try {
         const { username, password } = req.body;
-        if (!username || !password)
-            return res.status(400).json({ error: 'Usuario y contrasena requeridos' });
+        // [AUD-003] Validación ya delegada a validate(schemas.login) — garantiza username+password
 
         // [PERF-1] Projection minima — evita traer campos innecesarios del documento
         const usuarioDoc = await db.collection('users').findOne(
@@ -1800,7 +1869,7 @@ app.get('/api/notificaciones', requireAuth, async (req, res) => {
     } catch (e) { res.status(500).json({ error: 'Error obteniendo notificaciones' }); }
 });
 
-app.post('/api/notificaciones', requireAuth, async (req, res) => {
+app.post('/api/notificaciones', requireAuth, validate(schemas.notificacion), async (req, res) => {
     try {
         const { titulo, mensaje, tipo = 'info', icono, tab_destino, subtab, usuario_destino } = req.body;
         if (!titulo || !mensaje) return res.status(400).json({ error: 'titulo y mensaje requeridos' });
@@ -1880,7 +1949,7 @@ app.get('/api/rh/movimientos', requireAuth, requirePermiso('rh.movimientos.ver')
     }
 });
 
-app.post('/api/rh/movimientos', requireAuth, requirePermiso('rh.movimientos.crear'), async (req, res) => {
+app.post('/api/rh/movimientos', requireAuth, requirePermiso('rh.movimientos.crear'), validate(schemas.rhMovimiento), async (req, res) => {
     try {
         const m = { ...req.body, creadoPor: req.usuario.username, createdAt: new Date(), estado: 'pendiente' };
         await db.collection('rh_movimientos').insertOne(m);
