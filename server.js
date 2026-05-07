@@ -958,6 +958,16 @@ async function connectDB() {
     await idx('rh_movimientos',      { tipo: 1, createdAt: -1 },         { name: 'rh_mov_tipo_fecha' });
     await idx('hub_nebula_config',   { _id: 1 },                         { name: 'nebula_config_id' });
 
+    // [AUD-FA3-001] Índices añadidos en Fase 3 — colecciones con queries frecuentes sin índice
+    await idx('users',               { email: 1 },                       { sparse: true, name: 'users_email' });
+    await idx('users',               { rol: 1, area: 1 },                { name: 'users_rol_area' });
+    await idx('rh_movimientos',      { estado: 1, createdAt: -1 },       { name: 'rh_mov_estado_fecha' });
+    await idx('rh_movimientos',      { area: 1, tipo: 1 },               { name: 'rh_mov_area_tipo' });
+    await idx('nebula_agents',       { agentId: 1 },                     { unique: true, sparse: true, name: 'nebula_agent_id_unique' });
+    await idx('hub_tareas',          { status: 1, area: 1, createdAt: -1 }, { name: 'tareas_status_area_fecha' });
+    await idx('hub_peticiones',      { username: 1, createdAt: -1 },     { name: 'peticiones_user_fecha' });
+    await idx('hub_peticiones',      { status: 1, area: 1 },             { name: 'peticiones_status_area' });
+
     await crearIndicesTTL();
 
     // [FEAT-004] Programar reporte semanal (opt-in via WEEKLY_REPORT_ENABLED=true)

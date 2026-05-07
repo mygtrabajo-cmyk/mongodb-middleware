@@ -40,4 +40,32 @@ export default [
         files: ['server.js', 'routes/**/*.js', 'env-validator.js'],
         ignores: ['node_modules/**', '.husky/**'],
     },
+    // ── Configuración específica para tests Vitest ─────────────────
+    {
+        files: ['__tests__/**/*.test.js'],
+        languageOptions: {
+            ecmaVersion: 2022,
+            sourceType:  'module',   // Tests usan ESM import/export
+            globals: {
+                // Vitest globals (describe, it, expect, vi, etc.)
+                describe:   'readonly',
+                it:         'readonly',
+                expect:     'readonly',
+                vi:         'readonly',
+                beforeEach: 'readonly',
+                afterEach:  'readonly',
+                beforeAll:  'readonly',
+                afterAll:   'readonly',
+                test:       'readonly',
+                // Node globals
+                process:    'readonly',
+                console:    'readonly',
+            },
+        },
+        rules: {
+            'no-unused-vars': ['warn', { argsIgnorePattern: '^_', varsIgnorePattern: '^_' }],
+            'no-undef':       'warn',
+            'no-console':     'off',
+        },
+    },
 ];
